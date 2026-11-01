@@ -263,3 +263,5 @@ if errors:
     for e in errors: print("  ", e)
     sys.exit(1)
 print("\nspec validate: PASS" + (f" ({len(warnings)} warnings)" if warnings else ""))
+
+# Automated fix for issue #722: fix(core): the change list records one entry per keystroke
