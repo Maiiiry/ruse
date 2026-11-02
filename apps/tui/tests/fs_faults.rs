@@ -195,7 +195,8 @@ fn edit_of_hostile_paths_reports_and_keeps_the_session() {
 /// journal is written next to it under the same odd name.
 fn round_trips(dir: &Scratch, name: &Path) {
     let file = dir.0.join(name);
-    let mut ed = Editor::start(dir, &[name]);
+    // `--` first: a leading-dash name is otherwise an unknown option (#896), as in nvim.
+    let mut ed = Editor::start(dir, &[Path::new("--"), name]);
     ed.settle();
     ed.keys(&format!("ix{ESC}:w\r"));
     // Bounded poll: on a loaded CI runner the write can land after the output went quiet.
