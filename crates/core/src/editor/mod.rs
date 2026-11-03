@@ -459,6 +459,9 @@ pub struct View {
     /// recomputes 'scroll' as half the height on a resize). `None` = half the window height. Frontend-owned,
     /// like `top`.
     scroll: Option<(usize, usize)>,
+    /// This window's own `'scrolloff'` (#1151), or `None` to use the global value (nvim's local `-1`).
+    /// Frontend-owned, like `top`: the viewport pass reads it, and a split copies it with the View.
+    scrolloff: Option<i64>,
     cursor: usize,
     mode: Mode,
     /// Whether the previous command edited text — drives undo grouping: an edit right after a non-edit
@@ -787,6 +790,7 @@ impl View {
             doc,
             top: 0,
             scroll: None,
+            scrolloff: None,
             cursor: 0,
             mode: Mode::Normal,
             last_was_edit: false,
@@ -1186,6 +1190,17 @@ impl View {
             tw = self.text_cols.saturating_sub(1).min(79);
         }
         tw
+    }
+
+    /// This window's own `'scrolloff'`, or `None` when it follows the global value.
+    #[must_use]
+    pub fn scrolloff_local(&self) -> Option<i64> {
+        self.scrolloff
+    }
+
+    /// Set (or, with `None`, clear) this window's own `'scrolloff'` (`:setlocal so`, #1151).
+    pub fn set_scrolloff_local(&mut self, so: Option<i64>) {
+        self.scrolloff = so;
     }
 
     /// The `CTRL-D`/`CTRL-U` amount for a window `height` rows high (Vim's 'scroll'): the value a count last
@@ -2541,10 +2556,14 @@ impl EditorState {
             .take(target_idx)
             .map(<[u8]>::len)
             .sum();
+        // Undo and redo come back to the start of the range's LAST line (#1165): nvim's `do_filter` saves
+        // the change with the cursor there (`uh_cursor`), having moved it to `line2` to append the output.
+        let last_start = spans[last].0;
         let list = EditList::new(vec![Edit::lines_changed(self.doc.bytes(), new_bytes)])
             .expect("a single edit is well-formed");
         let txn = Transaction::new(self.doc.revision(), list, self.origin)
-            .with_hint(GroupHint::BreakBefore);
+            .with_hint(GroupHint::BreakBefore)
+            .with_cursor(last_start);
         self.apply_txn(txn).expect("line filter applies cleanly");
         self.view.last_was_edit = true;
         let nb = self.doc.bytes();

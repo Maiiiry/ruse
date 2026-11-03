@@ -1327,6 +1327,17 @@ FIXTURES: list[dict] = [
     {"name": "v_J_dot", "lines": ["a", "b", "c", "d", "e"], "keys": "vjJj."},
     {"name": "v_colon_esc_leaves_visual", "lines": ["a", "b"], "keys": "vj:<Esc>x"},
     {"name": "V_bang_filter_two", "lines": ["c", "b", "a"], "keys": "Vj!sort<CR>"},
+    # --- #1165 undo/redo after a filter: nvim's `do_filter` saves the change with the cursor at the start
+    #     of the range's last line, so `u` and `CTRL-R` land there. -------------------------------------
+    {"name": "bang_filter_undo", "lines": ["c", "b", "a"], "keys": "!jsort<CR>u"},
+    {"name": "bang_filter_undo_mid", "lines": ["c", "b", "a", "d"], "keys": "j!jsort<CR>u"},
+    {"name": "bang_filter_undo_col", "lines": ["abc", "  def", "ghi"], "keys": "ll!jsort<CR>u"},
+    {"name": "bang_filter_redo", "lines": ["abc", "  def", "ghi"], "keys": "ll!jsort<CR>u<C-r>"},
+    {"name": "bangbang_filter_undo", "lines": ["c", "b", "a", "d"], "keys": "j!!sort<CR>u"},
+    {"name": "ex_filter_all_undo", "lines": ["c", "b", "a"], "keys": ":%!sort<CR>u"},
+    {"name": "ex_filter_all_redo", "lines": ["c", "b", "a", "d"], "keys": ":%!sort<CR>u<C-r>"},
+    {"name": "ex_filter_range_undo", "lines": ["c", "b", "a", "d"], "keys": "G:1,2!sort<CR>u"},
+    {"name": "V_bang_filter_undo", "lines": ["c", "b", "a", "d"], "keys": "jVj!sort<CR>u"},
     # --- #606/#792 Select mode: `gh`/`gH`/`g CTRL-H` enter it; a typed printable (any letter, digit,
     #     `"`, `:`, space, `<CR>`) replaces the selection and enters Insert; `<BS>`/`CTRL-H`/`<Del>` delete
     #     it; `CTRL-O` runs one Visual command; arrows and `<S-…>`/`<Home>`/`<End>` extend it. -----------
@@ -1376,6 +1387,19 @@ FIXTURES: list[dict] = [
     # --- #605 page scroll: CTRL-F/CTRL-B, <PageDown>/<PageUp>, <S-Down>/<S-Up>, <S-CR>, and CTRL-D/CTRL-U with
     #     the 'scroll' a count sets. Viewport-dependent, so nvim is aligned to ruse's 80x24 session (a 23-row
     #     window: no status line) and ruse's scrolloff=3. Cursor only; `top` is unit-tested in viewport.rs. --
+    # #1151 'scrolloff' is global-local: `:setlocal` gives the window its own value, `:set` sets the global
+    # one and drops the window's, `:setglobal` leaves it, a negative local follows the global, `so<` copies it.
+    {"name": "so_setlocal_L", "lines": HUNDRED, "keys": ":setlocal so=0<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_setlocal_big_L", "lines": HUNDRED, "keys": ":setlocal so=8<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_set_drops_local", "lines": HUNDRED, "keys": ":setlocal so=0<CR>:set so=5<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_setglobal_keeps_local", "lines": HUNDRED, "keys": ":setlocal so=0<CR>:setglobal so=6<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_setglobal_unset_local", "lines": HUNDRED, "keys": ":setglobal so=0<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_setlocal_negative", "lines": HUNDRED, "keys": ":setlocal so=-1<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_setlocal_from_global", "lines": HUNDRED, "keys": ":setlocal so=0<CR>:setglobal so=7<CR>:setlocal so<<CR>L", "setup": PAGE_SETUP},
+    {"name": "so_setlocal_H", "lines": HUNDRED, "keys": "50Gzz:setlocal so=0<CR>H", "setup": PAGE_SETUP},
+    # #1151 'history': `:set hi=1` keeps only the newest line, so CTRL-P cannot reach the `:s` before it.
+    {"name": "hi_one_keeps_newest", "lines": ["a"], "keys": ":s/a/b/<CR>u:set hi=1<CR>:<C-p><C-p><CR>"},
+    {"name": "hi_default_reaches_older", "lines": ["a"], "keys": ":s/a/b/<CR>u:set hi=5<CR>:<C-p><C-p><CR>"},
     {"name": "pg_ctrl_f", "lines": HUNDRED, "keys": "<C-f>", "setup": PAGE_SETUP},
     {"name": "pg_ctrl_f_twice", "lines": HUNDRED, "keys": "<C-f><C-f>", "setup": PAGE_SETUP},
     {"name": "pg_ctrl_f_count", "lines": HUNDRED, "keys": "2<C-f>", "setup": PAGE_SETUP},
