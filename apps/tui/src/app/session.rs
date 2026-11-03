@@ -203,36 +203,139 @@ fn insert_page_key(key: KeyEvent) -> Option<bool> {
     }
 }
 
-/// Apply a scroll command's result: set the focused window's `top`, then move the cursor to `row` with a
-/// vertical move, so the column follows the sticky wanted column (Vim's 'nostartofline').
+/// A window whose top line a scroll command set (nvim's `VALID_TOPLINE`): the frame keeps it while the
+/// cursor, the top line and the text stay as the command left them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ScrollValid {
+    window: usize,
+    cursor: usize,
+    top: usize,
+    revision: ruse_core::Revision,
+}
+
+/// What a scroll key asks of [`run_scroll`] (#615).
+#[derive(Clone, Copy)]
+enum ScrollKey {
+    /// `CTRL-E` (`up`) / `CTRL-Y`, `count` lines.
+    Lines { up: bool, count: usize },
+    /// `CTRL-F` / `CTRL-B` and the page keys, `count` pages.
+    Page { forward: bool, count: usize },
+    /// `CTRL-D` / `CTRL-U`, the window's 'scroll' rows.
+    Half { forward: bool, amount: usize },
+}
+
+/// Run a scroll key on the focused window as nvim v0.12.6 does over its screen rows (`scroll.rs`), then
+/// apply the result: the view's top line and skipped columns, and the cursor (placed with the wanted
+/// column kept, or moved there when the command set a new one). Returns false when nothing moved (nvim
+/// beeps).
 #[allow(clippy::too_many_arguments)]
-fn scroll_view(
-    new_top: usize,
-    row: usize,
+fn run_scroll(
+    key: ScrollKey,
     ws: &mut Workspace,
+    frame: &FrameCtx,
     line_idx: &line_index::LineIndex,
+    folds: &[crate::folds::Fold],
+    so: usize,
+    height: usize,
+    screen_want: &mut Option<(usize, usize)>,
+    valid: &mut Option<ScrollValid>,
     files: &Files,
     recorded: &mut Vec<Command>,
     status: &mut String,
     quit: &mut bool,
-) {
-    ws.set_top(ws.focus(), new_top);
-    let cur = line_idx.line_of(ws.focused().view.cursor());
-    if row != cur {
-        let (n, m) = if row > cur {
-            (row - cur, ruse_core::Motion::Down)
-        } else {
-            (cur - row, ruse_core::Motion::Up)
+) -> bool {
+    use crate::scroll::{Scroll, ViewPos};
+    let Some(win) = frame.wins.get(ws.focus()) else {
+        return false;
+    };
+    let (pos, curswant, mode) = {
+        let f = ws.focused();
+        let bytes = f.doc.bytes();
+        let text = PaneText {
+            bytes,
+            idx: line_idx,
         };
-        run_cmd(
-            Command::Move(n as u32, m),
-            ws,
-            files,
-            recorded,
-            status,
-            quit,
-        );
+        let cursor = f.view.cursor().min(bytes.len());
+        let line = line_idx.line_of(cursor);
+        let curswant = match *screen_want {
+            Some((at, w)) if at == cursor => w,
+            _ => f.view.curswant(),
+        };
+        (
+            ViewPos {
+                top: f.view.top(),
+                skipcol: if win.wrap { f.view.skipcol() } else { 0 },
+                line,
+                byte: cursor - text.start(line),
+                curswant,
+            },
+            curswant,
+            f.view.mode(),
+        )
+    };
+    let (done, start) = {
+        let f = ws.focused();
+        let text = PaneText {
+            bytes: f.doc.bytes(),
+            idx: line_idx,
+        };
+        let lines = PaneLines {
+            text,
+            win,
+            folds,
+            virt: &[],
+            height,
+        };
+        let sc = Scroll {
+            lines: &lines,
+            height,
+            so,
+            sms: win.smoothscroll,
+            tab_end: win.tab_end(mode),
+            memo: Default::default(),
+        };
+        let done = match key {
+            ScrollKey::Lines { up, count } => sc.scroll_lines(pos, up, count),
+            ScrollKey::Page { forward, count } => sc.page(pos, forward, count, false),
+            ScrollKey::Half { forward, amount } => sc.page(pos, forward, amount, true),
+        };
+        let start = text.start(done.pos.line);
+        (done, start)
+    };
+    let i = ws.focus();
+    ws.set_top(i, done.pos.top);
+    ws.set_skipcol(i, done.pos.skipcol);
+    let at = start + done.pos.byte;
+    let cursor = ws.focused().view.cursor();
+    if at != cursor {
+        if done.pos.curswant == curswant {
+            // The wanted column stays (nvim's scrollup/scrolldown keep `curswant`).
+            place_cursor(ws, recorded, at);
+        } else {
+            let target = u32::try_from(at + 1).unwrap_or(u32::MAX);
+            run_cmd(
+                Command::Move(target, ruse_core::Motion::GotoByte),
+                ws,
+                files,
+                recorded,
+                status,
+                quit,
+            );
+        }
     }
+    *screen_want = Some((ws.focused().view.cursor(), done.pos.curswant));
+    // nvim marks the top line valid after a scroll: the next redraw keeps it (no 'scrolloff' pull back)
+    // until the cursor or the text moves.
+    *valid = done.keep_top.then(|| ScrollValid {
+        window: i,
+        cursor: ws.focused().view.cursor(),
+        top: done.pos.top,
+        revision: ws.focused().doc.revision(),
+    });
+    if done.beep {
+        ws.beep();
+    }
+    !done.beep
 }
 
 /// The union of the byte ranges visible in every pane showing the FOCUSED doc — the window syntax
@@ -554,6 +657,8 @@ pub(crate) struct Session {
     /// Revision-cached line index: O(log n) row/line lookups instead of an O(buffer) newline scan per
     /// pane per frame (D-042 win D). Refreshed by `pre_frame`.
     pub(crate) line_idx: line_index::LineIndex,
+    /// The line indexes of the other buffers the windows show (#1182), refreshed by `pre_frame`.
+    pub(crate) pane_idx: line_index::PaneIndexes,
     pub(crate) initial: Vec<u8>,
     pub(crate) recorded: Vec<Command>,
     /// The editing options the core reads, as the session began: a saved trace starts by setting them, so
@@ -622,6 +727,8 @@ pub(crate) struct Session {
     /// nvim's wanted column after a `gj` / `gk` (#615), as `(cursor byte, column)`: the next one reuses it
     /// while the cursor is still there.
     screen_want: Option<(usize, usize)>,
+    /// The window whose top line the last scroll command set, kept by the next frames (#615).
+    scroll_valid: Option<ScrollValid>,
     /// The `keymap.lang` pairs the config installed, so a reload can take them back (#1151).
     config_lmaps: Vec<(char, char)>,
     /// Where each option's value came from, for `:verbose set opt?` (#614).
@@ -723,6 +830,7 @@ impl Session {
             files,
             highlighters,
             line_idx: line_index::LineIndex::default(),
+            pane_idx: line_index::PaneIndexes::default(),
             initial,
             recorded: Vec::new(),
             start_options,
@@ -756,6 +864,7 @@ impl Session {
             scrolloff: SCROLLOFF,
             ui_opts: crate::app::set_exec::UiOptions::default(),
             screen_want: None,
+            scroll_valid: None,
             config_lmaps: Vec::new(),
             opt_sources: HashMap::new(),
             ex_verbose: false,
@@ -810,6 +919,7 @@ impl Session {
             ws,
             files,
             line_idx,
+            pane_idx,
             journal_throttle,
             journal_failed,
             unnamed_start,
@@ -824,6 +934,7 @@ impl Session {
             status,
             lsp,
             ui_opts,
+            scroll_valid,
             ..
         } = self;
         // Snapshot the FOCUSED buffer once for the frame (line index, folds, highlight parse). `text_arc()`
@@ -950,6 +1061,16 @@ impl Session {
         let rects = window_rects(cols, text_rows, ws.window_count(), ws.split_dir());
         let has_signs = !lsp.diagnostics_for(ws.focused_buffer()).is_empty();
         let focus_buf = ws.focused_buffer();
+        // The other buffers the windows show keep their own line index, rebuilt on their own edits only.
+        for i in 0..ws.window_count() {
+            let p = ws.pane(i);
+            if p.view.doc() != focus_buf {
+                pane_idx.refresh(p.view.doc(), p.doc.revision(), p.doc.bytes());
+            }
+        }
+        pane_idx.retain(|d| {
+            d != focus_buf && (0..ws.window_count()).any(|i| ws.pane(i).view.doc() == d)
+        });
         let mut wins = Vec::with_capacity(rects.len());
         for (i, rect) in rects.iter().enumerate() {
             let pane_folds: &[crate::folds::Fold] = if i == ws.focus() {
@@ -957,16 +1078,14 @@ impl Session {
             } else {
                 &[]
             };
-            let (win, top, leftcol) = {
+            let (win, top, leftcol, skipcol) = {
                 let p = ws.pane(i);
-                let own;
                 let idx = if p.view.doc() == focus_buf {
                     &*line_idx
                 } else {
-                    let mut ix = line_index::LineIndex::default();
-                    ix.refresh_for(p.view.doc(), p.doc.revision(), p.doc.bytes());
-                    own = ix;
-                    &own
+                    pane_idx
+                        .get(p.view.doc(), p.doc.revision())
+                        .unwrap_or(&*line_idx)
                 };
                 let text = PaneText {
                     bytes: p.doc.bytes(),
@@ -980,7 +1099,8 @@ impl Session {
                     height,
                     text.line_count(),
                     i == ws.focus() && has_signs,
-                );
+                )
+                .with_folds(pane_folds);
                 let cursor = p.view.cursor().min(text.bytes.len());
                 let cline = idx.line_of(cursor);
                 let lines = PaneLines {
@@ -990,29 +1110,79 @@ impl Session {
                     virt: &[],
                     height,
                 };
-                let top = viewport::update_topline(
-                    &lines,
-                    p.view.top(),
-                    cline,
-                    height,
-                    scrolloff_for(p.view, global_so),
-                    viewport::scrolljump_rows(ui_opts.display.scrolljump, height),
-                );
-                // The cursor's line laid out up to the cursor (a huge line costs no more).
+                let so = scrolloff_for(p.view, global_so);
+                // The cursor's line laid out up to the cursor (a huge line costs no more), once: the
+                // scroll rules below read the same column.
+                let line_byte = cursor - text.start(cline);
                 let (start, end, vcol) = crate::ui::window_view::cursor_place(
                     &win,
                     text,
                     cline,
-                    cursor - text.start(cline),
+                    line_byte,
                     win.tab_end(p.view.mode()),
                 );
-                // A cursor line taller than the window shows from the row that keeps the cursor on it.
-                let crow = vcol / win.width;
-                let skip = if win.wrap && top == cline && crow >= height {
-                    crow.saturating_sub(height.saturating_sub(1))
-                } else {
-                    0
+                let sc = crate::scroll::Scroll {
+                    lines: &lines,
+                    height,
+                    so,
+                    sms: win.smoothscroll,
+                    tab_end: win.tab_end(p.view.mode()),
+                    memo: std::cell::Cell::new(Some((cline, line_byte, vcol))),
                 };
+                // The top line's skipped columns (#615): the cursor moved into them shows them again,
+                // and a new top line starts unskipped.
+                let mut pos = crate::scroll::ViewPos {
+                    top: p.view.top(),
+                    skipcol: if win.wrap { p.view.skipcol() } else { 0 },
+                    line: cline,
+                    byte: cursor - text.start(cline),
+                    curswant: 0,
+                };
+                pos.skipcol = sc.uncover_cursor(&pos);
+                if !win.smoothscroll && pos.skipcol > 0 {
+                    // Without 'smoothscroll' a scroll's leftover skipped columns are gone once the
+                    // cursor has moved (nvim's `curs_columns` runs before the top line is checked).
+                    pos.skipcol = sc.frame_skipcol(&pos);
+                }
+                let skipped = crate::scroll::TopSkipped {
+                    lines: &lines,
+                    top: pos.top,
+                    rows: sc.skipped_rows(pos.skipcol),
+                };
+                let kept = *scroll_valid
+                    == Some(ScrollValid {
+                        window: i,
+                        cursor,
+                        top: pos.top,
+                        revision: p.doc.revision(),
+                    });
+                let sj = viewport::scrolljump_rows(ui_opts.display.scrolljump, height);
+                let sms = (win.smoothscroll && win.wrap).then_some(win.width);
+                let (top, sms_skip) = if kept {
+                    (pos.top, None)
+                } else {
+                    let (top, skip) =
+                        viewport::update_topline_sms(&skipped, pos.top, cline, height, so, sj, sms);
+                    if top == pos.top || skip.is_some_and(|s| s > 0) {
+                        (top, skip)
+                    } else {
+                        // nvim validates the top line again before it draws: a far jump centred
+                        // without 'scrolloff' (`scroll_cursor_halfway`) then gets its context rows.
+                        (
+                            viewport::update_topline(&lines, top, cline, height, so, sj),
+                            skip,
+                        )
+                    }
+                };
+                if top != pos.top || sms_skip.is_some() {
+                    pos.top = top;
+                    pos.skipcol = sms_skip.unwrap_or(0);
+                }
+                // A cursor line taller than the window shows the rows around the cursor (nvim's
+                // `curs_columns`); 'smoothscroll' keeps what the scroll commands left.
+                pos.skipcol = sc.frame_skipcol(&pos);
+                let skip = sc.skipped_rows(pos.skipcol);
+                let skipcol = pos.skipcol;
                 let leftcol = if win.wrap {
                     0
                 } else {
@@ -1021,10 +1191,11 @@ impl Session {
                 win.skip = skip;
                 win.leftcol = leftcol;
                 win.cursor = Some((cursor, vcol));
-                (win, top, leftcol)
+                (win, top, leftcol, skipcol)
             };
             ws.set_top(i, top);
             ws.set_leftcol(i, leftcol);
+            ws.set_skipcol(i, skipcol);
             // The window's text columns: 'wrapmargin' counts from its right edge, after the gutter.
             ws.set_text_cols(i, win.width);
             wins.push(win);
@@ -1318,6 +1489,7 @@ impl Session {
             fold_rev,
             sources: opt_sources,
             ui: ui_opts,
+            win_height: 0,
         };
         crate::app::set_exec::apply_config(config, &mut host);
         let notes =
@@ -1415,6 +1587,7 @@ impl Session {
             meta_tail,
             alt_file,
             screen_want,
+            scroll_valid,
             ..
         } = self;
         let (revision, text_rows) = (frame.revision, frame.text_rows);
@@ -2104,18 +2277,29 @@ impl Session {
             *overlay = Some(Overlay::Files(file_picker::open()));
             return;
         }
-        let last_line = line_idx.line_of(snapshot.len().saturating_sub(1));
         // Page scroll (`C-f`/`C-b`, `<PageDown>`/`<PageUp>`, `<S-Down>`/`<S-Up>`, `<S-CR>`), in Normal and
         // Visual and, through the Insert arm below, in Insert. `{count}` scrolls that many pages.
         let selection_base = visual && pending == Pending::Base;
+        let fv = folds
+            .get(&ws.focused_buffer())
+            .map_or(&[][..], Vec::as_slice);
         if let (Some(forward), true) = (page, chord || selection_base) {
-            let count = engine.take_count();
-            let top = ws.focused().view.top();
-            if let Some((new_top, row)) =
-                viewport::page_scroll(top, focused_h, so, count, forward, last_line)
-            {
-                scroll_view(new_top, row, ws, line_idx, files, recorded, status, quit);
-            }
+            let count = engine.take_count().max(1) as usize;
+            run_scroll(
+                ScrollKey::Page { forward, count },
+                ws,
+                frame,
+                line_idx,
+                fv,
+                so,
+                focused_h,
+                screen_want,
+                scroll_valid,
+                files,
+                recorded,
+                status,
+                quit,
+            );
             return;
         }
         // `z` arms the scroll/fold prefix with the count typed before it. In Normal (scroll + fold verbs) and
@@ -2139,50 +2323,48 @@ impl Session {
                 ws.set_scroll(ws.focus(), count.min(focused_h.max(1)), focused_h);
             }
             let amount = ws.focused().view.scroll(focused_h);
-            let (top, cur) = (
-                ws.focused().view.top(),
-                line_idx.line_of(ws.focused().view.cursor()),
-            );
-            let (new_top, row) = viewport::half_page_scroll(
-                top,
-                cur,
-                focused_h,
+            run_scroll(
+                ScrollKey::Half {
+                    forward: is_ctrl(key, 'd'),
+                    amount,
+                },
+                ws,
+                frame,
+                line_idx,
+                fv,
                 so,
-                amount,
-                is_ctrl(key, 'd'),
-                last_line,
+                focused_h,
+                screen_want,
+                scroll_valid,
+                files,
+                recorded,
+                status,
+                quit,
             );
-            scroll_view(new_top, row, ws, line_idx, files, recorded, status, quit);
             return;
         }
         // `C-e` / `C-y` scroll the view one line down / up, nudging the cursor only if it would leave the
         // scrolloff band. Frontend-only (viewport concern); `{count}` scrolls that many lines.
         if chord && (is_ctrl(key, 'e') || is_ctrl(key, 'y')) {
-            let n = engine.take_count().max(1) as usize;
-            // The last real line: the slot after a final newline is no line (#677).
-            let last_line =
-                line_idx.line_of(ruse_core::motion::off_phantom(snapshot, snapshot.len()));
-            let cursor_row = line_idx.line_of(ws.focused().view.cursor());
-            let (nt, nr) = viewport::scroll_lines(
-                ws.focused().view.top(),
-                cursor_row,
-                focused_h,
+            let count = engine.take_count().max(1) as usize;
+            run_scroll(
+                ScrollKey::Lines {
+                    up: is_ctrl(key, 'e'),
+                    count,
+                },
+                ws,
+                frame,
+                line_idx,
+                fv,
                 so,
-                n,
-                is_ctrl(key, 'e'),
-                last_line,
+                focused_h,
+                screen_want,
+                scroll_valid,
+                files,
+                recorded,
+                status,
+                quit,
             );
-            ws.set_top(ws.focus(), nt);
-            if nr != cursor_row {
-                run_cmd(
-                    Command::Move(nr as u32 + 1, ruse_core::Motion::GotoLine),
-                    ws,
-                    files,
-                    recorded,
-                    status,
-                    quit,
-                );
-            }
             return;
         }
         // `i_CTRL-E` / `i_CTRL-Y` (Insert mode) — insert the char directly BELOW / ABOVE the caret at the
@@ -2213,13 +2395,23 @@ impl Session {
         // that breaks undo and restarts the `.` record like `i_<Down>` (nvim v0.12.6).
         if let (true, Some(forward)) = (vim_insert, insert_page_key(key)) {
             if engine.insert_plain_text_ctx() {
-                let top = ws.focused().view.top();
-                if let Some((new_top, row)) =
-                    viewport::page_scroll(top, focused_h, so, 1, forward, last_line)
-                {
-                    run_cmd(engine.insert_page_jump(), ws, files, recorded, status, quit);
-                    scroll_view(new_top, row, ws, line_idx, files, recorded, status, quit);
-                }
+                // The jump breaks undo first (it changes no text, so the scroll below sees the same lines).
+                run_cmd(engine.insert_page_jump(), ws, files, recorded, status, quit);
+                run_scroll(
+                    ScrollKey::Page { forward, count: 1 },
+                    ws,
+                    frame,
+                    line_idx,
+                    fv,
+                    so,
+                    focused_h,
+                    screen_want,
+                    scroll_valid,
+                    files,
+                    recorded,
+                    status,
+                    quit,
+                );
                 return;
             }
         }
@@ -3014,6 +3206,7 @@ impl Session {
             // `:set` / `:setlocal` / `:setglobal` (#614): the grammar is `input/set_cmd.rs`, the values it
             // reads and writes are behind `set_exec::OptionHost`.
             Ex::SetOptions(line) => {
+                let win_height = frame.rects.get(ws.focus()).map_or(0, |r| usize::from(r.h));
                 let mut host = crate::app::set_exec::OptionHost {
                     ws,
                     recorded,
@@ -3030,6 +3223,7 @@ impl Session {
                     fold_rev,
                     sources: opt_sources,
                     ui: ui_opts,
+                    win_height,
                 };
                 let out =
                     crate::app::set_exec::run_set(&line, &mut host, cols as usize, *ex_verbose);
@@ -4066,10 +4260,24 @@ impl Session {
             .map(|(i, rect)| {
                 let p = self.ws.pane(i);
                 let mut ix = line_index::LineIndex::default();
-                ix.refresh_for(p.view.doc(), p.doc.revision(), p.doc.bytes());
+                let idx = if p.view.doc() == self.ws.focused_buffer() {
+                    &self.line_idx
+                } else if let Some(idx) = self.pane_idx.get(p.view.doc(), p.doc.revision()) {
+                    idx
+                } else {
+                    ix.refresh_for(p.view.doc(), p.doc.revision(), p.doc.bytes());
+                    &ix
+                };
                 let text = PaneText {
                     bytes: p.doc.bytes(),
-                    idx: &ix,
+                    idx,
+                };
+                let folds = if i == self.ws.focus() {
+                    self.folds
+                        .get(&self.ws.focused_buffer())
+                        .map_or(&[][..], Vec::as_slice)
+                } else {
+                    &[]
                 };
                 WinView::resolve(
                     p.view,
@@ -4079,6 +4287,7 @@ impl Session {
                     text.line_count(),
                     i == self.ws.focus() && has_signs,
                 )
+                .with_folds(folds)
             })
             .collect()
     }
@@ -4765,6 +4974,7 @@ pub(crate) fn run(path: Option<PathBuf>, raw: Vec<u8>) -> io::Result<()> {
                     .get(&s.ws.focused_buffer())
                     .map_or(&[][..], Vec::as_slice),
                 &s.line_idx,
+                &s.pane_idx,
                 s.ui_opts.showmode,
             )?;
             // F-031 slice 3b-2b: the graphics pass — after the cell flush, draw real pixels for the focused
