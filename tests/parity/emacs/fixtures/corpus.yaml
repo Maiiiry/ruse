@@ -2281,6 +2281,209 @@
         "mark": 0,
         "kill": null
       }
+    },
+    {
+      "name": "first_cu3_self_insert",
+      "text": "abc\ndef",
+      "ops": [
+        "C-u 3 self-insert-command x"
+      ],
+      "expect": {
+        "text": [
+          "xxxabc",
+          "def"
+        ],
+        "point": 3,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "first_cu_self_insert",
+      "text": "abc\ndef",
+      "ops": [
+        "C-u self-insert-command x"
+      ],
+      "expect": {
+        "text": [
+          "xxxxabc",
+          "def"
+        ],
+        "point": 4,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "first_cu2_forward_char",
+      "text": "abc\ndef",
+      "ops": [
+        "C-u 2 forward-char"
+      ],
+      "expect": {
+        "text": [
+          "abc",
+          "def"
+        ],
+        "point": 2,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "first_self_insert_q",
+      "text": "abc",
+      "ops": [
+        "self-insert-command q",
+        "self-insert-command x"
+      ],
+      "expect": {
+        "text": [
+          "qxabc"
+        ],
+        "point": 2,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "first_self_insert_z",
+      "text": "abc",
+      "ops": [
+        "self-insert-command z",
+        "self-insert-command z"
+      ],
+      "expect": {
+        "text": [
+          "zzabc"
+        ],
+        "point": 2,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "first_delete_char",
+      "text": "abc\ndef",
+      "ops": [
+        "delete-char"
+      ],
+      "expect": {
+        "text": [
+          "bc",
+          "def"
+        ],
+        "point": 0,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "typed_then_end_of_line",
+      "text": "abc\ndef",
+      "ops": [
+        "self-insert-command a",
+        "move-end-of-line"
+      ],
+      "expect": {
+        "text": [
+          "aabc",
+          "def"
+        ],
+        "point": 4,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "typed_then_bol_eol",
+      "text": "abc\ndef",
+      "ops": [
+        "self-insert-command a",
+        "move-beginning-of-line",
+        "move-end-of-line"
+      ],
+      "expect": {
+        "text": [
+          "aabc",
+          "def"
+        ],
+        "point": 4,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "typed_then_next_line",
+      "text": "abc\ndef",
+      "ops": [
+        "self-insert-command a",
+        "next-line"
+      ],
+      "expect": {
+        "text": [
+          "aabc",
+          "def"
+        ],
+        "point": 6,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "typed_then_previous_line",
+      "text": "abc\ndef",
+      "ops": [
+        "self-insert-command a",
+        "previous-line"
+      ],
+      "point": 5,
+      "expect": {
+        "text": [
+          "abc",
+          "daef"
+        ],
+        "point": 2,
+        "mark": null,
+        "kill": null
+      }
+    },
+    {
+      "name": "typed_then_yank",
+      "text": "abc def\nghi",
+      "ops": [
+        "kill-word",
+        "self-insert-command x",
+        "yank"
+      ],
+      "expect": {
+        "text": [
+          "xabc def",
+          "ghi"
+        ],
+        "point": 4,
+        "mark": 1,
+        "kill": "abc"
+      }
+    },
+    {
+      "name": "typed_then_yank_below_text",
+      "text": "ab\ncd",
+      "ops": [
+        "kill-line",
+        "self-insert-command x",
+        "next-line",
+        "yank"
+      ],
+      "expect": {
+        "text": [
+          "x",
+          "cabd"
+        ],
+        "point": 5,
+        "mark": 3,
+        "kill": "ab"
+      }
     }
   ]
 }
