@@ -1037,6 +1037,48 @@ fn visual_span(st: &EditorState, b: &[u8], cur: usize) -> Result<(usize, usize, 
 
 /// Like [`edit_yank`] but routes the captured span through [`RegWrite::KillAppend`] — an Emacs kill that
 /// accumulates onto the current unnamed entry when it follows another kill (kill-ring behaviour).
+/// Select's `open/replace-selection` over a charwise or linewise selection, shared by a typed key
+/// ([`Command::ReplaceSelection`]) and a paste ([`Command::InsertPaste`] in a selection): delete the
+/// selection into the unnamed register, insert `ins` where it began, and enter Insert after it.
+fn replace_selection_with(
+    st: &EditorState,
+    b: &[u8],
+    cur: usize,
+    hint: GroupHint,
+    ins: Vec<u8>,
+) -> Plan {
+    let line = matches!(
+        st.view.mode,
+        Mode::Visual {
+            kind: SelectKind::Linewise
+        } | Mode::Select {
+            kind: SelectKind::Linewise
+        }
+    );
+    let n = ins.len();
+    match st.view.anchor {
+        Some(anchor) => {
+            let (s, e) = selection_range(b, anchor, cur, line);
+            if s < e {
+                // The removed span fills the unnamed register, as a Visual/Normal delete does —
+                // charwise even for whole lines, as nvim stores it (`gHX` leaves `"abc\n"`, `v`).
+                let reg = captured(b, s, e, false);
+                edit_yank(
+                    one(Edit::replace(s, e - s, ins)),
+                    s + n,
+                    Mode::Insert,
+                    hint,
+                    reg,
+                )
+            } else {
+                edit(one(Edit::insert(s, ins)), s + n, Mode::Insert, hint)
+            }
+        }
+        // No anchor (not really in a selection): degrade to a plain insert-and-enter-Insert.
+        None => edit(one(Edit::insert(cur, ins)), cur + n, Mode::Insert, hint),
+    }
+}
+
 fn edit_kill(edits: EditList, cursor: usize, mode: Mode, hint: GroupHint, reg: Register) -> Plan {
     Plan {
         action: Action::Txn { edits, hint },
@@ -1427,6 +1469,66 @@ pub fn plan(st: &EditorState, cmd: &Command) -> Plan {
             }
             let n = bytes.len();
             edit(one(Edit::insert(cur, bytes)), cur + n, Mode::Insert, hint)
+        }
+        // A bracketed paste (#600): one literal splice at the caret, mode unchanged.
+        Command::InsertPaste(text) => {
+            if text.is_empty() {
+                return nop(cur, st.view.mode);
+            }
+            // Over a charwise/linewise selection a paste replaces it, as a typed Select key does
+            // (`vim.paste`: `<Del>` the selection, then put the text where it was), entering Insert.
+            if matches!(
+                st.view.mode.selection(),
+                Some(SelectKind::Charwise | SelectKind::Linewise)
+            ) {
+                return replace_selection_with(st, b, cur, hint, text.as_bytes().to_vec());
+            }
+            let n = text.len();
+            edit(
+                one(Edit::insert(cur, text.as_bytes().to_vec())),
+                cur + n,
+                st.view.mode,
+                hint,
+            )
+        }
+        // A Replace-mode paste: overwrite one char of the current line per pasted char (newlines excluded,
+        // as nvim's `vim.paste` counts them), then splice the text. nvim counts BYTES and can split a
+        // multi-byte char; this counts characters.
+        Command::ReplacePaste(text) => {
+            if text.is_empty() {
+                return nop(cur, st.view.mode);
+            }
+            let nchars = text.chars().filter(|&c| c != '\n').count();
+            let le = line_end(b, cur);
+            let end = std::str::from_utf8(&b[cur..le]).map_or(le, |rest| {
+                rest.char_indices().nth(nchars).map_or(le, |(i, _)| cur + i)
+            });
+            let n = text.len();
+            edit(
+                one(Edit::replace(cur, end - cur, text.as_bytes().to_vec())),
+                cur + n,
+                st.view.mode,
+                hint,
+            )
+        }
+        // Emacs `xterm-paste`: kill-new the text, then yank it (point after, mark at the start).
+        Command::EmacsPaste(text) => {
+            if text.is_empty() {
+                return nop(cur, st.view.mode);
+            }
+            let n = text.len();
+            Plan {
+                set_register: Some(RegWrite::Write(Register::charwise(
+                    text.as_bytes().to_vec(),
+                ))),
+                set_mark: Some(MarkWrite::Set(cur)),
+                ..edit(
+                    one(Edit::insert(cur, text.as_bytes().to_vec())),
+                    cur + n,
+                    st.view.mode,
+                    hint,
+                )
+            }
         }
         // `i_CTRL-W` — delete the word before the caret (within the current line), staying in Insert.
         Command::InsertDeleteWordBack => {
@@ -2255,37 +2357,8 @@ pub fn plan(st: &EditorState, cmd: &Command) -> Plan {
                 let seed = c.encode_utf8(&mut buf).as_bytes();
                 return plan_block_insert(st, b, cur, hint, &BlockInsertKind::Change, seed);
             }
-            let line = matches!(
-                st.view.mode,
-                Mode::Visual {
-                    kind: SelectKind::Linewise
-                } | Mode::Select {
-                    kind: SelectKind::Linewise
-                }
-            );
             let ins = c.encode_utf8(&mut buf).as_bytes().to_vec();
-            let n = ins.len();
-            match st.view.anchor {
-                Some(anchor) => {
-                    let (s, e) = selection_range(b, anchor, cur, line);
-                    if s < e {
-                        // The removed span fills the unnamed register, as a Visual/Normal delete does —
-                        // charwise even for whole lines, as nvim stores it (`gHX` leaves `"abc\n"`, `v`).
-                        let reg = captured(b, s, e, false);
-                        edit_yank(
-                            one(Edit::replace(s, e - s, ins)),
-                            s + n,
-                            Mode::Insert,
-                            hint,
-                            reg,
-                        )
-                    } else {
-                        edit(one(Edit::insert(s, ins)), s + n, Mode::Insert, hint)
-                    }
-                }
-                // No anchor (not really in a selection): degrade to a plain insert-and-enter-Insert.
-                None => edit(one(Edit::insert(cur, ins)), cur + n, Mode::Insert, hint),
-            }
+            replace_selection_with(st, b, cur, hint, ins)
         }
         Command::BlockInsert(kind) => plan_block_insert(st, b, cur, hint, kind, &[]),
         Command::SwapSelectionEnds => {
