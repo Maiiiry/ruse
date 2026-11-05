@@ -489,11 +489,24 @@ fn resolve_tree_aware(
     snapshot: &[u8],
 ) -> Command {
     // A buffer whose language is not indented by node depth (Markdown, #818) keeps the core's plain `=`/`o`.
-    let tree_of = |ws: &Workspace| {
+    let has_tree = |ws: &Workspace| {
         highlighters
             .get(&ws.focused_buffer())
             .and_then(highlight::CachedHighlight::tree)
             .filter(|t| indent::uses_node_depth(t))
+    };
+    // Lines `first..=last` indent by the tree, or, where it has an error, by a window of the buffer with its
+    // open blocks closed, so a block still being typed indents by the depth it will have (#1214).
+    let tree_of = |ws: &Workspace, first: usize, last: usize| {
+        has_tree(ws).map(|t| {
+            let next = line_idx.nth_line_start(last + 1);
+            let last_le = if next > 0 && snapshot.get(next - 1) == Some(&b'\n') {
+                next - 1
+            } else {
+                snapshot.len()
+            };
+            indent::IndentTree::new(t, snapshot, first, line_idx.nth_line_start(first), last_le)
+        })
     };
     // `'lisp'` indents in the core, as nvim's Lisp rules win over an indent expression (#1163).
     if ws.focused().view.lisp() {
@@ -517,25 +530,26 @@ fn resolve_tree_aware(
     }
     // `i_CTRL-F` re-indents the caret's line from the tree.
     if matches!(cmd, Command::InsertReindent) {
-        if let Some(tree) = tree_of(ws) {
-            let row = line_idx.line_of(ws.focused().view.cursor().0);
+        let row = line_idx.line_of(ws.focused().view.cursor().0);
+        if let Some(tree) = tree_of(ws, row, row) {
             return Command::SetIndents {
                 first_line: row,
                 last_line: row,
-                levels: indent::indent_levels(tree, snapshot, row, row),
+                levels: tree.levels(row, row),
             };
         }
         return cmd;
     }
     // `=` — resolve the reindent range + levels from the tree, else fall through to the core `=`.
     let cmd = if let Command::Reindent { count, motion } = cmd {
-        match (ws.reindent_range(motion, count), tree_of(ws)) {
-            (Some((first_line, last_line)), Some(tree)) => Command::SetIndents {
+        let range = ws.reindent_range(motion, count);
+        match range.and_then(|(first, last)| Some((first, last, tree_of(ws, first, last)?))) {
+            Some((first_line, last_line, tree)) => Command::SetIndents {
                 first_line,
                 last_line,
-                levels: indent::indent_levels(tree, snapshot, first_line, last_line),
+                levels: tree.levels(first_line, last_line),
             },
-            _ => Command::Reindent { count, motion },
+            None => Command::Reindent { count, motion },
         }
     } else {
         cmd
@@ -551,27 +565,31 @@ fn resolve_tree_aware(
         Command::OpenBelow | Command::OpenAbove | Command::InsertNewline
     ) && !continues_comment
     {
-        match tree_of(ws) {
+        let cur = ws.focused().view.cursor().0;
+        let row = line_idx.line_of(cur);
+        match tree_of(ws, row, row) {
             Some(tree) => {
-                let cur = ws.focused().view.cursor().0;
-                let row = line_idx.line_of(cur);
+                let ls = line_idx.nth_line_start(row);
+                let next = line_idx.nth_line_start(row + 1);
+                let le = if next > 0 && snapshot.get(next - 1) == Some(&b'\n') {
+                    next - 1
+                } else {
+                    snapshot.len()
+                };
+                // Where the tree is still broken after closing the open blocks, its depth means nothing:
+                // the core's plain open keeps the line's indent (autoindent, #1214).
+                let at = match cmd {
+                    Command::OpenBelow => le,
+                    Command::OpenAbove => ls,
+                    _ => cur,
+                };
+                if tree.broken_at(at) {
+                    return cmd;
+                }
                 let (kind, level) = match cmd {
-                    Command::OpenBelow => {
-                        let next = line_idx.nth_line_start(row + 1);
-                        let le = if next > 0 && snapshot.get(next - 1) == Some(&b'\n') {
-                            next - 1
-                        } else {
-                            snapshot.len()
-                        };
-                        let ls = line_idx.nth_line_start(row);
-                        let level = indent::suggest_open_below(tree, snapshot, ls, le, row + 1);
-                        (OpenKind::Below, level)
-                    }
-                    Command::OpenAbove => (
-                        OpenKind::Above,
-                        indent::suggest_indent(tree, line_idx.nth_line_start(row), row),
-                    ),
-                    _ => (OpenKind::Split, indent::suggest_indent(tree, cur, row + 1)),
+                    Command::OpenBelow => (OpenKind::Below, tree.open_below(ls, le, row + 1)),
+                    Command::OpenAbove => (OpenKind::Above, tree.suggest_indent(ls, row)),
+                    _ => (OpenKind::Split, tree.suggest_indent(cur, row + 1)),
                 };
                 Command::OpenLineIndent { kind, level }
             }
@@ -583,7 +601,7 @@ fn resolve_tree_aware(
     // `}`/`)`/`]` — realign to the matching opener in a tree-backed buffer (the core bracket-match decides
     // whether to actually move). Dot-repeat replays the plain `InsertChar` (column unchanged).
     match cmd {
-        Command::InsertChar(c @ ('}' | ')' | ']')) if tree_of(ws).is_some() => {
+        Command::InsertChar(c @ ('}' | ')' | ']')) if has_tree(ws).is_some() => {
             Command::InsertCloser { ch: c }
         }
         other => other,
