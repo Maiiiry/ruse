@@ -1956,7 +1956,7 @@ impl Session {
         let mut new = crate::config::load_mode(&paths, safe);
         self.config_stamp = crate::config::Stamp::of(&paths);
         for d in &new.diagnostics {
-            tracing::warn!(code = d.code, "{}", d.message);
+            crate::log::config_diagnostic(d.code);
         }
         let broken = new.layers.iter().find(|l| {
             matches!(l.state, LayerState::Quarantined(_))
@@ -4263,7 +4263,10 @@ impl Session {
                         let n = read_text(ws, recorded, addr, clean.to_vec(), false);
                         status.echo(format!("\"{path}\" {n}L, {}B", raw.len()));
                     }
-                    Err(e) => status.error(format!("E484: can't open {path}: {e}")),
+                    Err(e) => {
+                        crate::log::open_failed("read", std::path::Path::new(&path), &e);
+                        status.error(format!("E484: can't open {path}: {e}"));
+                    }
                 },
                 ReadSource::Command(cmd) => match crate::shell::capture(&cmd) {
                     Ok(out) => {
@@ -5619,7 +5622,7 @@ fn journal_outcome(
         }
         Err(e) => {
             if failed.insert(id) {
-                tracing::warn!(event = "journal.failed", path = %path.display(), error = %e);
+                crate::log::journal_failed(path, &e);
                 status.error(format!(
                     "E303: unable to write the recovery journal for \"{}\": {e} ({})",
                     path.display(),
@@ -5710,13 +5713,24 @@ pub(crate) fn run(
             .map_or(0, crate::config::boot::BootRecord::failed),
     );
     let config = crate::config::load_mode(&config_paths, safe);
+    // Safe mode is a degrade: the user and workspace layers are not read (#966).
+    if let Some(mode) = safe {
+        crate::log::degrade(
+            "config",
+            match mode {
+                crate::config::SafeMode::Asked => "safe_mode_asked",
+                crate::config::SafeMode::CrashLoop { .. } => "safe_mode_crash_loop",
+            },
+            "",
+        );
+    }
     let mut boot_armed = crate::config::boot::arm(
         boot_record.clone(),
         safe,
         crate::config::reads_user_layers(&config),
     );
     for d in &config.diagnostics {
-        tracing::warn!(code = d.code, "{}", d.message);
+        crate::log::config_diagnostic(d.code);
     }
     let status = match crate::config::startup_notice(&config) {
         Some(note) if status == "ruse — :q to quit" => note,
@@ -6003,6 +6017,8 @@ pub(crate) fn run(
         if let Some(b) = boot_armed.take() {
             b.clear();
         }
+        #[cfg(debug_assertions)]
+        crate::log::debug_panic_if_requested();
         // Keys the session queued come before the terminal: the key half of a split Alt chord (#896), then
         // macro replay (D-055), so `@{reg}`'s decoded keys flow through the same dispatch as if re-typed. A
         // key from the replay queue is `from_replay`.
