@@ -17,7 +17,6 @@
 
 use crossterm::style::Color;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
 
 /// What occupies one display cell.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -73,15 +72,17 @@ impl Cell {
 }
 
 /// The display width, in terminal columns, of the grapheme cluster `g`: its base char's width
-/// (0 for a lone combining mark, 1 for normal, 2 for wide/CJK/emoji), floored at 1 for any
-/// non-empty cluster so a cluster always occupies at least one cell.
+/// (1 for normal, 2 for wide/CJK/emoji), floored at 1 for any non-empty cluster so a cluster always
+/// occupies at least one cell. The core's [`ruse_core::cells::cluster_width`], which its virtual columns
+/// count with too (#1251).
 #[must_use]
 pub fn cluster_width(g: &str) -> u16 {
-    match g.chars().next() {
-        None => 0,
-        Some(base) => (UnicodeWidthChar::width(base).unwrap_or(0) as u16).max(1),
-    }
+    u16::try_from(ruse_core::cells::cluster_width(g)).unwrap_or(u16::MAX)
 }
+
+// How nvim shows what it does not print (`^X`, `<xx>`, `<xxxx>`, #1181) is the core's width model, so the
+// cells painted and the virtual columns counted are one rule (#1251).
+pub use ruse_core::cells::{is_control, transcribe, unprintable};
 
 /// A `cols × rows` grid of cells, row-major. Repainted each frame, then diffed against the prior one.
 pub struct Screen {
@@ -124,7 +125,23 @@ impl Screen {
     /// column AFTER it. A width-2 cluster also marks the next cell as a continuation; a width-1 cluster fills
     /// one cell. A wide cluster with no room for its second half is drawn as a blank so nothing is clipped
     /// mid-glyph.
+    ///
+    /// No control byte ever reaches a cell (#1181): a cluster holding one paints its transcription
+    /// ([`transcribe`], `^[` for ESC) across as many cells, so text from a buffer, a file name or a
+    /// message can never move the terminal's cursor or change its state.
     pub fn put_styled(&mut self, row: u16, col: u16, g: &str, style: &CellStyle) -> u16 {
+        if let Some(shown) = transcribe(g, false) {
+            let mut c = col;
+            for sg in shown.graphemes(true) {
+                c = self.put_clean(row, c, sg, style);
+            }
+            return c;
+        }
+        self.put_clean(row, col, g, style)
+    }
+
+    /// [`Screen::put_styled`] of a cluster known to hold no control char.
+    fn put_clean(&mut self, row: u16, col: u16, g: &str, style: &CellStyle) -> u16 {
         let w = cluster_width(g);
         if w == 0 {
             return col;
@@ -152,6 +169,30 @@ impl Screen {
             }
         }
         col + w
+    }
+
+    /// Give the cell at `(row, col)` the background `bg`, keeping what it shows (`'cursorline'`,
+    /// `'cursorcolumn'`, `'colorcolumn'`, #616). A wide glyph's two cells both take it.
+    pub fn set_bg(&mut self, row: u16, col: u16, bg: Color) {
+        let Some(i) = self.idx(row, col) else {
+            return;
+        };
+        self.cells[i].style.bg = bg;
+        let wide = |c: &Cell| matches!(&c.content, Content::Cluster(g) if cluster_width(g) == 2);
+        if self.cells[i].content == Content::Continuation && col > 0 {
+            self.cells[i - 1].style.bg = bg;
+        } else if wide(&self.cells[i]) {
+            if let Some(j) = self.idx(row, col + 1) {
+                self.cells[j].style.bg = bg;
+            }
+        }
+    }
+
+    /// Make the cell at `(row, col)` bold (`CursorLineNr`, #616).
+    pub fn set_bold(&mut self, row: u16, col: u16) {
+        if let Some(i) = self.idx(row, col) {
+            self.cells[i].style.bold = true;
+        }
     }
 
     /// Paint a plain ASCII/short string left-to-right from `col`, one cluster per call. Convenience

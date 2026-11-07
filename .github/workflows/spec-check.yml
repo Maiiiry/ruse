@@ -14,11 +14,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0                   # `gov ratchet` compares ceilings with the base branch (#884)
       - uses: ./.github/actions/setup-python-yaml
       - run: python3 tools/spec-validate.py
       # When the generator (D-022) exists: python3 tools/spec-build.py && git diff --exit-code
       - name: docs hygiene (anchors / frontmatter / normative leak)
         run: python3 tools/ruse.py docs check
+      # The `gov-check` step of spec/verification.yaml: waiver expiry (FIT-WAIVERS-EXPIRED), ratchet
+      # ceilings, parity_oracle corpus integrity, prd_cfg, perf baselines, ... (#882). Without it they were
+      # enforced only by the optional local lefthook. No nvim/emacs here, so parity_oracle skips its selftest.
+      - name: governance checkers (gov check)
+        run: python3 tools/ruse.py gov check
       - name: change-workflow toolchain tests
         run: python3 -m unittest discover -s tools/tests -t .
       # Workflow files are code too: an invalid expression fails the run before any step executes

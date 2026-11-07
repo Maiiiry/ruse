@@ -17,8 +17,8 @@ audience: [maintainers, contributors, llm-agents, implementers-in-any-language]
 status: draft
 related:
   - ../architecture/architecture.md          # §7 UI/workspace, §3 state ownership
-  - ../rfc/proposed/RFC-0008-document-model.md  # Document/View/handle/kind noun (INV-DOC-VIEW, D-003)
-  - ../rfc/proposed/RFC-0002-workspace-architecture.md # layer model + interactive write-back
+  - ../rfc/accepted/RFC-0008-document-model.md  # Document/View/handle/kind noun (INV-DOC-VIEW, D-003)
+  - ../rfc/accepted/RFC-0002-workspace-architecture.md # layer model + interactive write-back
   - ../parity/workspace.md                    # WS-* surfaces, virtual-doc kinds, V-14 write-back
   - ../parity/vim.md                          # VIM-WIN windows/tabs/buffers, hidden
   - ../parity/emacs.md                        # EMACS-BUFFER, EMACS-EDIT-2 narrowing (V-27)
@@ -36,8 +36,8 @@ related:
 > This doc specifies **C-VIEW** (View/Window/layout, `depends_on: C-RENDER, C-ANCHOR`) and
 > **C-WORKSPACE** (Workspace + buffers, `depends_on: C-DOCUMENT, C-VIEW`) as declared in
 > [spec/PRD.yaml](../../spec/PRD.yaml). It is the *container* tier that sits above the Document noun
-> ([RFC-0008](../rfc/proposed/RFC-0008-document-model.md)) and inside the workspace layer model
-> ([RFC-0002](../rfc/proposed/RFC-0002-workspace-architecture.md)). Those two RFCs fix *what a Document
+> ([RFC-0008](../rfc/accepted/RFC-0008-document-model.md)) and inside the workspace layer model
+> ([RFC-0002](../rfc/accepted/RFC-0002-workspace-architecture.md)). Those two RFCs fix *what a Document
 > and a buffer-kind are*; this doc fixes *how Views are laid out, focused, resized, torn down, and
 > persisted*, and how the Workspace owns the buffer list. It cites the Document/kind/handle/anchor model
 > by ID and does not re-derive it.
@@ -57,7 +57,7 @@ alternately a per-window or per-buffer concept nobody can predict; a floating co
 *eats* an in-flight operator-pending state; and a session file (`:mksession` / `shada`) that either
 saves nothing useful or saves view-local ephemera it cannot faithfully restore.
 
-The [architecture](../architecture/architecture.md#7) principle — **buffer ≠ view ≠ window ≠ file**,
+The [architecture §7](../architecture/architecture.md) principle — **buffer ≠ view ≠ window ≠ file**,
 "everything is a workspace view/buffer" — and [INV-DOC-VIEW](../invariants/reference-invariants.md) fix
 the *nouns*. What is still unspecified, and what this doc closes, is the **layout tree and its lifecycle**:
 how Windows tile, split, focus, resize, and — critically — how closing a Window is decoupled from
@@ -81,7 +81,7 @@ closes **narrowing ownership** (V-27), the **overlay/modal layer** vs the tiling
   revision stream and one anchor store; an explicit *cloned/linked* variant where views may or may not
   share view-local facts. *(VW-MULTI)*
 - **G5** Buffer **kinds** and the **interactive-view write-back** contract from the View side (edits →
-  typed domain CommandRequests, preflighted) — binding [RFC-0002](../rfc/proposed/RFC-0002-workspace-architecture.md)
+  typed domain CommandRequests, preflighted) — binding [RFC-0002](../rfc/accepted/RFC-0002-workspace-architecture.md)
   §write-back to the layout engine.
 - **G6** **Narrowing as a Document-level restriction** (V-27) that confines *all* ops, reconciled with
   INV-DOC-VIEW, plus independent narrowing via an *indirect document*. *(VW-NARROW)*
@@ -96,10 +96,10 @@ closes **narrowing ownership** (V-27), the **overlay/modal layer** vs the tiling
 ## Non-goals
 
 - The Document / typed-coordinate / anchor / identity / **kind** model itself — owned by
-  [RFC-0008](../rfc/proposed/RFC-0008-document-model.md). We *use* `DocumentId`, `Snapshot`, `Anchor`,
+  [RFC-0008](../rfc/accepted/RFC-0008-document-model.md). We *use* `DocumentId`, `Snapshot`, `Anchor`,
   and `BufferKind`; we do not redefine them.
 - The transaction/undo contract and the save/recovery **journal** — owned by
-  [RFC-0007](../rfc/proposed/RFC-0007-transaction-engine.md) / [persistence-and-recovery.md](persistence-and-recovery.md). Session persistence here reuses
+  [RFC-0007](../rfc/accepted/RFC-0007-transaction-engine.md) / [persistence-and-recovery.md](persistence-and-recovery.md). Session persistence here reuses
   that versioned format; it does not invent a second one.
 - The **positions-history** model (marks `a-z`/`A-Z`, mark ring, jumplist, changelist) — owned by
   [positions-history.md](positions-history.md) (D-027). We fix only *which owner* (view vs document vs
@@ -167,7 +167,7 @@ not redefined here):
 ### 1. The three handles and who owns what (VW-HANDLE, VW-VIEWSTATE)
 
 Ownership is partitioned one-fact-one-owner, extending
-[RFC-0008 §1](../rfc/proposed/RFC-0008-document-model.md):
+[RFC-0008 §1](../rfc/accepted/RFC-0008-document-model.md):
 
 | Fact | Owner | Handle | Never on |
 | --- | --- | --- | --- |
@@ -304,8 +304,8 @@ Every solve bumps `LayoutTree.epoch`.
 
 ### 3. Layout lifecycle ≠ view lifecycle ≠ document lifecycle (VW-LIFE) — leak prevention
 
-This is the load-bearing decoupling ([RFC-0002](../rfc/proposed/RFC-0002-workspace-architecture.md),
-[RFC-0008 §1](../rfc/proposed/RFC-0008-document-model.md), design-requirements §11). Three lifetimes,
+This is the load-bearing decoupling ([RFC-0002](../rfc/accepted/RFC-0002-workspace-architecture.md),
+[RFC-0008 §1](../rfc/accepted/RFC-0008-document-model.md), design-requirements §11). Three lifetimes,
 three owners, released bottom-up:
 
 ```
@@ -391,17 +391,16 @@ splits" behavior Vim gets right and that a cursor-on-buffer model gets wrong (th
 **Linked/cloned views.** `:split` and `C-w v` create a *new* View of the same Document (independent
 cursor). A **clone** operation (Emacs `clone-indirect-buffer` *without* narrowing; a "duplicate view")
 may optionally *copy* the source View's cursor/viewport as a starting point but thereafter they diverge.
-There is no mode where two Views of the *same* Document share a live cursor — that would be a single View
-shown twice, which the layout expresses by hosting one `ViewId` in… no: a `WindowId` hosts exactly one
-`ViewId`, and a `ViewId` is hosted by at most one Window, so "one view, two windows" is not representable —
+There is no mode where two Views of the *same* Document share a live cursor. A `WindowId` hosts exactly one
+`ViewId`, and a `ViewId` is hosted by at most one Window, so "one view, two windows" is not representable:
 by construction (VW-HANDLE) each window is an independent view. This is deliberate: it removes the
 "whose cursor is it" ambiguity entirely.
 
 ### 5. Buffer kinds and interactive-view write-back (from the View side)
 
-Kind is a Document property ([RFC-0008 §5](../rfc/proposed/RFC-0008-document-model.md), INV-BUFFER-KIND);
+Kind is a Document property ([RFC-0008 §5](../rfc/accepted/RFC-0008-document-model.md), INV-BUFFER-KIND);
 the *View* is what turns a user gesture into the kind-appropriate mutation. The write-back contract is
-[RFC-0002 §write-back](../rfc/proposed/RFC-0002-workspace-architecture.md) / [workspace.md V-14](../parity/workspace.md);
+[RFC-0002 §write-back](../rfc/accepted/RFC-0002-workspace-architecture.md) / [workspace.md V-14](../parity/workspace.md);
 this doc pins the **View-side descriptor** that a WS-* surface supplies:
 
 ```rust
@@ -416,6 +415,8 @@ pub struct WriteBackDescriptor {
     interpret_edit: fn(edit: &BufferEditIntent, &RenderModel) -> Option<CommandRequest>,
 }
 ```
+
+D-057 names `{Ordinary, Scratch, NoFile, Interactive}`; reconciling the two is part of #945.
 
 Per-kind view behavior:
 
@@ -520,7 +521,7 @@ temporary-state layer, never by owning mode.
 
 ### 8. Workspace & Session (VW-SESSION)
 
-The **Workspace** is a Built-in Service ([RFC-0002](../rfc/proposed/RFC-0002-workspace-architecture.md)),
+The **Workspace** is a Built-in Service ([RFC-0002](../rfc/accepted/RFC-0002-workspace-architecture.md)),
 owning the whole container tier:
 
 ```rust
@@ -540,10 +541,10 @@ pub struct Workspace {
 ```
 
 <!-- design-code-ack: Workspace — the illustration above is the FULL C-WORKSPACE design; the code
-     (crates/core/src/workspace.rs) is the F-007 MVP slice, which deliberately implements only
-     { documents, views, windows, split, focus } and defers buffer_list / tabs / overlays / roots /
-     services / settings / session / health to post-MVP (see "MVP slice — F-007 minimal" below). The
-     design is ahead of the code by intent, not stale — reconcile as the slice grows. -->
+     (crates/core/src/workspace.rs) is the F-007 MVP slice plus the buffer list, which implements
+     { documents, views, windows, split, focus, names, buffer_order, alt, clipboard } and defers tabs /
+     overlays / roots / services / settings / session / health to post-MVP (see "MVP slice — F-007 minimal"
+     below). The design is ahead of the code by intent. -->
 
 
 #### 8.1 Buffer list: listed / unlisted / hidden (VIM-WIN, EMACS-BUFFER)
@@ -630,7 +631,8 @@ machine/global (user profile)  <  workspace (project)  <  buffer-local (mode)  <
    lower precedence  ────────────────────────────────────────────────────────────────────►  higher
 ```
 
-- **Machine/global vs workspace:** a workspace (`.ruse/…` in a repo root) may set project settings
+- **Machine/global vs workspace:** a workspace (`.ruse/…` in a repo root; committed project config only,
+  never per-user state, D-062) may set project settings
   (formatter, tab width, enabled plugins) but **must not override security-sensitive or machine-scoped
   settings** (trust decisions, credential paths, remote exec policy) — INV-TRUST-1 / ARCH-FORBID
   ("a workspace must not override security-sensitive settings"). The `SettingsResolver` classifies each
@@ -670,8 +672,10 @@ projection keyed by the focused/hosted `DocumentId`, not a separate store.
   rather than producing negative/zero-invalid rectangles; a split that cannot fit even at min is refused
   with a typed `ErrorCode::NoRoomForWindow` (INV-ERR-CLASS), matching Vim's `E36`.
 - **Closing the last window of a tab / of the workspace** — closing the last leaf of a tab closes the tab;
-  closing the last window of the last tab triggers the quit-policy (prompt if any modified/hidden buffer
-  has unsaved work; save-preflight, stability §13). Never silent loss.
+  closing the last window of the last tab triggers the quit-policy: refuse while any modified buffer,
+  focused or hidden, has unsaved work (Vim E37/E162 — `:q!` waives only the focused buffer), unless the
+  user abandons it explicitly (`:qa!`, `:cq`); save-preflight, stability §13. Never silent loss. Shipped
+  for the MVP flat layout in #611; no interactive prompt yet.
 - **Closing a modified buffer's last window** — does **not** unload it; becomes a hidden/listed background
   buffer with a live journal (§3). Explicit `:bdelete!`/`kill-buffer` on modified content goes through
   save-preflight.
@@ -732,7 +736,7 @@ projection keyed by the focused/hosted `DocumentId`, not a separate store.
 
 ## Compatibility impact
 
-- Delivers the container half of **F-007** (one buffer, many views) and **F-008** (workspace/session)
+- Delivers the container half of **F-007** (one buffer, many views) and the session half tracked by #639
   onto the Document noun; unblocks the WS-* surfaces ([workspace.md](../parity/workspace.md)) which are all
   Views over this layout.
 - Reproduces **VIM-WIN** (windows/tabs/buffers, `hidden`, `C-w`/`gt`) and **EMACS-BUFFER** (buffer list,
@@ -813,14 +817,12 @@ projection keyed by the focused/hosted `DocumentId`, not a separate store.
 
 ## Migration strategy
 
-Greenfield (no prior view/window/session impl). Land order, respecting `depends_on`
-(C-VIEW → C-RENDER, C-ANCHOR; C-WORKSPACE → C-DOCUMENT, C-VIEW): (1) the three handles + view-local state
-+ single-leaf layout; (2) the split tree + solve + `C-w` surface + tabs; (3) the lifecycle/leak model
-(§3) with scheduler task cancellation; (4) multi-view of one buffer (§4); (5) buffer list + kinds +
-interactive write-back (§5); (6) narrowing (§6); (7) overlays (§7); (8) Workspace, multi-root, session
+`DocumentId` and `ViewId` (plain indexes), view-local state, the flat layout, multi-view of one buffer and the
+buffer list are in place. `WindowId` and generation checks are not (#973). Order for the rest, respecting `depends_on` (C-VIEW → C-RENDER, C-ANCHOR; C-WORKSPACE → C-DOCUMENT,
+C-VIEW): the split tree + solve + full `C-w` surface + tabs; the lifecycle/leak model (§3) with scheduler task
+cancellation; kinds + interactive write-back (§5); narrowing (§6); overlays (§7); multi-root, session
 save/restore, settings scope (§8). Session and settings formats are versioned from v1 (INV-ADDITIVE) so
-later multi-client/remote work extends them without a break. This resolves **V-11** (C-WORKSPACE was
-absent from the early build order): the workspace stage is placed here, early, ahead of the remote stage.
+later multi-client/remote work extends them without a break.
 
 ## Test strategy
 
@@ -885,23 +887,22 @@ absent from the early build order): the workspace stage is placed here, early, a
    arena-owned Documents: a Document is retired only when its last View is dropped.
 4. **Buffer / View / Window are distinct.** Three handle types, no "buffers-as-tabs".
 
-### The core refactor (the crux, and the whole cost)
+### The buffer/view split
 
-Today `EditorState` (crates/core/src/editor.rs) entangles the **buffer** and the **view**. Split it:
+`EditorState` (`crates/core/src/editor/mod.rs`) is split between the **buffer** and the **view**:
 
-| Field(s) | Moves to | Why |
+| Field(s) | Lives on | Why |
 |---|---|---|
-| `doc: Document`, `last_was_edit` | **Document/Buffer** (shared) | text + undo + the grouping bit are buffer facts |
+| `doc: Document` | **Document/Buffer** (shared) | text + undo are buffer facts |
+| `last_was_edit` | **`View`** today | the grouping bit is a buffer fact; not moved yet |
 | `cursor`, `mode`, `anchor`, `last_visual`, `curswant`, `block_insert`, `replace_stack`, `pending_register`, viewport `top` | **`View`** (per-View, `ViewId`) | INV-DOC-VIEW: two Views of one buffer have independent cursors/selection/mode |
-| `registers` | **Workspace** (shared) | Vim registers are global, not per-buffer or per-view |
-| `tab_width`, `indent_style` | **Workspace/config** | editor config, not view or buffer |
+| `registers` | **Workspace** (D-057 slice 2, #944), lent into the focused `View` per command | Vim registers are global, not per-buffer or per-view |
+| `tab_width` (tabstop), `shift_width`, `indent_style` | **`View`** today (`IndentConfig`); Workspace/config is the target | editor config, not view or buffer |
 
-`apply_command(st, cmd)` becomes `apply_command(view: &mut View, doc: &mut Document, ctx: &mut EditCtx, cmd)`
-where `EditCtx` carries the shared registers + config. **This touches every command handler and every
-core test** — it is a mechanical but large diff, and it is why F-007 is design-first. The proposed
-sequencing (see the change plan) is: (a) land the Buffer/View split with a **single** View so behaviour
-is provably unchanged (the whole test suite still passes over one View); (b) add the Workspace +
-2-way split + focus; (c) repoint + flip.
+`apply_command` keeps its `EditorState` signature. To run a command, the focused `(Document, View)` pair is
+swapped out of its arena slots into an `EditorState`, the pipeline runs, and the pair is swapped back
+(the swap trick, `crates/core/src/workspace.rs`). One command runs at a time and other Views hold only the
+id, so the move is sound.
 
 ### Document ownership — arena + handles, not `Rc<RefCell>`
 
@@ -935,7 +936,7 @@ are ruse workspace ARCHITECTURE (census-N/A → backlog), like F-002/005/008. De
 ### Deferred to post-MVP (explicit)
 
 Full layout tree · tab pages · resize/sizing constraints + `winfix*` · the full `C-w` command set ·
-folds (the View holds a fold-state field, empty in MVP) · session/undo persistence across restart ·
+folds in the core View (folds are frontend state, `apps/tui/src/folds.rs`) · session/undo persistence across restart ·
 multi-client render pinning. None require re-opening the model above.
 
 ## Reference Invariants

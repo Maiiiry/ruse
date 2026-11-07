@@ -7,7 +7,7 @@ summary: >
   its kind and blast radius, and the required documents/verification/approval follow from that kind. A human
   owns Approve and Merge; the AI amplifies Plan and Execute; scripts verify the result independently. This
   documents the single entry point `python3 tools/ruse.py` and its P0 subcommands, the Change Contract
-  (.ruse/work/<id>/change.yaml), and how classification can only raise risk, never lower it.
+  ($(git rev-parse --git-path ruse/work)/<id>/change.yaml, inside .git), and how classification can only raise risk, never lower it.
 audience: [maintainers, contributors, llm-agents]
 status: draft
 related:
@@ -46,7 +46,7 @@ python3 tools/ruse.py <command>
 
 | Command | What it does |
 | --- | --- |
-| `change start --issue <id> --kind <k> --area <crate>` | Scaffold `.ruse/work/<id>/` (the Change Contract) |
+| `change start --issue <id> --kind <k> --area <crate>` | Scaffold `$(git rev-parse --git-path ruse/work)/<id>/` (the Change Contract) |
 | `change classify [--base <ref>] [--files ...] [--kind <k>]` | Compute the **minimum** required kind from the diff |
 | `impact --from <ID>` / `impact --changed` | What a spec ID or the diff ripples into |
 | `context build --issue <id>` / `context check` | Task-scoped context pack for an AI + staleness lock |
@@ -65,6 +65,7 @@ It mirrors the human one-minute guide in [change-paths.md](../contributing/chang
 | --- | --- | --- |
 | `docs-editorial` | 0 | direct PR (CI only) |
 | `docs-semantic` | 1 | link the spec/Decision ID; PR |
+| `build` | 1 | PR; CI stays green; no spec/Decision artifact |
 | `implementation` | 2 | Issue + one observable acceptance condition |
 | `spec` | 2 | Issue + spec diff (spec lands before/with the first impl PR) |
 | `architecture` | 3 | RFC + impact analysis + human approval; Decision when hard to reverse |
@@ -75,18 +76,70 @@ It mirrors the human one-minute guide in [change-paths.md](../contributing/chang
 `architecture` for a one-line README change only **warns**. Whether a docs edit is editorial or semantic —
 and whether something is "really" an architecture change — stays a human judgment; the tool only forces a
 floor when a path is unambiguously high-risk, and hard-fails a hand-edit of a generated file (ENG-DOC-001).
+Gate policy is one of those paths (#884): every machine-read `spec/*.yaml` (waivers, ratchet ceilings, the
+verify registry, fitness thresholds, perf baselines, the parity census and oracle pins) is at least `spec`,
+`spec/architecture.yaml` is `architecture`, the contracts in `spec/contracts/` are `contract`, lint /
+toolchain config (`clippy.toml`, `rust-toolchain.toml`) and `scripts/` are `build`, and `tests/` and `fuzz/`
+(oracle fixtures included) are `implementation`. Code that implements a stability boundary
+(`contract_triggers` in `change-kinds.yaml`: the RJ01/RJS0 record code, `persist/journal.rs`,
+`remote/protocol.rs`) only **warns** when the contract leaves the matching `contracts.*` flag unset, because
+a refactor of format code need not change the format.
+
+A failed `git diff` (a base ref that is not fetched, a shallow clone) is an error, never "0 changed files"
+(#885): `classify`, `verify`, `pr check` and `pr render` stop and say which git command failed.
 
 ## The Change Contract
 
-`change start` scaffolds a small, **local** agreement at `.ruse/work/<id>/change.yaml`
-(template: [spec/templates/change.yaml](../../spec/templates/change.yaml)). `.ruse/` is gitignored — only
-the final RFC / Decision / PRD change / PR is permanent. The contract declares the kind, the affected spec
-IDs (`CAP-*`/`F-*`/`C-*`/`INV-*`/`D-*`), the crates, whether a stability boundary is crossed, the
-`allow_paths` / `forbid_paths` blast radius, and the closing evidence. It is not a prompt — it is the set of
-permissions and verification conditions the implementer (human or agent) works within.
+`change start` scaffolds a small, **local** agreement at `$(git rev-parse --git-path ruse/work)/<id>/change.yaml`
+(template: [spec/templates/change.yaml](../../spec/templates/change.yaml)). That directory is inside `.git`,
+one per worktree, and is never committed — only the final RFC / Decision / PRD change / PR is permanent.
+The contract declares the kind, the affected spec IDs (`CAP-*`/`F-*`/`C-*`/`INV-*`/`D-*`), the crates,
+whether a stability boundary is crossed, the `allow_paths` / `forbid_paths` blast radius, and the closing
+evidence. It is not a prompt — it is the set of permissions and verification conditions the implementer
+(human or agent) works within.
+
+> **Where the tooling writes (D-062).** `.ruse/` at a workspace root belongs to the product: it holds only
+> committed project configuration (e.g. `.ruse/config.toml`), and ruse never writes local or per-user state
+> into a repository. So the ruse repo's development tooling keeps per-change state in
+> `$(git rev-parse --git-path ruse/work)/` (inside `.git`, per worktree) and the upstream-source cache in
+> `${XDG_CACHE_HOME:-~/.cache}/ruse-dev/` (shared across worktrees; `parity fetch` locks per upstream).
+> A checkout that still has the pre-D-062 `.ruse/work/` or `.ruse/cache/` gets it moved to the new
+> location by the first `ruse` command run there (it prints each move); an id present in both places
+> stops the command until you keep one.
+
+**Set the contract with flags, not by hand.** The contract file sits inside `.git`, where some editors and
+sandboxed agents cannot write, so every field an author fills is a command-line flag. You can pass them to
+`change start` and amend later with `change set`:
+
+```bash
+python3 tools/ruse.py change start --issue 42 --kind implementation --area core --goal "..." \
+    --allow crates/core/ --allow docs/design/document-model.md --forbid spec/DECISIONS.md \
+    --spec-ref C-TRANSACTION --spec-ref INV-TXN --non-goal "no UI change" --rfc RFC-0021 --decision D-062
+python3 tools/ruse.py change set --issue 42 --allow tools/              # append to allow_paths
+python3 tools/ruse.py change set --issue 42 --replace --allow tools/    # replace allow_paths
+```
+
+| Flag | Field |
+| --- | --- |
+| `--allow PATH` / `--forbid PATH` | `allow_paths` / `forbid_paths` (repeatable) |
+| `--spec-ref ID` | `affected.*`, chosen by prefix: `CAP-*` → capabilities, `F-*`/`C-*` → requirements, `INV-*` → invariants, `D-*` → decisions (repeatable) |
+| `--non-goal TEXT` | `non_goals` (repeatable) |
+| `--rfc ID` / `--decision ID` | `artifacts.rfc` / `artifacts.decision` (scalars) |
+| `--persistent-format` / `--protocol` / `--public-api` (and `--no-…`) | `contracts.*`: the change crosses that stability boundary; `pr check` then holds it to kind `contract` |
+| `--migration REF` | `artifacts.migration`: where old data's migration is decided (an RFC section, a `D-*`, a PR), or `none`; required by `pr check` when `contracts.persistent_format` is set |
+| `--compat-reviewed REF` | `artifacts.compat_reviewed`: where the compatibility review is recorded (an RFC section, a review, a PR); required by `pr check` for kind `contract`, which fails without it (#887) |
+| `--kind KIND` / `--goal TEXT` | `kind` / `goal` (`change set` only; `change start` has its own `--kind` / `--goal`) |
+
+List flags **append**, and duplicates are skipped. With `change set --replace`, each list flag you pass
+replaces its list, and lists you do not mention are kept. Scalars always replace. `--area` fills
+`affected.crates`. It seeds `allow_paths` with `crates/<c>/` **only when `change start` gets no `--allow`**:
+explicit `--allow` paths are the whole blast radius, so a docs-only change declared with `--area core`
+does not silently allow `crates/core/` (`pr check` fails any file outside `allow_paths`). The template's
+comments are preserved. A
+field that was hand-edited into a different shape is rewritten through YAML, and a warning says so.
 
 ```
-.ruse/work/<id>/
+$(git rev-parse --git-path ruse/work)/<id>/
 ├── change.yaml       # the contract
 ├── plan.md           # Planner output (plan validate checks completeness)
 ├── context.md        # context build output (what to read)
@@ -97,16 +150,18 @@ permissions and verification conditions the implementer (human or agent) works w
 
 ### The gate: local preflight vs. the CI gate of record
 
-`.ruse/` is gitignored **on purpose**, and CI never trusts it — a self-reported `evidence.json` cannot be a
+The work directory is local and uncommitted **on purpose**, and CI never trusts it — a self-reported `evidence.json` cannot be a
 merge gate (it is trivially fabricated). So the gate is two-tier:
 
-- **Local `ruse pr check`** — a *preflight*: it reads your `.ruse/` and tells you whether the gate will pass.
+- **Local `ruse pr check`** — a *preflight*: it reads your local work directory and tells you whether the gate will pass.
   Convenience, not authority.
 - **CI `change-policy` job** — the *gate of record* ([`.github/workflows/change-policy.yml`](../../.github/workflows/change-policy.yml)).
   It reads only the author's DECLARED contract from the `ruse-gate:v1` block that `ruse pr render` embeds in
   the PR body, then **re-derives** the observed kind + blast radius from the real diff and relies on the
   re-run verify jobs (`spec-check.yml`) for evidence:
   `ruse pr check --pr-body <body> --base origin/<base>`. Nothing on the contributor's machine is trusted.
+  This job does not see those jobs' results, so it records no evidence check of its own; its output names
+  the required jobs (`rust`, `spec-validate`) that enforce the evidence instead (#887).
 
 The author declares; CI verifies against the diff. Under-declaring the kind, or straying outside
 `allow_paths`, fails in CI regardless of what the local run reported.
@@ -126,7 +181,7 @@ python3 tools/ruse.py verify --changed
 python3 tools/ruse.py change start --issue 123 --kind implementation --area core --goal "..."
 # edit change.yaml: affected IDs, allow_paths
 python3 tools/ruse.py context build --issue 123     # what to read (bounded)
-python3 tools/ruse.py impact --issue 123 --out .ruse/work/123/impact.json
+python3 tools/ruse.py impact --issue 123 --out "$(git rev-parse --git-path ruse/work)/123/impact.json"
 # ... implement within allow_paths ...
 python3 tools/ruse.py verify --changed               # records evidence.json
 python3 tools/ruse.py pr render --issue 123 > pr.md
@@ -165,7 +220,12 @@ spec-validate) and `arch deps` / `dependency-check` (spec/dependencies.yaml `all
 crate dependency-cycle detection; enforces an explicit `crate_layers:` direction map if one is added to
 spec/dependencies.yaml). Both are wired into `verify`.
 
+`verify` fails safe (#888): a missing or malformed `spec/verification.yaml` fails it, a step the diff needs
+whose tool (`cargo`) is missing fails it instead of being skipped, and a changed file no scope rule
+recognises selects every scope. `arch deps` fails without PyYAML, its policy files or `cargo metadata`.
+
 Deferred (P1+, reported as "not built yet" by `verify`): `public-api-diff` and `protocol-compat` (need a
-git baseline and real Rust/protocol surface — the crates are still skeletons), and the `spec generate`
+git baseline and a real protocol surface; until then a `contract` change attests its review with
+`--compat-reviewed`), and the `spec generate`
 derived-artifact generator (tracked by D-022). These raise the floor of what `verify --full` and `pr check`
 can enforce as the reference implementation grows.

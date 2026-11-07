@@ -9,6 +9,9 @@ Two things it can check today without inventing new policy:
 If spec/dependencies.yaml grows an explicit `crate_layers:` map (crate -> allowed crate
 deps), this also enforces direction against it; until then that check reports "not declared"
 rather than guessing a layering from prose.
+
+  3. The module-level rules of spec/architecture.yaml read from the source (`source_scan`, #983):
+     each `forbidden_module_edges[*].scan`, and `txn_only_mutation` (CON-TXN-ONLY-MUTATION).
 """
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ import subprocess
 import sys
 
 from rusekit import repo, render  # noqa: E402
+from rusekit.arch import source_scan  # noqa: E402
 
 try:
     import yaml
@@ -106,8 +110,14 @@ def main(argv: list[str]) -> int:
     errors: list[str] = []
     warns: list[str] = []
 
+    # Every input this check needs is required: a missing PyYAML, policy file or cargo graph is a FAIL,
+    # never a PASS with the check skipped (#888).
+    if yaml is None:
+        render.fail("dependency-check: PyYAML is required (`pip install pyyaml`) — nothing was checked")
+        return 1
+
     # 1. allowed_layers reference real crates
-    if yaml is not None and os.path.isfile(repo.path("spec/dependencies.yaml")):
+    if os.path.isfile(repo.path("spec/dependencies.yaml")):
         deps = yaml.safe_load(open(repo.path("spec/dependencies.yaml"))) or {}
         valid = set(repo.CRATES) | {"any-dev"}
         for did, d in (deps.get("dependencies") or {}).items():
@@ -116,23 +126,23 @@ def main(argv: list[str]) -> int:
                     errors.append(f"{did}: allowed_layers '{layer}' is not a real crate "
                                   f"(known: {sorted(valid)})")
     else:
-        warns.append("spec/dependencies.yaml not readable — skipped allowed_layers check")
+        errors.append("spec/dependencies.yaml not found — allowed_layers cannot be checked")
 
     # 1b. Architecture-as-Code: the crate dependency contract (spec/architecture.yaml, ARCH-LAYER-001).
     arch: dict = {}
-    if yaml is not None and os.path.isfile(repo.path("spec/architecture.yaml")):
+    if os.path.isfile(repo.path("spec/architecture.yaml")):
         arch = yaml.safe_load(open(repo.path("spec/architecture.yaml"))) or {}
         for c in (arch.get("crates") or {}):
             if c not in repo.CRATES:
                 errors.append(f"architecture.yaml: crate '{c}' is not a real crate {sorted(repo.CRATES)}")
     else:
-        warns.append("spec/architecture.yaml not found — no crate dependency contract (ARCH-LAYER-001)")
+        errors.append("spec/architecture.yaml not found — no crate dependency contract (ARCH-LAYER-001)")
     allowed_closure = _closure(arch.get("crates") or {})
 
     # 2. internal crate graph: cycles + optional direction
     meta = _cargo_metadata()
     if meta is None:
-        warns.append("cargo metadata unavailable — skipped crate-graph checks")
+        errors.append("cargo metadata unavailable — the crate graph (cycles, direction) was not checked")
     else:
         graph = _internal_graph(meta)
         edges = sum(len(v) for v in graph.values())
@@ -162,11 +172,12 @@ def main(argv: list[str]) -> int:
         else:
             render.bullet("no architecture.yaml crate contract — cycles enforced, direction skipped",
                           mark="·")
-        # forbidden module edges: declared now, source-enforceable once crates have code
-        fme = arch.get("forbidden_module_edges") or []
-        if fme:
-            render.bullet(f"forbidden module edges: {len(fme)} declared "
-                          "(source-scan NOT-YET — needs code)", mark="·")
+    # 3. module-level rules read from the source (#983): forbidden edges inside a crate and direct mutation.
+    if arch:
+        src_errors, notes = source_scan.check(arch)
+        for n in notes:
+            render.bullet(n, mark="·")
+        errors.extend(src_errors)
 
     print()
     for w in warns:

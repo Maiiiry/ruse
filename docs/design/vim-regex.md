@@ -15,7 +15,7 @@ summary: >
 audience: [maintainers, contributors, llm-agents]
 status: draft
 related:
-  - architecture.md
+  - ../architecture/architecture.md
   - editing-language.md
   - register-model.md
   - ../parity/vim.md
@@ -28,7 +28,12 @@ related:
 
 # ruse Regex Abstraction & Vim-Dialect Engine
 
-Resolves **D-028** (open) and **V-8** (verification.md: "Vim regex dialect has no owning component or
+> **Current code.** D-028 is decided, and its 2026-11-03 amendment (#996) records the state the code is in: a port of
+> nvim's pattern reader lowering straight to the wrapped `regex` crate, which is the only engine; atoms it cannot
+> represent are rejected with a typed error. See [Current state (MVP)](#current-state-mvp-d-028-amendment-2026-11-03).
+> `VimEngine`, the IR, the router and match budgets below are unbuilt; the owned engine is scheduled later (§3, #1128).
+
+Design behind **D-028** (decided, design) and **V-8** (verification.md: "Vim regex dialect has no owning component or
 decision"). Specifies the `C-REGEX` component referenced by D-028 and by
 [F-009](../../spec/PRD.yaml) (Search & substitute), and closes the strategy question flagged by
 [VIM-SEARCH-1](../parity/vim.md#vim-search--search--substitute) and
@@ -39,6 +44,90 @@ decision"). Specifies the `C-REGEX` component referenced by D-028 and by
 Intentionally-different. Vim search/substitute is a muscle-memory L2 obligation
 ([VIM-SEARCH](../parity/vim.md#vim-search--search--substitute) targets L2); `\zs`/`\ze`/lookbehind are
 common enough in real `.vimrc`/plugins that documenting them away would fail the parity charter (D-007).
+
+## Current state (MVP, D-028 amendment 2026-11-03)
+
+D-028 stands as written: option (a), a Vim front-end and an owned Vim engine beside the wrapped one. What ships
+today is the first half, and the amendment records it.
+
+- **Front-end.** `crates/core/src/pattern.rs` is a port of nvim's `regexp.c` reader (`peekchr`, `nfa_regatom`,
+  `nfa_regpiece`, the collection reader; #692, PR #1050). It resolves the magic levels once (§5) and lowers
+  `\zs`/`\ze` to reserved empty capture groups (§4). It lowers **straight to Rust `regex` syntax**: there is no
+  `RegexIr`, no `Requirements` summary and no router yet. The IR arrives with the owned engine.
+- **Engine.** The wrapped `regex` crate is the only engine; it runs every pattern the front-end accepts. Which
+  shapes agree with nvim is certified by the differential oracle, `tools/parity/pattern_oracle.py`, which
+  captures nvim's first match for each row into `crates/core/tests/pattern_oracle/cases.rs`; `crates/core/tests/pattern_oracle.rs` replays every row.
+  The per-class table (`cargo test -p ruse-core --test pattern_oracle -- --nocapture`, after #745):
+
+  | class | rows | agree | unsupported | known |
+  |---|---:|---:|---:|---:|
+  | collections | 56 | 55 | 1 | 0 |
+  | anchors | 43 | 43 | 0 | 0 |
+  | magic levels | 65 | 62 | 3 | 0 |
+  | atoms | 32 | 32 | 0 | 0 |
+  | multis | 44 | 44 | 0 | 0 |
+  | optional sequence and code points | 19 | 19 | 0 | 0 |
+  | case and smartcase | 75 | 73 | 2 | 0 |
+  | line breaks | 27 | 27 | 0 | 0 |
+  | character classes | 57 | 57 | 0 | 0 |
+  | word boundaries | 50 | 46 | 0 | 4 |
+  | \zs and \ze | 28 | 28 | 0 | 0 |
+  | alternation and groups | 10 | 10 | 0 | 0 |
+  | multibyte and case folding | 59 | 59 | 0 | 0 |
+  | position atoms | 8 | 0 | 8 | 0 |
+  | rejected | 14 | 1 | 13 | 0 |
+  | **total** | **587** | **556** | **27** | **4** |
+
+  This table **is** §7's fast-path allow-list, grown by tests rather than starting empty: with no owned engine
+  to fall back to, a shape ruse claims to match like nvim is one with agreeing oracle rows. A Vim atom the
+  wrapped engine cannot express is rejected (next point); a shape no row covers yet is uncertified, and the
+  fix for that is a new oracle row, not a new rejection.
+- **Rejected, never faked.** Lookaround (`\@=` `\@!` `\@<=` `\@<!` `\@>`), backrefs `\1`-`\9`, `\&`, `~`, the
+  position atoms (`\%V` `\%23l` `\%23c` `\%23v` `\%'m` `\%#` `\%^` `\%$` …), `\Z` and equivalence classes
+  `[=a=]` return `RegexError::Unsupported`; an oracle row marked `Unsupported` fails if ruse ever returns a
+  match for it.
+- **`\<`/`\>` at the pattern edges: Vim's rule (#745, built).** When `\<` opens a one-branch pattern or `\>`
+  closes it (after any `\c`/`\v`-style flags; `\%#=` is dropped first), the lowering drops it from the Rust
+  pattern and `Regex` checks each candidate afterwards with Vim's rule (`nfa_regmatch` `NFA_BOW`/`NFA_EOW` over
+  `mb_get_class`): at the start, the character at the boundary is a word character (class 2 or more) and the
+  previous character on the line has a different class; at the end, the character before the boundary is a word
+  character and the one after (a line end counts as blank) has a different class. The classes come from
+  `crates/core/src/char_class_table.rs`, captured from the pinned nvim's `charclass()` for every code point by
+  `tools/parity/char_classes.py` (default `'iskeyword'`, so Latin-1 `×`/`÷` are word characters); the same
+  classes split the keyword `*`/`#`/`g*`/`gd` pick up (nvim's `find_ident_at_pos`), so `*` on `API` in
+  `API를` searches `\<API\>`. A start that fails `\<` is skipped (no end can rescue it).
+  A start whose first end fails `\>` tries its other ends: when the pattern's end can vary (a multi, `\|`,
+  `\%[`) and it has no other zero-width assertion, `^(?:pattern)\z` is matched on the slice up to each end that
+  passes `\>`, nearer shorter ends first (right for a greedy tail: `.*\>` on `ab cd+` is `(0,5)`), then longer
+  ones (right for a lazy tail: `.\{-}\>` on `ab cd` is `(0,2)`). At most 64 such ends, within 1024 characters
+  on each side, are tried per start; then the search moves to the next start. The limit is ranking: Vim takes
+  the highest-priority path that passes, ruse cannot rank paths, so `\(a.\|a.b\|a\)\>` on `a b` is nvim `(0,3)`
+  but ruse `(0,1)` (a `known(1128)` row). A pattern with another assertion (`^`, `$`, a mid-pattern `\<`) tries
+  no other ends. `*` got faster, not slower: the Unicode `\b` assertions kept the engine off its fastest path
+  (`word_search` bench, `spec/perf-baseline.yaml`).
+- **One knowing approximation left: mid-pattern `\<`/`\>`.** Anywhere else (inside a group, in one of several
+  branches, between other atoms) they lower to Rust's `\b{start}`/`\b{end}`. Those agree with Vim between a word
+  and a non-word character for ASCII and Latin, and miss Vim's other boundary, a change of class between two
+  word characters (Latin to Hangul/CJK/kana: `x\<한` on `x한`), and Latin-1 `×`/`÷`. The `known(1128)` rows are
+  these and the ranking limit above; a `known` row that starts agreeing fails until it is promoted, the same
+  ratchet as `tests/parity/vim/known-divergences.txt`. The owned engine (#1128) fixes both.
+- **Text that is not UTF-8 (#1243, built).** The wrapped engine matches `&str`, so `pattern::Hay` spells a
+  buffer for it: each byte that belongs to no valid UTF-8 char becomes an escape char, U+10FF00 plus the byte
+  (U+10FF80-U+10FFFF), and match offsets map back to the buffer. As in nvim, such a byte is one char (`.` and
+  `[^a]` take it; a cut sequence is one char per byte), equals no typed char (`/ÿ` does not find byte 0xFF), and
+  has the class of the Latin-1 char of its value for `\k` `\i` `\f` `\p` and the `\<`/`\>` checks (0xFF is a
+  keyword char, 0x80 is not). A pattern built from buffer text (`*`, `gd`, `[i`) spells such bytes the same way
+  (`pattern::spell`); `"/` and a `:s` replacement turn them back into bytes. Every regex user (`/`, `?`, `n`,
+  `*`, `gn`, `:s`, `:g`, `:sort`, `'formatlistpat'`) goes through it. Known differences: a real
+  U+10FF80-U+10FFFF char in the text is taken for the byte it spells; `&` in a `:s` replacement keeps the byte
+  where nvim writes its Latin-1 char as UTF-8. Inside a collection, as in nvim, the byte is compared as its
+  Latin-1 char (#1252): an item or range covering U+0080-U+00FF also takes the escape chars of those bytes, so
+  `[ð-ÿ]`, `[ÿ]`, `[\x80-\xff]` and `[Ÿ]\c` take byte 0xFF and `[^ÿ]` does not (`/ÿ` and `\%xff` still do not).
+  The `[:lower:]`/`[:upper:]` classes do not take such bytes yet (nvim's take 0xE9, 0xFF and 0xC9).
+- **Owned engine: still the plan, scheduled later (#1128, v0.3.2).** The Pike VM and bounded backtracker of §3 are for the
+  residual: lookaround, backrefs, position atoms, mid-pattern `\<`/`\>`, `\&` and `~`. When it lands, the IR and
+  router of §1 and §7 arrive with it, and the oracle classes above become the router's allow-list for
+  `DefaultEngine`.
 
 ## Problem
 
@@ -119,7 +208,7 @@ This doc depends on and is governed by (single-registry rule — no new `INV-*` 
   none`, `allowed_layers: [core]`).
 - **INV-CMD-SEMANTIC** — search/substitute are semantic commands with a **pattern + flags** argument; the engine
   is an *implementation detail resolved by the router*, never a user-visible command target.
-- **INV-QUERY-SNAPSHOT** — a compiled `Regex` matches against an immutable text **snapshot** (a Rope slice /
+- **INV-QUERY-SNAPSHOT** — a compiled `Regex` matches against an immutable text **snapshot** (a byte slice /
   visible-range snapshot), never live mutable Document state; incsearch decoration runs outside the paint
   critical section.
 - **INV-ASYNC-ORDER** — an incremental-search match request carries a request id + revision; a superseded
@@ -285,10 +374,17 @@ Vim's own two-engine divergence that we are trying to avoid (§7).
 back. This is **not** an engine capability — the engine only offers:
 
 - `find_at(hay, start)` — the next leftmost match (for first-per-line), and
-- `find_all(hay, range)` — an iterator of non-overlapping matches (for all-per-line).
+- `find_all(hay, range)` — an iterator of non-overlapping matches (for all-per-line), scanned per line the way
+  nvim's `do_sub` scans: resume at the reported (`\ze`) end, skip an empty match where the previous match
+  ended, stop a line once the scan reaches its end (#1047, #1048). A `/` search walks `search_all` instead,
+  which keeps every empty match (`/^$`, `/\<`, `/foo\zs`, #705).
 
 The **substitute command** ([editing-language.md](editing-language.md) / F-009) computes the effective "replace
-all vs first" as **`g_flag XOR gdefault`** and then calls `find_at` once per line or iterates `find_all`. Placing
+all vs first" as **`g_flag XOR gdefault`** and then calls `find_at` once per line or iterates `find_all`. A
+pattern with a line-break item (`\n`, `\_x`, `\_[…]`, `[\n]` — `Regex::multiline`, Vim's `re_multiline`) is
+instead matched against the whole buffer from each line (`Regex::find_whole_at`), following nvim's `do_sub`:
+a match belongs to the line its whole match starts on, the line it ends on is searched again while it is in
+the range, and the last line's break matches `\n` but stays in the buffer (#715). Placing
 `gdefault` here (not in `C-REGEX`) keeps the engine a pure matcher and matches Vim's own layering (it is a
 substitute option, orthogonal to the pattern). Documented here only because VIM-SEARCH-1 flags it as a
 get-it-exactly-right item; the **Exact** obligation is on the command layer, and the differential corpus asserts
@@ -297,7 +393,9 @@ the XOR truth table (T-09).
 Related command-layer items also **out of the engine** but noted for completeness: replacement items
 (`& \0`–`\9` `~ \u \U \l \L \e \E \r \n \t \=expr`) are expanded by the substitute layer using the engine's
 `Captures`; `:s///\=` runs the ruse expression surface (Non-goals). The engine's contribution is correct
-`Captures` (including `\zs`/`\ze`-adjusted group 0).
+`Captures` (including `\zs`/`\ze`-adjusted group 0). In the replacement, `\r` (and a literal CR) splits the line
+and `\n` inserts a NUL, as in Vim (#698). Where a pattern ends inside an Ex command or a search line is the
+engine's `skip_regexp` (Vim's), so a delimiter inside `[…]` does not end it (#803).
 
 ### 7. Engine selection (router: by capability, then context/profile)
 
@@ -325,9 +423,9 @@ Router algorithm:
    the two engines are proven **semantically equivalent** for that IR shape (leftmost-first + greedy align; empty-
    match and POSIX-longest edge cases do **not**). Until the differential corpus proves a given IR-shape class
    equivalent, that class stays pinned to `VimEngine`. Per D-010 ("don't stabilize the unvalidated"), the
-   fast-path allow-list starts **empty** and grows only as tests certify shapes — so v1 behavior is
-   "Vim dialect → VimEngine unless certified," and the DefaultEngine fast path is a proven optimization, not an
-   assumption.
+   fast-path allow-list grows only as tests certify shapes. *As built (D-028 amendment):* there is no `VimEngine`
+   yet, so the wrapped engine runs every accepted pattern and rejects the atoms it cannot express; the allow-list
+   of shapes certified equal to nvim is the oracle's class table in [Current state](#current-state-mvp-d-028-amendment-2026-11-03), not empty.
 4. **Context/profile overrides for safety, not correctness:** untrusted contexts (`Plugin{trusted:false}`, `Ai`,
    `RemotePeer`) get the **strict step budget** and the **backref/lookbehind deny option** (§8); `Lsp`/`Config`
    use `Dialect::Default` and thus never reach `VimEngine`.
@@ -391,7 +489,7 @@ Per D-007's per-feature grading, the Vim regex surface (VIM-SEARCH-1) is scoped 
 | Backrefs `\1`–`\9` | **Exact**, but **budget-bounded** | may abort on pathological input (M2) instead of Vim's slow completion |
 | `\< \>`, `\{-}`, `\%(...\)`, `\%[...]`, classes `\d \w \s …` | **Exact** | NFA-native (§3) |
 | Position atoms `\%23l \%23c \%V \%#` | **Adapted** | supported where `MatchCtx` (line/col/visual-area/cursor) is supplied by the caller (§5); pure-string matches without a view context skip them |
-| `\c` / `\C`, `'ignorecase'` / `'smartcase'` | **Exact** | folded into `CompileOpts` |
+| `\c` / `\C`, `'ignorecase'` / `'smartcase'` | **Exact** | folded into `CompileOpts`; under `'ignorecase'` a literal is its nvim `utf_fold` class and a collection is closed under those classes, never the engine's `(?i)` (#1112) |
 | Replacement items `& \0`–`\9` `~ \u\U\l\L\e\E \r\n\t` | **Exact** | expanded by substitute layer (§6) |
 | `'gdefault'` `g` inversion | **Exact** | command layer `g XOR gdefault` (§6) |
 | `:s///\=expr` | **Adapted** | ruse expression surface, not Vimscript (Non-goals, VIM-SCRIPT) |
@@ -505,13 +603,13 @@ This is a substitute-layer obligation noted for F-009.
 
 ## Migration strategy
 
-Greenfield (no prior regex layer). Land `C-REGEX` (trait + `DefaultEngine` + IR + `Vim` front-end) as a leaf
-kernel component **before** F-009 reaches Vim search parity. Sequence: (1) `RegexIr` + `Default` dialect +
-`DefaultEngine` (unblocks internal/LSP/plain find immediately, ReDoS-free); (2) `Vim` front-end + magic
+`C-REGEX` ships as the front-end over the wrapped engine; that scope is the D-028 amendment of 2026-11-03 (#996).
+Sequence for the rest (the owned engine is scheduled later; see Current state):
+(1) `RegexIr` + `Default` dialect + `DefaultEngine`; (2) `Vim` front-end on the IR + magic
 resolution + Pike-VM `VimEngine` covering NFA-native atoms incl. `\zs`/`\ze`; (3) bounded-backtracking fallback +
 budgets for backrefs/variable-lookbehind; (4) certify DefaultEngine fast-path shapes (§7 step 3) under the
-differential corpus. The substitute-command layer (`gdefault`, offsets, `\=`) lands with F-009 on top of the
-stable engine contract.
+differential corpus. The substitute-command layer (`gdefault`, offsets, capture groups, `\=`) lands on top of the
+stable engine contract (#638).
 
 ## Test strategy
 
@@ -541,6 +639,26 @@ Differential corpus (TEST-2), asserted against real Vim output; plus fuzzing (TE
   shape currently on the fast-path allow-list (the certification gate for §7 step 3).
 
 ## Open questions
+
+Answered 2026-11-03 (D-028 amendment, #996). The answers:
+
+- **OQ-1 answer** — The allow-list is the oracle-certified class table in
+  [Current state](#current-state-mvp-d-028-amendment-2026-11-03), produced by `crates/core/tests/pattern_oracle.rs`
+  from `tools/parity/pattern_oracle.py`. A shape joins it when its oracle rows agree with nvim; it is not empty.
+- **OQ-2 answer** — Matching on the wrapped engine is linear, so its bound today is the CTRL-C interrupt
+  checkpoint from #1122 (`crates/core/src/interrupt.rs` `breakcheck`, polled by the `:s` scan in
+  `crates/core/src/editor/substitute.rs` and the `:g` marking pass) plus the crate's default compiled-size limit.
+  The owned engine's backtracker adds a step budget on top of the same checkpoint. The numbers per context tier
+  are set by bench (D-019) when that engine exists.
+- **OQ-3 answer** — `MatchCtx` is needed only by the owned engine. Until then the position atoms are rejected
+  as `Unsupported`, so no caller has to supply view state.
+- **OQ-4 answer** — The ripgrep bridge (DEP-RIPGREP) translates from the IR independently, with its own
+  lowering to ripgrep's dialect, so a version skew between ripgrep's `regex` and ours stays inside the bridge.
+  It does not reuse `DefaultEngine`'s lowering.
+- **OQ-5 answer** — `\=` scope defers to D-025 (the command and editing-language layer); this doc does not fix it.
+- **OQ-6 answer** — No new invariant. The bound is expressed by INV-FAIL-BOUNDED and INV-SCHED-1.
+
+The questions as written:
 
 - **OQ-1** — The exact set of IR shapes provably equivalent between `DefaultEngine` and `VimEngine` (empty-match,
   leftmost-first vs POSIX-longest, greedy edge cases) that may join the §7 fast-path allow-list. Grows under the

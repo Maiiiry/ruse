@@ -35,7 +35,7 @@ related:
 ruse has no configuration model. `CFG` (design-requirements §10) requires separated user / workspace /
 machine-local settings, per-type merge, source provenance, a `:inspect config` command, safe mode,
 migration, and — the load-bearing security rule — **security-sensitive settings that a workspace cannot
-override** ([architecture §10](../architecture/architecture.md#10-security-trust-model): "Project settings
+override** ([architecture §10](../architecture/architecture.md): "Project settings
 do not arbitrarily override user settings"). Neovim's failure mode is the anti-model: config is arbitrary
 Lua, so a value's origin is unknowable, one bad line aborts startup, a project `exrc` can silently change
 security behavior, and there is no static type/deprecation/migration story. C-CONFIG must be the opposite:
@@ -62,10 +62,10 @@ never touch a security boundary.
 
 - Not the keymap **resolution** algorithm or the priority ABI itself — that is
   [architecture §1.2–§1.4](../architecture/architecture.md#1-input-philosophy-three-official-profiles)
-  (INV-PRIORITY / INV-PROFILE-ISOLATION). This doc only covers how keymap *config layers* stack (§7).
+  (INV-PRIORITY / INV-PROFILE-ISOLATION). This doc only covers how keymap *config layers* stack (Keymap config).
 - Not the plugin capability/permission grant flow (that is architecture §4.4 / §10); C-CONFIG only stores
   the declarative settings, never the trust decision.
-- Not the config file **surface syntax**. The on-disk format (TOML/RON/…) is implementation-defined; this
+- Not the config file **surface syntax**. The on-disk format is implementation-defined (the loader reads TOML, `config.toml`, #614); this
   doc specifies the model, and the authored schema is YAML. The wire model is a typed key→value map.
 - Not profiles-as-behavior-policy beyond the `input.profile` selector (bounded-scope profiles are CFG §10 /
   architecture §11.1, tracked separately).
@@ -81,7 +81,7 @@ terms:
 - **Effective value** — the single value a key resolves to after merge, with its provenance.
 - **Security-locked** — a key a workspace layer may never contribute to (CFG-LOCK-001).
 - **Inert layer** — a layer that is parsed and visible in `:inspect` but excluded from merge (e.g. an
-  untrusted workspace, or a quarantined malformed file).
+  untrusted or stale workspace, or a quarantined malformed file).
 
 ## Invariants
 
@@ -89,17 +89,17 @@ C-CONFIG depends on and enforces (registry: [reference-invariants.md](../invaria
 
 - **INV-TRUST-1** — no code runs before a workspace-trust decision; principals carry distinct trust; side
   effects are capability-gated. C-CONFIG is the enforcement point for the "workspace repo" principal:
-  security-locked keys and untrusted-workspace inertness (CFG-LOCK-001, §5).
+  security-locked keys and untrusted-workspace inertness (CFG-LOCK-001, and Workspace trust below).
 - **INV-FAIL-BOUNDED** — an external/lower-trust failure degrades, it does not abort. A bad key or malformed
-  layer degrades to the next layer / default; safe mode is the escalation (CFG-SAFE-001, §8).
+  layer degrades to the next layer / default; safe mode is the escalation (CFG-SAFE-001, Failure modes).
 - **INV-PROTOCOL-VERSIONED** — config schema is versioned with deprecation windows; migration is part of the
-  contract (§9).
+  contract (Migration strategy).
 - **INV-CONTRACT-FIRST / INV-ADDITIVE** — the schema is the contract; schema evolution is additive; readers
   handle unknown keys gracefully (unknown key ⇒ warn + ignore, never abort).
 - **INV-PRIORITY / INV-PROFILE-ISOLATION** — keymap config layers feed the priority ABI; they do not merge
-  across profiles (§7).
+  across profiles (Keymap config).
 - **INV-STATUS / INV-ORIGIN** — the config layer publishes a health status; every effective value carries an
-  origin (its provenance), mirroring the mutation-origin discipline (§10).
+  origin (its provenance), mirroring the mutation-origin discipline (Observability).
 
 This doc introduces no `INV-*` IDs (minting is reserved to the registry). Two candidates —
 `INV-CONFIG-LOCK` and `INV-CONFIG-PROVENANCE` — are proposed in Open questions.
@@ -109,7 +109,7 @@ This doc introduces no `INV-*` IDs (minting is reserved to the registry). Two ca
 ### CFG-LAYER-001 — Three scopes and precedence
 
 Layers stack lowest→highest; for a `replace` key the **highest layer that is allowed to write it wins**.
-Collection merges (§ CFG-MERGE-001) fold in the same order.
+Collection merges (CFG-MERGE-001) fold in the same order.
 
 | # | Layer | Typical location | Trust principal | Writes keys with `scope` … |
 |---|-------|------------------|-----------------|-----------------------------|
@@ -203,13 +203,54 @@ Security-locked keys cover the three categories called out by `CFG`/architecture
 prompting), and **forwarding** (credential/port forwarding). In the schema these are, at minimum:
 `plugins.allow_unsigned` (scope machine), `remote.trust_prompt` (scope user), `workspace.trusted_roots`
 (scope user; D-058 — the roots whose language servers may start), plus the trust/forwarding
-keys owned by C-REMOTE. A workspace-authored keymap may likewise never bind a security-gated command to a
-key (§7). This directly discharges INV-TRUST-1 for the "workspace repo" principal and POLICY
+keys owned by C-REMOTE. A workspace may not bind keys at all (D-062, Keymap config). This directly discharges INV-TRUST-1 for the "workspace repo" principal and POLICY
 [`ENG-TRUST-001`](../../spec/POLICY.yaml).
 
 A plugin cannot escalate its own settings to security-locked: the host validates that a plugin schema only
 marks keys `security_locked` within a bounded allowlist (network/credential/exec-touching), and never
 un-locks a core-locked key.
+
+### Workspace trust — user-owned and content-bound (D-058, D-062)
+
+The workspace layer is merged only while the workspace is trusted. Trust is granted by the user principal
+only (D-058: `:trust` for the session, or the user-scope `workspace.trusted_roots` list at startup) and is
+**stored on the user side, never in the repository**. `.ruse/` itself holds only committed project
+configuration; ruse writes no local or per-user state into a user's repository (D-062).
+
+Trust is **content-bound** (D-062, adopted from Helix's workspace trust, motivated by
+helix-editor/helix#9514): a trust record holds the trusted root **and a hash of the workspace's `.ruse/`
+contents** at the time of the grant (an absent `.ruse/` hashes as empty). On every load the hash is
+recomputed. If it differs — a pull, a branch switch, a merged change — the workspace layer is **stale**: it is
+treated as untrusted, kept inert, shown as `stale` in `:inspect config`, and not loaded until the user
+re-confirms (for example `:trust` again), which records the new hash. Content binding applies to the config
+layer; the D-058 language-server gate stays root-bound. Full rationale:
+[RFC-0021](../rfc/accepted/RFC-0021-workspace-config-boundary.md).
+
+The loader (#614, `apps/tui/src/trust.rs`, `apps/tui/src/config.rs`) settles the details:
+
+- **Hash** — SHA-256 (DEP-CRYPTO-HASH, RustCrypto `sha2`), recorded as `sha256:<hex>`.
+- **File set** — every entry under `<root>/.ruse/`, walked recursively and sorted by relative path
+  (`/`-separated bytes). The input starts with the tag `ruse-trust-v1\0`. A regular file adds `F`, its path,
+  `\0`, its length as 8 big-endian bytes and its bytes. A symbolic link is never followed; it adds `L`, its
+  path, `\0`, and the length and bytes of its target. Directories are walked, and other entries are skipped.
+  An absent `.ruse/` is the empty set (only the tag). Hashing gives up past 10 000 entries or 64 MiB, and the
+  layer is then stale.
+- **Record** — one JSON file per root, `{"root": …, "hash": …}`, in
+  `${XDG_STATE_HOME:-~/.local/state}/ruse/trust/`. The file is named by the hex SHA-256 of the canonical
+  absolute root path, as in Helix, and the directory is mode 0700. Nothing is written under the repository.
+- **Commands** — `:trust` grants the session's language-server trust (D-058, unchanged), writes the record,
+  and reloads the config so the workspace layer applies at once. `:untrust` (nvim spelling:
+  `:trust ++remove`) deletes the record, takes back the session grant, and reloads. A value that came from the
+  workspace goes back to the layer below, or to the default. Options typed with `:set` keep their values.
+- **Links** — the loader reads `.ruse/config.toml` only as a regular file inside a real `.ruse/` directory.
+  A symbolic link at either place quarantines the layer, so nothing outside the hashed set can load.
+  The loader parses the `config.toml` bytes the hash walk read and never opens the file a second time, so a
+  file changed or swapped between the check and the parse cannot load unhashed content. Each file is opened
+  without following a link (`O_NOFOLLOW` on Unix) and read only up to the 64 MiB budget.
+- **Language servers** — a trust record is not a language-server grant. At startup that comes from
+  `workspace.trusted_roots` in the user layer, or `RUSE_TRUSTED_WORKSPACES`. A `workspace.trusted_roots`
+  entry does not load workspace config either: config needs a record. Whether a persisted record should also
+  grant language servers is a D-058 re-evaluation, left open.
 
 ### Deriving config keys from parity — depth-first, never bulk
 
@@ -220,8 +261,8 @@ key **only once its behavior is analyzed and shipped/designed** — never bulk-m
 gdefault` as a checklist, not as typed keys). Materializing a typed key with a guessed default from an
 un-analyzed option is exactly the "shaky derivation" the breadth→depth split guards against. The key arrives
 **with its feature's design**, alongside the runtime that honors it. Example: `editor.scrolloff` exists
-because the viewport behavior it configures shipped (its margin was a constant); the Vim search options do
-**not** yet have keys because that search behavior is not built. So `config-schema.yaml` grows one analyzed
+because the viewport behavior it configures shipped, and `editor.ignorecase`/`smartcase`/`hlsearch`/`incsearch`
+arrived with the search behavior they configure. So `config-schema.yaml` grows one analyzed
 option at a time, and completeness-vs-parity is a *per-feature* obligation, not a one-time backfill.
 
 ### CFG schema — types/defaults/enums driving tooling
@@ -232,12 +273,12 @@ optional `enum`/`min`/`max`, and a one-line `desc`. From it C-CONFIG derives, wi
 
 - **Autocomplete** — key names + enum values + type hints in config files and the command line.
 - **Type-check** — a value of the wrong type / out-of-range int / non-enum string is rejected *for that key*
-  (falls back per §8), not accepted silently.
+  (falls back per Failure modes), not accepted silently.
 - **Deprecation** — a key marked `deprecated` (optionally `replaced_by`) warns and, where lossless, aliases
   to its replacement for a deprecation window (INV-ADDITIVE).
-- **Migration** — the schema `version` drives §9.
+- **Migration** — the schema `version` drives the Migration strategy.
 
-The schema is authored (records-with-fields ⇒ YAML, per [D-021](../../spec/DECISIONS.md#d-021)); a generator
+The schema is authored (records-with-fields ⇒ YAML, per [D-021](../../spec/DECISIONS.md)); a generator
 may emit a JSON copy for editor tooling but the YAML is canonical and hand-edited.
 
 ### CFG-PLUGIN — Per-plugin config schema
@@ -262,7 +303,7 @@ settings in its manifest, using the **same field set** as the core schema:
   opaque-but-preserved (unknown-key rule: warn-and-keep, never drop user data), so deactivating a plugin
   does not lose its config.
 
-### Keymap config (§7)
+### Keymap config
 
 Keymaps are configuration, but they are **not** scalar-merged. Keymap config layers **append** into the key
 resolver, which then applies the two **priority axes** (architecture §1.4, D-046) and static conflict
@@ -272,10 +313,19 @@ layer contributes bindings *into* keymap layers at its own provenance rank; it i
 
 - Cross-profile keymaps never merge or conflict (INV-PROFILE-ISOLATION): a workspace Vim binding and a user
   Emacs binding are in different key spaces.
-- A workspace keymap config layer enters at the **workspace provenance tier** (the old ABI tier 4) and only
-  when the workspace is trusted; it can never register a global binding above the user tier, and can never
-  bind a security-gated command (CFG-LOCK-001). Plugin-suggested bindings remain the lowest, opt-in tier.
-  Provenance never lets a config layer reorder *keymap layers* — only bindings within one (D-046).
+- **A workspace adds or changes no active key bindings, even when trusted (D-062).** `keymap.*` keys are
+  `scope: user` in [config-schema.yaml](../../spec/config-schema.yaml), so a workspace layer that sets one is
+  inert for that key and the entry is dropped with a diagnostic (CFG-LAYER-001). A binding invokes a command,
+  so a project rebinding common keys is a confused-deputy risk; trust means "may run this repo's tools", not
+  "may rewire my keys"; and keys are per-profile muscle memory (INV-PROFILE-ISOLATION). Precedent: VS Code
+  keybindings are application-scoped (user file only); Zed keeps `vim_mode` user-only and limits project
+  settings to editor behaviour and language tooling.
+- Projects contribute **commands** (trust- and capability-gated; project commands are #647) and may declare
+  **suggested bindings**. These enter the existing plugin-suggested, opt-in tier: they appear only as hints in
+  which-key and the palette and take effect only when the user opts in, and the accepted binding is stored in
+  the user layer. The workspace provenance tier (architecture §1.4, tier 4) therefore holds no active
+  bindings. Relaxing this needs a new `D-*`.
+- Provenance never lets a config layer reorder *keymap layers* — only bindings within one (D-046).
 
 The keymap *values* (the map of `key → command + when`) deep-merge; the *resolution* is out of scope here.
 
@@ -291,7 +341,8 @@ degrades locally.
 | Malformed layer (parse error) | **Quarantine the whole layer** (mark inert), keep lower layers; diagnostic `config.layer_quarantined` with the parse location. |
 | Workspace sets a security-locked / out-of-scope key | Drop the entry, `config.locked_key_ignored` (CFG-LOCK-001). |
 | Untrusted workspace | Entire workspace layer inert until trust granted; `:inspect` shows it as `untrusted`. |
-| Schema version older than file | Migrate (§9); unmigratable keys kept inert with a manual-warning. |
+| Stale workspace (`.ruse/` changed since trust was granted) | Treated as untrusted: entire workspace layer inert and not loaded until the user re-confirms trust, which records the new content hash; `:inspect` shows it as `stale` (D-062). |
+| Schema version older than file | Migrate (Migration strategy); unmigratable keys kept inert with a manual-warning. |
 | Plugin schema conflict / bad plugin config | Isolated to that plugin's namespace; the plugin degrades, the editor does not (INV-PLUGIN-ISOLATED). |
 | Repeated boot failure attributable to config | Auto-escalate to **safe mode** (below). |
 
@@ -302,6 +353,17 @@ mode" delivery contract). Safe mode is distinct from per-key degradation: a sing
 safe mode — it just falls back. The status line shows `Config: safe-mode` (INV-STATUS) and `:inspect config`
 still works so the user can find the offending key.
 
+As built (#1152, `apps/tui/src/config/boot.rs`): a start is **config-attributable** when it read a user or
+workspace layer and ended before its first frame was drawn (a panic, abort or signal between loading the
+config and painting; a crash later in the session is not counted). A small record under the state directory
+(`${XDG_STATE_HOME:-~/.local/state}/ruse/config-boot`) counts such starts in a row: a start that read user
+config writes `n + 1` before applying it, and its first frame removes the record. A start that finds `n >= 3`
+(Firefox's `max_resumed_crashes`) runs in safe mode and leaves the record, so safe mode holds until the user
+runs `:config-reload`, which loads every layer, installs it, and removes the record. `--safe-mode` neither
+counts nor clears. The status line carries `[Config: safe-mode]` for the session, the startup message names
+the reason, `:inspect config` lists the user and workspace layers as `safe-mode`, and `:checkhealth` has a
+`config` row (`ok` / `degraded (…)` / `safe-mode (…)`). There are no plugins yet to disable.
+
 ## Recovery behavior
 
 - Per-key fallback and layer quarantine are automatic and non-destructive: C-CONFIG **never rewrites a user
@@ -310,14 +372,15 @@ still works so the user can find the offending key.
   keys and their locations so the user can repair the source.
 - Leaving safe mode is an explicit user action after repair; there is no silent auto-heal that could mask a
   persistent problem.
-- Migration writes (§9) are opt-in and atomic (write-new-then-replace), never in place, and keep a backup of
+- Migration writes (Migration strategy) are opt-in and atomic (write-new-then-replace), never in place, and keep a backup of
   the pre-migration file.
 
 ## Security impact
 
 - **INV-TRUST-1 is enforced here** for the workspace-repo principal: security-locked keys (executables,
   trust, forwarding, `plugins.allow_unsigned`, `remote.trust_prompt`) are never workspace-overridable, and an
-  **untrusted workspace's config is fully inert** — opening a repo cannot change security behavior. This is
+  **untrusted or stale workspace's config is fully inert** — opening a repo cannot change security behavior,
+  and a grant never carries over to `.ruse/` content the user has not re-confirmed (D-062). This is
   the config half of architecture §10 ("project settings do not override user settings").
 - Machine-local **lock** provides enterprise policy that user/workspace cannot loosen.
 - Provenance makes every security-relevant value **auditable** — `:inspect config` shows exactly which layer
@@ -335,6 +398,14 @@ still works so the user can find the offending key.
   of authored config), not O(document).
 - Reload recomputes the merge and diffs the snapshot; consumers subscribe to change events rather than
   polling. No layer is re-parsed unless its file changed (watcher-driven, with a full-reparse fallback).
+- As built (#1152): the session stats the layer files, the `.ruse/` directory and the trust record (a few
+  `lstat`s: length, modification time, inode) when it looks at its files anyway (idle, focus gain, after an
+  Ex command, `:checktime`), and reloads when one moved; `:config-reload` reloads at once. A reload installs
+  only the keys whose effective value changed (an option typed with `:set` keeps its value), says which on the
+  status line, and is silent when none did. A layer that loaded before and now does not parse keeps the whole
+  previous config, with the error. `input.profile` and the `security_locked` keys keep their running value
+  until the next start (see Open questions). No file-watch dependency: the poll reuses the `[disk changed]`
+  rhythm (RFC-0023 §8).
 
 ## Compatibility impact
 
@@ -397,6 +468,14 @@ is older:
 
 Migration never blocks startup: an unmigratable key degrades to inert + warning (safe-mode-compatible).
 
+As built (#1152, `apps/tui/src/config.rs` `MIGRATIONS`, mirrored by `migrations:` in the schema): a layer file
+names the version it was written for with a top-level `version = N`, and a file without one is read as the
+current version, so a file never needs the key until a step exists. Each step lists `Rename` (auto-conversion)
+and `Manual` (manual-warning) changes; renames chain across steps, and a key under an old table name is still
+found. A `version` newer than this ruse reads, or one that is not a positive integer, is a diagnostic and read
+as current. The table is empty at version 1: no key has been renamed or removed since the schema began. The
+opt-in rewrite of the file is not built; the file is only ever read.
+
 ## Test strategy
 
 - **Precedence** — table-driven: for each `(scope, security_locked)` combination, assert the winning layer
@@ -427,20 +506,22 @@ Migration never blocks startup: an unmigratable key degrades to inert + warning 
   itself be split (admin vs vendor). Deferred to the C-CONFIG implementation RFC.
 - **Negation syntax** — the concrete `!pattern` / removal form for `append`/`set-union` lists.
 - **Reload semantics for `security_locked` keys** — may a live reload change a locked value, or only at
-  restart? Leaning restart-only for trust/executable keys.
+  restart? Built restart-only (#1152): a reload leaves every `security_locked` key at its running value and
+  names it as taking effect at the next start, so a file edited behind a running session cannot loosen its
+  trust. Revisit if a locked key gains a runtime consumer that must follow edits.
 - **Per-language / per-filetype sub-scopes** (VSCode `[rust]` blocks) — modeled as `deep-merge` maps now;
   whether they warrant a first-class sub-scope is open.
 
 ## Reference Invariants
 
 - **INV-TRUST-1** — security-locked keys are never workspace-overridable; untrusted-workspace config is inert
-  (CFG-LOCK-001, §5, Security impact).
+  (CFG-LOCK-001, Workspace trust, Security impact).
 - **INV-FAIL-BOUNDED** — one bad key/layer degrades to a lower layer/default; safe mode boots on defaults +
   machine-local (CFG-SAFE-001, Failure modes).
 - **INV-PROTOCOL-VERSIONED / INV-ADDITIVE / INV-CONTRACT-FIRST** — the schema is the versioned contract;
-  evolution is additive; migration is part of it (CFG-MIG-001, §9, Compatibility).
+  evolution is additive; migration is part of it (CFG-MIG-001, Compatibility).
 - **INV-PRIORITY / INV-PROFILE-ISOLATION** — keymap config layers feed the priority ABI and never merge
-  across profiles (§7).
+  across profiles (Keymap config).
 - **INV-STATUS / INV-ORIGIN / INV-ERR-CLASS / INV-QUERY-SNAPSHOT** — config health is a state machine; every
   effective value carries provenance; diagnostics are typed and logged once; the effective map is an
   immutable snapshot (Observability, Performance).

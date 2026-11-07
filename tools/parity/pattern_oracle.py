@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""Neovim pattern oracle — differential ground truth for ruse's Vim-regex front-end (issue #692).
+
+tools/parity/oracle.py captures what KEYS do; this harness captures what a PATTERN matches. For each
+(pattern, subject, case options) it asks the pinned Neovim where the first match is, and writes the
+answers into a generated Rust table (crates/core/tests/pattern_oracle/cases.rs) that
+crates/core/tests/pattern_oracle.rs replays against `ruse_core::Regex::compile` + `find_at`.
+
+HOW A MATCH IS OBSERVED (read-only, one fresh `nvim -u NONE -i NONE` process for the whole table):
+    - A one-line subject, no 'smartcase': `matchstrpos(subject, pattern)` — the byte span [start, end)
+      of the first match, or no match. This is string matching, which is what a substitute sees per line.
+    - A multi-line subject, or 'smartcase' (which `matchstrpos` ignores): the subject is put in a buffer
+      and `searchpos(pattern, 'cnW')` / `searchpos(pattern, 'cenW')` from line 1 col 0 give the start and
+      the last character of the match; the span is converted to byte offsets in the lines joined by
+      "\\n" — ruse's buffer haystack. Multi-line cases are written to match at least one character (the
+      'e' flag cannot tell an empty match from a one-character one).
+    - A Vim error (E-number) is recorded as `Error`; ruse must then also refuse the pattern.
+
+EXPECTATIONS. Every row asserts ruse agrees with nvim, except rows marked `unsupported`: atoms the
+wrapped Rust engine cannot express (lookaround, backrefs, `\\&`, `~`, position atoms, ...). For those
+ruse must return `RegexError::Unsupported` — rejected, never faked — and nvim's answer is recorded for
+the reader.
+
+The pin is verified exactly as oracle.py verifies it (spec/parity/upstreams.yaml neovim.version_label).
+Stdlib only (D-034).
+
+Usage:
+    python3 tools/parity/pattern_oracle.py            # regenerate the table
+    python3 tools/parity/pattern_oracle.py --check    # fail if the committed table is stale
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle import OracleError, assert_pin, nvim_version, read_pin  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TABLE = REPO_ROOT / "crates" / "core" / "tests" / "pattern_oracle" / "cases.rs"
+
+# (pattern, subject, options, expectation). `subject` is a str (one line) or a list of lines. `options`
+# is "" | "ic" | "ic scs". `expectation` is "" (ruse agrees with nvim), "unsupported", or `known(n)`: a
+# tracked divergence of the wrapped engine (issue #n) — ruse must still DISAGREE, so a fix shows up as
+# a failing row to promote to "" (the same ratchet as tests/parity/vim/known-divergences.txt).
+#
+# A bare string starts a CLASS (#912): every row after it, up to the next string, belongs to that class.
+# The Rust test prints the per-class tally (`cargo test -p ruse-core --test pattern_oracle -- --nocapture`).
+U = "unsupported"
+
+
+def known(issue: int) -> str:
+    return f"known #{issue}"
+
+
+CASES: list[str | tuple[str, str | list[str], str, str]] = [
+    "collections",
+    # --- #692: bracket ranges and contents ---------------------------------------------------------
+    (r"[0-9]", "a-1-2", "", ""),
+    (r"[a-z]\+", "Ab-cd", "", ""),
+    (r"[0-9]", "a-b", "", ""),
+    (r"[0-9]", "123", "", ""),
+    (r"[^x]", "xxy", "", ""),
+    (r"[\d]", "d5", "", ""),
+    (r"[\d]", "\\", "", ""),
+    (r"[\de]", "e", "", ""),
+    (r"[]abc]", "x]", "", ""),
+    (r"[^]a]", "]ab", "", ""),
+    (r"[[]", "a[", "", ""),
+    (r"[a--b]", "-", "", ""),
+    (r"[a--b]", "b", "", ""),
+    (r"[a-c-e]", "d-", "", ""),
+    (r"[--a]", "+", "", ""),
+    (r"[a-]", "-", "", ""),
+    (r"[-a]", "-", "", ""),
+    (r"[b-a]", "a", "", ""),
+    (r"[\x61]", "xa", "", ""),
+    (r"[\d97-z]", "b", "", ""),
+    (r"[a-\d99]", "b", "", ""),
+    (r"[\o141]", "a", "", ""),
+    (r"[é]", "é", "", ""),
+    (r"[\e]", "\x1b", "", ""),
+    (r"[\t]", "\t", "", ""),
+    (r"[\]]", "]", "", ""),
+    (r"[\^]", "^", "", ""),
+    (r"[\-]", "-", "", ""),
+    (r"[a\-z]", "b", "", ""),
+    (r"[\\]", "\\", "", ""),
+    (r"[\s]", "s", "", ""),
+    (r"[\x]", "x", "", ""),
+    (r"[[:alpha:]]", "1a", "", ""),
+    (r"[[:alpha:]]", "é", "", ""),
+    (r"[[:upper:]]", "aÉ", "", ""),
+    (r"[[:lower:]]", "Aé", "", ""),
+    (r"[[:digit:]x]", "ax", "", ""),
+    (r"[[:space:]]", "a\tb", "", ""),
+    (r"[[:punct:]]", "a,b", "", ""),
+    (r"[[:xdigit:]]\+", "xbeefy", "", ""),
+    (r"[[:ident:]]\+", "-é_9-", "", ""),
+    (r"[[:keyword:]]", "-中", "", ""),
+    (r"[[:fname:]]\+", " a/b.c ", "", ""),
+    (r"[[:return:]]", "a\rb", "", ""),
+    (r"[[:tab:]]", "a\tb", "", ""),
+    (r"[[:bogus:]]", "b", "", ""),
+    (r"[[:alpha:]-z]", "-", "", ""),
+    (r"[a-[:alpha:]]", "b", "", ""),
+    (r"[[.a.]]", "a", "", ""),
+    (r"[[.a.]b]", "b", "", ""),
+    (r"[[=a=]]", "a", "", U),
+    (r"[a-z]", "é", "", ""),
+    (r"\v[(]\zsfoo", "(foo", "", ""),
+    (r"foo[1", "foo[1", "", ""),
+    (r"[", "[", "", ""),
+    (r"\_[ab", "_[ab", "", ""),
+    "anchors",
+    # --- #692: non-anchor ^ $ * ------------------------------------------------------------------
+    (r"$foo", "cost $foo", "", ""),
+    (r"a^b", "a^b", "", ""),
+    (r"a$b", "a$b", "", ""),
+    (r"*foo", "*foo", "", ""),
+    (r"\(*a\)", "*a", "", ""),
+    (r"^*x", "*x", "", ""),
+    (r"^\(*a\)", "*a", "", ""),
+    (r"\(^a\)", "ba", "", ""),
+    (r"\(^a\)", "a", "", ""),
+    (r"b\|^a", "a", "", ""),
+    (r"a\|^b", "b", "", ""),
+    (r"a\(*\)", "a*", "", ""),
+    (r"\(a\|*\)", "*", "", ""),
+    (r"a$\|b", "a", "", ""),
+    (r"\(a$\)", "a", "", ""),
+    (r"a$\c", "a", "", ""),
+    (r"$\|a", "x", "", ""),
+    (r"a$\v|b", "a", "", ""),
+    (r"x\$", "x$", "", ""),
+    (r"\%(^b\)", "b", "", ""),
+    (r"a\%(^b\)", "ab", "", ""),
+    (r"\c^*a", "*A", "", ""),
+    (r"^\*a", "*a", "", ""),
+    (r"a**", "aa", "", ""),
+    (r"^b", ["a", "b"], "", ""),
+    (r"a$", ["xa", "b"], "", ""),
+    (r"a\nb", ["xa", "b"], "", ""),
+    (r"\n^b", ["a", "b"], "", ""),
+    "magic levels",
+    # --- #692: escapes honour the magic level ----------------------------------------------------
+    (r"\v\(a\)", "(a)", "", ""),
+    (r"\v\+", "+", "", ""),
+    (r"\v\?", "?", "", ""),
+    (r"\v\{", "{", "", ""),
+    (r"\v\|", "a|", "", ""),
+    (r"\v\=", "=", "", ""),
+    (r"\v\<", "<", "", ""),
+    (r"\v\>", ">", "", ""),
+    (r"\v\.", "a.", "", ""),
+    (r"\v\*", "*", "", ""),
+    (r"\v\[", "[", "", ""),
+    (r"\v\%", "%", "", ""),
+    (r"\v\@", "@", "", ""),
+    (r"\v\}", "}", "", ""),
+    (r"\v}", "}", "", ""),
+    (r"\v-", "a-b", "", ""),
+    (r"\v!", "a!b", "", ""),
+    (r"\va^b", "a^b", "", ""),
+    (r"\v$a", "$a", "", ""),
+    (r"\v^a", "a", "", ""),
+    (r"\v^*", "*", "", ""),
+    (r"\v(*)", "*", "", ""),
+    (r"\v(^a)", "a", "", ""),
+    (r"\va{2}", "aaa", "", ""),
+    (r"\va{-}", "aa", "", ""),
+    (r"\va{-1,}", "aaa", "", ""),
+    (r"\v(ab)+", "zababz", "", ""),
+    (r"\va|b", "b", "", ""),
+    (r"\va=b", "ab", "", ""),
+    (r"\va=b", "b", "", ""),
+    (r"\va?b", "b", "", ""),
+    (r"\v=", "a=", "", ""),
+    (r"\v{", "{", "", ""),
+    (r"\v<foo>", "foo foobar", "", ""),
+    (r"\v<foo>", "foobar foo", "", ""),
+    (r"\v%(ab)+", "abab", "", ""),
+    (r"\v%[ab]", "ab", "", ""),
+    (r"\vfoo@=", "foo", "", U),
+    (r"\va&", "a&", "", U),
+    (r"\v~", "a~", "", U),
+    (r"\Ma\.b", "axb", "", ""),
+    (r"\Ma.b", "axb", "", ""),
+    (r"\Ma.b", "a.b", "", ""),
+    (r"\Ma\*", "aaa", "", ""),
+    (r"\Ma*", "a*", "", ""),
+    (r"\M\[a]", "a", "", ""),
+    (r"\M[a]", "[a]", "", ""),
+    (r"\M^*", "*", "", ""),
+    (r"\M\*", "a*", "", ""),
+    (r"\M~", "a~", "", ""),
+    (r"\Ma\{2}", "aa", "", ""),
+    (r"\Va\.b", "axb", "", ""),
+    (r"\Va.b", "axb", "", ""),
+    (r"\Va\*", "aaa", "", ""),
+    (r"\V\^a", "a", "", ""),
+    (r"\V^a", "^a", "", ""),
+    (r"\Va\$", "a", "", ""),
+    (r"\Va$", "a$", "", ""),
+    (r"\V$a", "$a", "", ""),
+    (r"\V\$a", "$a", "", ""),
+    (r"\Va\|b", "b", "", ""),
+    (r"\V[a]", "[a]", "", ""),
+    (r"\V\[a]", "a", "", ""),
+    (r"\va+\m.", "aax", "", ""),
+    (r"\Va.\m.", "a.x", "", ""),
+    "atoms",
+    # --- magic default, backslash forms --------------------------------------------------------
+    (r"f(x", "a f(x b", "", ""),
+    (r"a+", "xa+y", "", ""),
+    (r"a\+", "xaaay", "", ""),
+    (r"\(ab\)\+", "zababz", "", ""),
+    (r"a\=b", "b", "", ""),
+    (r"a\?b", "ab", "", ""),
+    (r"a{", "a{", "", ""),
+    (r"}", "}", "", ""),
+    (r"\}", "}", "", ""),
+    "multis",
+    (r"a\{2}", "aaa", "", ""),
+    (r"a\{,2}", "aaa", "", ""),
+    (r"a\{2,}", "aaaa", "", ""),
+    (r"x\{3,1}", "xxxx", "", ""),
+    (r"a\{-2,}", "aaaa", "", ""),
+    (r"a\{-,2}", "aaa", "", ""),
+    (r"a\{-2}", "aaa", "", ""),
+    (r"a\{0}b", "ab", "", ""),
+    (r"a\{\}", "aa", "", ""),
+    (r"a\{-}", "aa", "", ""),
+    (r"a.\{-}b", "axbxb", "", ""),
+    (r"a\{1,2\}", "aa", "", ""),
+    (r"a\{ 1}", "aa", "", ""),
+    (r"a\{", "a{", "", ""),
+    (r"a\{x}", "a{x}", "", ""),
+    (r"a\{1,2", "aa", "", ""),
+    (r"\{", "{", "", ""),
+    (r"\(a", "a", "", ""),
+    (r"a\)", "a", "", ""),
+    (r"\%(a", "a", "", ""),
+    (r"\%(ab\)\+", "xabab", "", ""),
+    "optional sequence and code points",
+    (r"\%[abc]x", "abx", "", ""),
+    (r"r\%[ead]", "rea", "", ""),
+    (r"\%[r\%[ab]]", "rab", "", ""),
+    (r"\%[a[bc]]x", "acx", "", ""),
+    (r"\%[a\(b\)]", "ab", "", ""),
+    (r"\%[ab]*", "abab", "", ""),
+    (r"\%[a]\+", "aa", "", ""),
+    (r"\%[ab", "a", "", ""),
+    (r"\%[]", "a", "", ""),
+    (r"\%d97", "xa", "", ""),
+    (r"\%x61", "xa", "", ""),
+    (r"\%o141", "a", "", ""),
+    (r"\%u00e9", "é", "", ""),
+    (r"\%U000000e9", "é", "", ""),
+    (r"\%d", "d", "", ""),
+    (r"\%q", "q", "", ""),
+    (r"\%#=1a", "a", "", ""),
+    (r"\%#=2a", "a", "", ""),
+    (r"a\%#=1", "a", "", ""),
+    "atoms",
+    (r"\-", "-", "", ""),
+    (r"\/", "/", "", ""),
+    (r"\,", ",", "", ""),
+    (r"\]", "]", "", ""),
+    (r"\q", "q", "", ""),
+    (r"\Q", "q", "", ""),
+    (r"\y", "y", "", ""),
+    (r"\0", "0", "", ""),
+    (r"\\", "\\", "", ""),
+    (r"\\", "a\\", "", ""),
+    (r"a\\", "a\\", "", ""),
+    (r"\_", "_", "", ""),
+    (r"\_q", "q", "", ""),
+    (r"\z", "z", "", ""),
+    (r"\zq", "z", "", ""),
+    (r"\z(a\)", "a", "", ""),
+    (r"\z1", "a", "", ""),
+    (r"\zs*", "a", "", ""),
+    "case and smartcase",
+    # --- #692: \c \C, case classes under 'ignorecase' --------------------------------------------
+    (r"\cfoo", "FOO", "", ""),
+    (r"foo\c", "xFoO", "", ""),
+    (r"\Cfoo", "FOO", "ic", ""),
+    (r"\C\cfoo", "FOO", "ic", ""),
+    (r"\c\Cfoo", "FOO", "", ""),
+    (r"\Ca\cA", "aa", "", ""),
+    (r"foo", "FOO", "ic", ""),
+    (r"Foo", "foo", "ic scs", ""),
+    (r"foo", "FOO", "ic scs", ""),
+    (r"\Sfoo", "xFOO", "ic scs", ""),
+    (r"\c\u", "a", "", ""),
+    (r"\c\l", "A", "", ""),
+    (r"\c\U", "a", "", ""),
+    (r"\c\L", "A", "", ""),
+    (r"\c\a", "A", "", ""),
+    (r"\c[A-Z]", "a", "", ""),
+    (r"\c[^a]", "A", "", ""),
+    (r"\c[[:upper:]]", "a", "", ""),
+    (r"\c[[:upper:]x]", "aX", "", ""),
+    (r"\c[^[:upper:]]", "a", "", U),
+    (r"\u", "a", "ic", ""),
+    (r"[A-Z]", "a", "ic", ""),
+    # Vim never case-folds a class atom or a recognised class spelling, so no Unicode fold sneaks in
+    # (U+212A KELVIN SIGN folds to k, U+017F LONG S to s); other collections fold like literals.
+    (r"\a", "K", "ic", ""),
+    (r"\w", "ſ", "ic", ""),
+    (r"\W", "K", "ic", ""),
+    (r"\h", "K", "ic", ""),
+    (r"\i", "ſ", "ic", ""),
+    (r"\i", "Ÿ", "ic", ""),
+    (r"\k", "Ÿ", "ic", ""),
+    (r"\x", "K", "ic", ""),
+    (r"k", "K", "ic", ""),
+    (r"[k]", "K", "ic", ""),
+    (r"[s]", "ſ", "ic", ""),
+    (r"[a-z]", "K", "ic", ""),
+    (r"[a-z]", "K", "ic", ""),
+    (r"[a-z]", "K", "", ""),
+    (r"[A-Z]", "k", "ic", ""),
+    (r"[^a-z]", "K", "ic", ""),
+    (r"[^a-z]", "K", "ic", ""),
+    (r"[a-zA-Z]", "K", "ic", ""),
+    (r"[A-Za-z_]", "K", "ic", ""),
+    (r"[a-zA-Z0-9_]", "ſ", "ic", ""),
+    (r"[0-9a-fA-F]", "K", "ic", ""),
+    (r"[a-z_]", "K", "ic", ""),
+    (r"[a-z0-9]", "K", "ic", ""),
+    (r"[a-y]", "K", "ic", ""),
+    (r"[j-l]", "K", "ic", ""),
+    (r"[^j-l]", "K", "ic", ""),
+    (r"[r-t]", "ſ", "ic", ""),
+    (r"[a-zé]", "K", "ic", ""),
+    (r"[[:alpha:]]", "K", "ic", ""),
+    (r"[[:alpha:]]", "A", "ic", ""),
+    (r"[[:alpha:]x]", "KX", "ic", ""),
+    (r"[[:digit:]k]", "K", "ic", ""),
+    (r"[^[:alpha:]]", "K", "ic", U),
+    (r"[^[:digit:]]", "K", "ic", ""),
+    (r"[a-z\n]", ["1", "a"], "", ""),
+    (r"[^a-z]", ["a", "b"], "", ""),
+    "line breaks",
+    # --- #692: \_x newline-inclusive forms -------------------------------------------------------
+    (r"\_s", ["a", "b"], "", ""),
+    (r"a\_s\+b", ["a ", " b"], "", ""),
+    (r"a\_.b", ["a", "b"], "", ""),
+    (r"a.b", ["a", "b"], "", ""),
+    (r"a\_[xy]b", ["a", "b"], "", ""),
+    (r"a[^x]b", ["a", "b"], "", ""),
+    (r"a\_[^x]b", ["a", "b"], "", ""),
+    (r"a\_^b", "ab", "", ""),
+    (r"a\_$", "a", "", ""),
+    (r"\_^a", "a", "", ""),
+    (r"\_x", "g", "", ""),
+    # (a following line: in a buffer, `\n` also matches at the end of the LAST line, which a joined
+    # haystack without a trailing "\n" cannot show)
+    (r"\_a\+", ["xa", "b", "-"], "", ""),
+    (r"a\S", ["a", "b"], "", ""),
+    (r"a\_S", ["a", "b"], "", ""),
+    (r"\_[ab]", "_", "", ""),
+    (r"a[\n]b", ["a", "b"], "", ""),
+    (r"a[^\n]", ["a", "b"], "", ""),
+    (r"\_[^\n]", "x", "", ""),
+    (r"a\n", ["a", "b"], "", ""),
+    "atoms",
+    # --- #692: \e \t \r \n escapes ---------------------------------------------------------------
+    (r"\e", "a\x1b", "", ""),
+    (r"\t", "a\tb", "", ""),
+    (r"\r", "a\rb", "", ""),
+    (r"\b", "a\x08b", "", ""),
+    (r"\n", "x", "", ""),
+    "character classes",
+    # --- #692: character classes ------------------------------------------------------------------
+    (r"\i\+", "-é_9µ-", "", ""),
+    (r"\i", "中", "", ""),
+    (r"\I", "1a", "", ""),
+    (r"\k\+", "-中文-", "", ""),
+    (r"\k", "—", "", ""),
+    (r"\k", "😀", "", ""),
+    (r"\k\+", "a×b", "", ""),
+    (r"\K", "1a", "", ""),
+    (r"\f\+", " /a/b.c~ ", "", ""),
+    (r"\f", "中", "", ""),
+    (r"\F", "1a", "", ""),
+    (r"\p\+", "\x01ab\x7f", "", ""),
+    (r"\p", "é", "", ""),
+    (r"\p", "\t", "", ""),
+    (r"\p", "​", "", ""),
+    (r"\P", "1a", "", ""),
+    (r"\s\+", "a \tb", "", ""),
+    (r"\S", " a", "", ""),
+    (r"\d\+", "x123y", "", ""),
+    (r"\d", "٣", "", ""),
+    (r"\D", "1a", "", ""),
+    (r"\w\+", "-ab_9-", "", ""),
+    (r"\w", "é", "", ""),
+    (r"\W", "a-", "", ""),
+    (r"\a", "1é", "", ""),
+    (r"\A", "a1", "", ""),
+    (r"\l", "Aa", "", ""),
+    (r"\L", "aA", "", ""),
+    (r"\u", "aA", "", ""),
+    (r"\U", "Aa", "", ""),
+    (r"\h\+", "1a_b", "", ""),
+    (r"\H", "_1", "", ""),
+    (r"\o\+", "98071", "", ""),
+    (r"\O", "78", "", ""),
+    (r"\x\+", "xbeefg", "", ""),
+    (r"\X", "fg", "", ""),
+    (r".", "é", "", ""),
+    "word boundaries",
+    # --- word boundaries --------------------------------------------------------------------------
+    (r"\<foo\>", "foobar foo", "", ""),
+    (r"\<", "a", "", ""),
+    (r"a\>", "ab a", "", ""),
+    (r"\<é", "aé é", "", ""),
+    "\\zs and \\ze",
+    # --- \zs / \ze (#738 / #1024 fall out of the empty-group markers) ----------------------------
+    (r"foo\zsbar", "a foobar b", "", ""),
+    (r"foo\zsbar", "a xxxbar b", "", ""),
+    (r"o\zsba\zer", "a foobar b", "", ""),
+    (r"foo\zebar", "a foobar b", "", ""),
+    (r"a\zsb\zsc", "abc", "", ""),
+    (r"a\zeb\zec", "abc", "", ""),
+    (r"a\zeb\zsc", "abc", "", ""),
+    (r"foo\zsbar\|baz", "baz", "", ""),
+    (r"foo\|bar\zebaz", "barbaz", "", ""),
+    (r"\(a\zsb\)*", "abab", "", ""),
+    (r"\(ab\)*\zsc", "ababc", "", ""),
+    # `\=` / `\?` on a marker are accepted (only the repeating multis are E888)
+    (r"a\zs\=b", "ab", "", ""),
+    (r"a\zs\?b", "ab", "", ""),
+    (r"a\ze\=b", "ab", "", ""),
+    (r"a\ze\?b", "ab", "", ""),
+    (r"a\zs\+b", "ab", "", ""),
+    (r"a\ze\{2}b", "ab", "", ""),
+    # === #912 conformance corpus: more rows per class, and the 2026-11-02 audit reproductions ========
+    "multis",
+    # #743: every `\{` count form the help names compiles
+    (r"a\{2}", "caaa", "", ""),
+    (r"a\{}", "aa", "", ""),
+    (r"a\{,2}", "caaa", "", ""),
+    (r"\va{-1,}", "caaa", "", ""),
+    (r"a*", "baaa", "", ""),
+    (r"ba*", "baaa", "", ""),
+    (r"a\=", "b", "", ""),
+    (r"ab\=c", "ac", "", ""),
+    (r"\(ab\)\{2}", "abababx", "", ""),
+    (r"a\{-1,2}", "aaa", "", ""),
+    (r"a\{-1,}b", "aaab", "", ""),
+    (r".\{-}", "abc", "", ""),
+    (r"a.\{-}c", "abcbc", "", ""),
+    (r"a.*c", "abcbc", "", ""),
+    (r"\va{3}", "aaaa", "", ""),
+    (r"\va{1,2}?", "aa", "", ""),
+    (r"a\{2}\{2}", "aaaa", "", ""),
+    (r"\(a*\)*b", "aab", "", ""),
+    (r"\(a\|b\)\{2,}", "xabbay", "", ""),
+    (r"\v(a|ab)(c|bcd)(d*)", "abcd", "", ""),
+    (r"\va{,}", "aa", "", ""),
+    (r"\va{-,}", "aa", "", ""),
+    (r"a\{3,2}", "aaaa", "", ""),
+    "alternation and groups",
+    (r"foo\|bar", "xbar", "", ""),
+    (r"\(foo\|fo\)o", "foo", "", ""),
+    (r"\%(a\|b\)\+", "xabbay", "", ""),
+    (r"\v(foo|bar)+", "barfoo", "", ""),
+    (r"a\|b\|c", "zc", "", ""),
+    (r"\(\)", "a", "", ""),
+    # at most nine `\(` groups (E51)
+    (r"\(a\)\(b\)\(c\)\(d\)\(e\)\(f\)\(g\)\(h\)\(i\)\(j\)", "abcdefghij", "", ""),
+    (r"\v((a)|(b))+", "ab", "", ""),
+    (r"\|a", "a", "", ""),
+    (r"a\|", "b", "", ""),
+    "anchors",
+    # #737: `^` / `$` anchor at every line of a buffer, not only at its ends
+    (r"^foo", ["x", "foo"], "", ""),
+    (r"foo$", ["foo x", "a foo"], "", ""),
+    (r"^b$", ["a", "b", "c"], "", ""),
+    (r"\n$", ["a", "", "b"], "", ""),
+    (r"^\s*\n", ["x", " ", "y"], "", ""),
+    (r"a$\n^b", ["a", "b"], "", ""),
+    (r"^a\|b$", "ba", "", ""),
+    (r"^a\|b$", "ab", "", ""),
+    (r"\_^b", ["a", "b"], "", ""),
+    (r"a\_$\_s*b", ["a", "", "b"], "", ""),
+    (r"^", "", "", ""),
+    (r"$", "", "", ""),
+    (r"^$", "", "", ""),
+    (r"\v^(a|b)$", "b", "", ""),
+    (r"\v(^a|b$)", "cb", "", ""),
+    "line breaks",
+    # #744: `\s`, `\W`, `[^x]` never match a line break (only `\_x` and `\n` do)
+    (r"a\s", ["x a", "b"], "", ""),
+    (r"a\W", ["a", "b"], "", ""),
+    (r"a[^x]", ["a", "b"], "", ""),
+    (r"a\D", ["a", "b"], "", ""),
+    (r"a\_W", ["a", "b"], "", ""),
+    (r"a\_D", ["a", "b"], "", ""),
+    (r"a\_.\{-}b", ["a", "x", "b"], "", ""),
+    (r"a\n\n", ["a", "", "b"], "", ""),
+    "character classes",
+    # #744: `\w` `\d` `\s` are ASCII-only (Unicode letters, digits and spaces are not in them)
+    (r"\w\+", "é_", "", ""),
+    (r"\d\+", "٣1", "", ""),
+    (r"\s", "　 ", "", ""),
+    (r"\S\+", "　x ", "", ""),
+    (r"\w", "中a", "", ""),
+    (r"\h", "é_", "", ""),
+    (r"\a\+", "éab", "", ""),
+    (r"\l", "éa", "", ""),
+    (r"\u", "ÉA", "", ""),
+    (r"\x", "１a", "", ""),
+    (r"\o", "８7", "", ""),
+    (r"\i\+", "a中", "", ""),
+    (r"\k\+", "é中", "", ""),
+    (r"[[:alnum:]]\+", "-é1-", "", ""),
+    (r"[[:blank:]]", "a　\tb", "", ""),
+    (r"[[:cntrl:]]", "a\x01", "", ""),
+    (r"[[:graph:]]", " é", "", ""),
+    (r"[[:print:]]", "\x01 ", "", ""),
+    (r"[[:backspace:]]", "a\x08", "", ""),
+    (r"[[:escape:]]", "a\x1b", "", ""),
+    "word boundaries",
+    # #745: `\<` / `\>` are zero-width and need a word character on the right / left side
+    (r"a\<", "a b", "", ""),
+    (r"\>a", " a", "", ""),
+    (r"\<a\>", "ba a", "", ""),
+    (r"\>", "foo bar", "", ""),
+    (r"\<\>", "ab", "", ""),
+    (r"\<_\w\+", "a _b", "", ""),
+    (r"\<é", "xé é", "", ""),
+    (r"\<1", "a1 1", "", ""),
+    # Vim also starts a word where the character class changes between two word characters
+    # (Latin to Hangul, CJK, kana, emoji). Rust's Unicode `\b` does not; a `\<` opening the pattern and
+    # a `\>` closing it are checked after the match with Vim's class rule instead (#745).
+    (r"\<API\>", "x API를 API", "", ""),
+    (r"\<한", "abc한글", "", ""),
+    (r"글\>", "한글abc", "", ""),
+    (r"\<b", "a×b", "", ""),
+    (r"\<b", "a÷b b", "", ""),
+    (r"\<×", "a ×", "", ""),
+    (r"a\<", "ab", "", ""),
+    (r"\>a", "ab", "", ""),
+    (r"\<\>", "a한", "", ""),
+    (r"\<\>", "한a", "", ""),
+    (r"\<", " 한글", "", ""),
+    (r"\>", "API를", "", ""),
+    (r"\<글", "한글 글", "", ""),
+    (r"\<か\>", "漢かカ か", "", ""),
+    (r"\<カ", "かカ", "", ""),
+    (r"\<😀", "a😀", "", ""),
+    (r"\<a", "😀a", "", ""),
+    (r"\<,", "a ,", "", ""),
+    (r"\<x", "　x", "", ""),
+    (r"\<API\>", "API를", "ic", ""),
+    (r"\v<API>", "x API를", "", ""),
+    (r"\c\<api\>", "x API를", "", ""),
+    (r"\<API\zs를", "API를", "", ""),
+    (r"\<API\ze를", "API를", "", ""),
+    (r"\<a\|b\>", "ab b", "", ""),
+    (r"\<\w\+", "abc한글", "", ""),
+    (r"\<\k\+\>", "x 한글abc", "", ""),
+    (r"\<API\>", ["xAPI", "API를"], "", ""),
+    # A closing `\>` whose first end fails: the other ends at the same start are tried, nearer shorter
+    # ones first, then longer ones.
+    (r".*\>", "ab cd+", "", ""),
+    (r".\{-}\>", "ab cd", "", ""),
+    (r"\(a\|ab\)\>", "ab", "", ""),
+    (r"\w\+\>", "abc한", "", ""),
+    (r"\k\+\>", "API를,", "", ""),
+    (r"a.\{-}\>", "ab한 x", "", ""),
+    # ... but ruse cannot rank the paths as Vim's engine does: here Vim takes the second alternative
+    # (the longer end), ruse the nearer shorter one. The owned engine (#1128) fixes it.
+    (r"\(a.\|a.b\|a\)\>", "a b", "", known(1128)),
+    # Mid-pattern `\<` / `\>` keep the Unicode `\b{start}` / `\b{end}` approximation until #1128.
+    (r"x\<한", "x한", "", known(1128)),
+    (r"API\>를", "API를", "", known(1128)),
+    (r"\(\<한\)", "abc한", "", known(1128)),
+    "\\zs and \\ze",
+    (r"\v(ab)\zeab", "ababab", "", ""),
+    (r"foo\zs", "xx foo bar", "", ""),
+    (r"\zsfoo", "xfoo", "", ""),
+    (r"foo\ze", "foo", "", ""),
+    (r"\zs", "a", "", ""),
+    (r"a\zs\_s*b", ["a", "b"], "", ""),
+    (r"\_s\zsb", ["a", "b"], "", ""),
+    (r"a\n\zeb", ["a", "b"], "", ""),
+    (r"\v<\zsfoo>", "xfoo foo", "", ""),
+    (r"f\zso\+\zebar", "foobar", "", ""),
+    (r"\%(a\zsb\|c\zsd\)", "cd", "", ""),
+    "case and smartcase",
+    # #757: smartcase counts letters, not the letter of an escape (`\S`, `\V`, `\%U`, `\_S`)
+    (r"\Vfoo", "FOO", "ic scs", ""),
+    (r"\Mfoo", "FOO", "ic scs", ""),
+    (r"\_Sfoo", "xFOO", "ic scs", ""),
+    (r"\%U00000041foo", "AFOO", "ic scs", ""),
+    (r"\Ufoo", "xFOO", "ic scs", ""),
+    (r"\v\Sfoo", "xFOO", "ic scs", ""),
+    (r"\v%Ufoo", "xFOO", "ic scs", ""),
+    (r"Foo", "FOO", "ic scs", ""),
+    (r"Foo", "Foo", "ic scs", ""),
+    (r"foo\C", "FOO", "ic scs", ""),
+    (r"\cFoo", "fOO", "ic scs", ""),
+    (r"[A-Z]oo", "foo", "ic scs", ""),
+    (r"\u", "a", "ic scs", ""),
+    (r"É", "é", "ic scs", ""),
+    (r"é", "É", "ic scs", ""),
+    (r"foo", "FOO", "scs", ""),
+    (r"\cfoo\Cbar", "FOOBAR", "", ""),
+    "multibyte and case folding",
+    (r"é", "É", "ic", ""),
+    (r"É", "é", "ic", ""),
+    (r"ß", "SS", "ic", ""),
+    (r"ss", "ß", "ic", ""),
+    # nvim does not fold ẞ (U+1E9E) to ß; the regex crate does. ruse folds by nvim's `utf_fold` classes
+    # (crates/core/src/case_tables.rs) instead of the engine's (#1112).
+    (r"ß", "ẞ", "ic", ""),
+    (r"ẞ", "ß", "ic", ""),
+    (r"\%u1e9e", "ß", "ic", ""),
+    (r"[ß]", "ẞ", "ic", ""),
+    (r"ᾳ", "ᾼ", "ic", ""),
+    (r"ᾼ", "ᾳ", "ic", ""),
+    (r"ᾀ", "ᾈ", "ic", ""),
+    (r"ῳ", "ῼ", "ic", ""),
+    (r"xι", "xͅ", "ic", ""),
+    (r"k", "K", "ic", ""),
+    (r"\%u212a", "k", "ic", ""),
+    (r"[a-y]", "K", "ic", ""),
+    (r"[^k]", "K", "ic", ""),
+    (r"[^k]", "Kx", "ic", ""),
+    (r"s", "ſ", "ic", ""),
+    (r"[r-t]", "ſ", "ic", ""),
+    (r"꟎", "꟎", "ic", ""),
+    (r"\%ua7ce", "꟏", "ic", ""),
+    (r"\%ua7cf", "꟎", "ic", ""),
+    (r"\%U16ea0", "\U00016ebb", "ic", ""),
+    (r"\%U16ebb", "\U00016ea0", "ic", ""),
+    (r"\%U1e900", "\U0001e922", "ic", ""),
+    (r"ϑ", "Θ", "ic", ""),
+    (r"ϴ", "θ", "ic", ""),
+    (r"µ", "Μ", "ic", ""),
+    (r"İ", "i", "ic", ""),
+    (r"ı", "i", "ic", ""),
+    (r"ǅ", "ǆ", "ic", ""),
+    (r"ß", "ẞ", "", ""),
+    (r"σ", "Σ", "ic", ""),
+    (r"ς", "Σ", "ic", ""),
+    (r"Σ", "ς", "ic", ""),
+    (r"ǆ", "ǅ", "ic", ""),
+    (r"ǆ", "Ǆ", "ic", ""),
+    (r"i", "İ", "ic", ""),
+    (r"I", "ı", "ic", ""),
+    (r"ff", "ﬀ", "ic", ""),
+    (r"k", "K", "ic", ""),
+    (r"ω", "Ω", "ic", ""),
+    (r"ä", "Ä", "ic", ""),
+    (r"[é]", "É", "ic", ""),
+    (r"[à-ä]", "Â", "ic", ""),
+    (r"[À-Ä]", "â", "ic", ""),
+    (r".", "😀", "", ""),
+    (r"..", "éa", "", ""),
+    (r"a.c", "a中c", "", ""),
+    (r"[^a]", "中", "", ""),
+    (r"[é-ü]", "añ", "", ""),
+    (r"\%u4e2d", "x中", "", ""),
+    (r"\%x41", "A", "", ""),
+    (r"[中]", "中", "", ""),
+    (r"가\+", "x가가", "", ""),
+    (r"\v가{2}", "가가가", "", ""),
+    (r"[가-힣]\+", "a한글b", "", ""),
+    (r"😀\|中", "a中", "", ""),
+    "position atoms",
+    (r"\%<3la", "a", "", U),
+    (r"\%>1ca", "ba", "", U),
+    (r"\%3va", "xxa", "", U),
+    (r"\%'aa", "a", "", U),
+    (r"\%.la", "a", "", U),
+    (r"\%<'ma", "a", "", U),
+    (r"\%#a", "a", "", U),
+    (r"\%V", "a", "", U),
+    "rejected",
+    # --- rejected, never faked ---------------------------------------------------------------------
+    (r"\(a\)\1", "aa", "", U),
+    (r"foo\@=", "foo", "", U),
+    (r"\(foo\)\@<=bar", "foobar", "", U),
+    (r"\(a\)\@>", "a", "", U),
+    (r"a\&", "a&", "", U),
+    (r"~", "a~", "", U),
+    (r"\%Va", "a", "", U),
+    (r"\%2c", "ab", "", U),
+    (r"\%1la", "a", "", U),
+    (r"\%^a", "a", "", U),
+    (r"a\%$", "a", "", U),
+    (r"a\%#", "a", "", U),
+    (r"\Za", "a", "", U),
+    (r"\1", "1", "", ""),
+]
+
+
+
+def _rows() -> list[tuple[str, str, str | list[str], str, str]]:
+    """CASES flattened to (class, pattern, subject, options, expectation)."""
+    rows, cls = [], None
+    for item in CASES:
+        if isinstance(item, str):
+            cls = item
+        else:
+            if cls is None:
+                raise OracleError("a case before the first class heading")
+            rows.append((cls, *item))
+    return rows
+
+
+ROWS = _rows()
+
+_LUA = r"""
+local cases = vim.json.decode(io.open(%s):read('*a'))
+local out = {}
+local function off(lines, l, c)  -- 1-based line, 0-based byte col -> byte offset in joined text
+  local n = 0
+  for i = 1, l - 1 do n = n + #lines[i] + 1 end
+  return n + c
+end
+for _, k in ipairs(cases) do
+  vim.o.ignorecase = k.ic
+  vim.o.smartcase = k.scs
+  local r
+  if #k.lines == 1 and not k.scs then
+    local ok, m = pcall(vim.fn.matchstrpos, k.lines[1], k.pat)
+    if not ok then r = { kind = 'error', msg = tostring(m) }
+    elseif m[2] < 0 then r = { kind = 'none' }
+    else r = { kind = 'match', s = m[2], e = m[3] } end
+  else
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, k.lines)
+    vim.api.nvim_win_set_cursor(0, {1, 0})
+    local ok, s = pcall(vim.fn.searchpos, k.pat, 'cnW')
+    if not ok then r = { kind = 'error', msg = tostring(s) }
+    elseif s[1] == 0 then r = { kind = 'none' }
+    else
+      local e = vim.fn.searchpos(k.pat, 'cenW')
+      local line = k.lines[e[1]]
+      local len = 1
+      if e[2] - 1 < #line then
+        local b = line:byte(e[2])
+        len = (b < 0x80 and 1) or (b < 0xE0 and 2) or (b < 0xF0 and 3) or 4
+      end
+      r = { kind = 'match', s = off(k.lines, s[1], s[2] - 1), e = off(k.lines, e[1], e[2] - 1) + len }
+    end
+  end
+  table.insert(out, r)
+end
+io.write(vim.json.encode(out))
+"""
+
+
+def capture() -> tuple[list[dict], str]:
+    """Run every case through one fresh pinned nvim; return the observations and the version line."""
+    pin = read_pin()
+    version = nvim_version()
+    assert_pin(version, pin)
+    payload = [
+        {
+            "pat": pat,
+            "lines": [subj] if isinstance(subj, str) else subj,
+            "ic": "ic" in opts.split(),
+            "scs": "scs" in opts.split(),
+        }
+        for _, pat, subj, opts, _ in ROWS
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        data = Path(tmp) / "cases.json"
+        data.write_text(json.dumps(payload), encoding="utf-8")
+        script = Path(tmp) / "probe.lua"
+        script.write_text(_LUA % json.dumps(str(data)), encoding="utf-8")
+        proc = subprocess.run(
+            ["nvim", "--headless", "-u", "NONE", "-i", "NONE", "-l", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    if proc.returncode != 0 or not proc.stdout:
+        raise OracleError(f"nvim failed (rc={proc.returncode}): {proc.stderr.strip()}")
+    results = json.loads(proc.stdout)
+    if len(results) != len(ROWS):
+        raise OracleError(f"expected {len(ROWS)} observations, got {len(results)}")
+    return results, version
+
+
+def rust_str(s: str) -> str:
+    """A Rust string literal for `s`; control characters escaped, everything else verbatim."""
+    out = []
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F or 0x200B <= ord(ch) <= 0x200F:
+            out.append(f"\\u{{{ord(ch):x}}}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def render(results: list[dict], version: str) -> str:
+    pin = read_pin()
+    lines = [
+        "// GENERATED by tools/parity/pattern_oracle.py — do not edit by hand. Every `nvim` answer was",
+        f"// captured from the pinned Neovim ({version}, revision {pin['revision']});",
+        "// regenerate with `python3 tools/parity/pattern_oracle.py`.",
+        "",
+        "use super::{Case, Expect, Nvim};",
+        "",
+        "#[rustfmt::skip] // one row per line, as generated",
+        "pub(crate) const CASES: &[Case] = &[",
+    ]
+    for (cls, pat, subj, opts, expect), r in zip(ROWS, results):
+        hay = subj if isinstance(subj, str) else "\n".join(subj)
+        if r["kind"] == "match":
+            nv = f"Nvim::Match({r['s']}, {r['e']})"
+        elif r["kind"] == "none":
+            nv = "Nvim::NoMatch"
+        else:
+            nv = "Nvim::Error"
+        if expect == U:
+            ex = "Expect::Unsupported"
+        elif expect.startswith("known #"):
+            ex = f"Expect::Known({int(expect[7:])})"
+        else:
+            ex = "Expect::Agree"
+        lines.append(
+            f"    Case {{ class: {rust_str(cls)}, pat: {rust_str(pat)}, hay: {rust_str(hay)}, "
+            f"ic: {str('ic' in opts.split()).lower()}, scs: {str('scs' in opts.split()).lower()}, "
+            f"nvim: {nv}, expect: {ex} }},"
+        )
+    lines.append("];")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    try:
+        results, version = capture()
+    except OracleError as exc:
+        print(f"pattern_oracle: {exc}", file=sys.stderr)
+        return 2
+    text = render(results, version)
+    if "--check" in argv:
+        current = TABLE.read_text(encoding="utf-8") if TABLE.exists() else ""
+        if current != text:
+            print(f"pattern_oracle: {TABLE} is stale; regenerate it", file=sys.stderr)
+            return 1
+        print(f"pattern_oracle: {len(ROWS)} cases up to date")
+        return 0
+    TABLE.parent.mkdir(parents=True, exist_ok=True)
+    TABLE.write_text(text, encoding="utf-8")
+    print(f"pattern_oracle: wrote {len(ROWS)} cases to {TABLE.relative_to(REPO_ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

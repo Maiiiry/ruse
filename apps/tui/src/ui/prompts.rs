@@ -1,57 +1,53 @@
-//! Full-screen and status-line prompts: the open-time crash-recovery prompt (F-008) and the
-//! `:s///c` interactive confirm loop (F-009 #2).
+//! Status-line prompts: the `:s///c` interactive confirm loop (F-009 #2), and the flag a full-screen prompt
+//! (the open-time recovery prompt, [`super::recovery`]) sets when it paints over the editor.
 
-use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::style::Print;
-use crossterm::terminal::{self, ClearType};
-use crossterm::{cursor, queue};
+use crossterm::event::KeyCode;
 
-use ruse_core::Workspace;
+use ruse_core::{BytePos, Workspace};
 
-/// Ask the user whether to load recovered unsaved changes (F-008 #3). Renders a minimal full-screen
-/// prompt and blocks for one key: `y`/`r` = recover, anything else = discard and open the disk file.
-/// The original file is never touched here — the choice only decides the initial BUFFER (#4).
-pub(crate) fn prompt_recovery(out: &mut io::Stdout) -> io::Result<bool> {
-    queue!(
-        out,
-        terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0),
-        Print("ruse: unsaved changes were recovered from a previous session."),
-        cursor::MoveTo(0, 1),
-        Print("Press 'r' to RECOVER them, or any other key to open the on-disk file."),
-    )?;
-    out.flush()?;
-    loop {
-        if let Event::Key(k) = event::read()? {
-            if k.kind == KeyEventKind::Release {
-                continue; // act on the press, not its release (kitty/Windows send both)
-            }
-            return Ok(matches!(
-                k.code,
-                KeyCode::Char('r') | KeyCode::Char('y') | KeyCode::Char('R')
-            ));
-        }
-    }
+/// Set when a full-screen prompt has painted over the editor, so the next frame repaints every cell
+/// instead of diffing against a screen the terminal no longer shows.
+static SCREEN_CLOBBERED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a prompt painted over the editor since the last call (and reset the flag).
+pub(crate) fn take_screen_clobbered() -> bool {
+    SCREEN_CLOBBERED.swap(false, Ordering::Relaxed)
+}
+
+/// Note that a full-screen prompt painted over the editor ([`take_screen_clobbered`]).
+pub(crate) fn mark_screen_clobbered() {
+    SCREEN_CLOBBERED.store(true, Ordering::Relaxed);
 }
 
 /// The state of an in-progress `:s///c` confirm loop (F-009 #2): the pending substitutions, the index
-/// of the one being confirmed, and the subset accepted so far. The buffer is NOT edited until the loop
+/// of the one being confirmed, and the answers given so far. The buffer is NOT edited until the loop
 /// ends (all confirmed, or `a`/`l`/`q`), so the absolute offsets stay valid throughout; the accepted
-/// subset is then applied as one undo group.
+/// subset is then applied as one undo group, through the resolved `:s` recorded with the answers
+/// (RFC-0020), so a trace replays the same choice without a prompt.
 pub(crate) struct Confirm {
     pub(crate) subs: Vec<ruse_core::Substitution>,
     pub(crate) idx: usize,
-    accepted: Vec<ruse_core::Substitution>,
+    answers: Vec<bool>,
+    /// The resolved `:s` (its `answers` filled in when the loop ends).
+    ex: ruse_core::ExCmd,
+    /// The cursor when the loop began (the frame follows the current match meanwhile).
+    from: usize,
 }
 
 impl Confirm {
-    pub(crate) fn new(subs: Vec<ruse_core::Substitution>) -> Confirm {
+    pub(crate) fn new(
+        subs: Vec<ruse_core::Substitution>,
+        ex: ruse_core::ExCmd,
+        from: usize,
+    ) -> Confirm {
         Confirm {
             subs,
             idx: 0,
-            accepted: Vec::new(),
+            answers: Vec::new(),
+            ex,
+            from,
         }
     }
 }
@@ -76,35 +72,58 @@ pub(crate) fn confirm_key(
     confirm: &mut Option<Confirm>,
     key: crossterm::event::KeyEvent,
     ws: &mut Workspace,
-    status: &mut String,
+    recorded: &mut Vec<ruse_core::Command>,
+    status: &mut crate::app::messages::Status,
+    report: i64,
 ) {
     let Some(mut c) = confirm.take() else {
         return;
     };
+    let n = c.subs.len();
     match key.code {
         KeyCode::Char('y') => {
-            if let Some(s) = c.subs.get(c.idx) {
-                c.accepted.push(s.clone());
-            }
+            c.answers.push(true);
             c.idx += 1;
         }
-        KeyCode::Char('n') => c.idx += 1,
+        KeyCode::Char('n') => {
+            c.answers.push(false);
+            c.idx += 1;
+        }
         KeyCode::Char('a') => {
-            c.accepted.extend(c.subs[c.idx..].iter().cloned());
-            c.idx = c.subs.len();
+            c.answers.resize(n, true);
+            c.idx = n;
         }
         KeyCode::Char('l') => {
-            if let Some(s) = c.subs.get(c.idx) {
-                c.accepted.push(s.clone());
-            }
-            c.idx = c.subs.len();
+            c.answers.push(true);
+            c.idx = n;
         }
-        KeyCode::Char('q') | KeyCode::Esc => c.idx = c.subs.len(),
+        KeyCode::Char('q') | KeyCode::Esc => c.idx = n,
         _ => {} // any other key: re-prompt (Vim ignores it)
     }
-    if c.idx >= c.subs.len() {
-        let out = ws.apply_substitutions(&c.accepted);
-        *status = format!("{} substitutions on {} lines", out.replacements, out.lines);
+    if c.idx >= n {
+        c.answers.resize(n, false);
+        let Confirm {
+            mut ex,
+            answers,
+            from,
+            ..
+        } = c;
+        if let ruse_core::ExCmd::Substitute { answers: a, .. } = &mut ex {
+            *a = Some(answers);
+        }
+        // Run it from where the loop began (the jump it records is that position), then leave the
+        // cursor on the last match shown when nothing was replaced, as the loop did live.
+        let shown = ws.focused().view.cursor().0;
+        ws.place_focused_cursor(BytePos(from));
+        let out = crate::app::dispatch::sub_outcome(crate::app::dispatch::run_ex(ex, ws, recorded))
+            .unwrap_or(ruse_core::SubOutcome {
+                replacements: 0,
+                lines: 0,
+            });
+        if out.replacements == 0 {
+            crate::app::dispatch::place_cursor(ws, recorded, shown);
+        }
+        status.give(crate::app::dispatch::substituted_message(&out, report));
         // `confirm` was taken and stays None — the loop is over.
     } else {
         *confirm = Some(c);

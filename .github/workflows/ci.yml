@@ -4,11 +4,17 @@
 # Rust-relevant path changed — the skip still reports success.
 # `rust-macos` is advisory (not required): clippy + test on macOS, because platform-specific code
 # (pty/forkpty, terminal) can be clean on Linux and broken on macOS. Same Rust-relevance gate.
+# `rust-release` is advisory (not required) and NOT run on PRs: `cargo test --workspace --release` on push
+# to main, weekly, and on demand (#899) — shipped binaries are built with the release profile, so its
+# codegen (optimiser; `debug_assertions` and `overflow-checks` off) must be tested too.
 # Security (docs/operations/ci-cd-and-release.md §11): actions pinned by SHA, least-privilege token.
 name: ci
 on:
   pull_request:
   push: { branches: [main] }
+  schedule:
+    - cron: "0 5 * * 1"   # weekly, Monday ~05:00 UTC — the release-profile suite (rust-release)
+  workflow_dispatch: {}
 permissions: { contents: read }
 concurrency:
   group: ci-${{ github.ref }}
@@ -30,13 +36,15 @@ jobs:
         run: |
           have=0; [ -f Cargo.toml ] && have=1
           echo "have=$have" >> "$GITHUB_OUTPUT"
-          # PRs: run the heavy Rust steps only when Rust-relevant paths moved. Fail SAFE — if the diff
-          # cannot be computed, run them. Other events always run.
+          # PRs: run the heavy Rust steps only when Rust-relevant paths moved. Fail SAFE — if the fetch or
+          # the diff fails, run them (#888: a piped `git diff | grep` read a failed diff as "no Rust change").
+          # Other events always run. The pattern also covers lint/format/cargo config and fuzz targets.
           rust=1
           if [ "$EVENT" = "pull_request" ]; then
-            if git fetch --no-tags --depth=1 origin "$BASE_REF" 2>/dev/null; then
-              if git diff --name-only FETCH_HEAD HEAD 2>/dev/null \
-                   | grep -qE '^(crates|apps|tests)/|Cargo\.(toml|lock)$|^rust-toolchain|^\.github/workflows/ci\.yml$|^spec/(architecture|dependencies)\.yaml$'; then
+            if git fetch --no-tags --depth=1 origin "$BASE_REF" 2>/dev/null \
+               && changed=$(git diff --name-only FETCH_HEAD HEAD); then
+              if printf '%s\n' "$changed" \
+                   | grep -qE '^(crates|apps|tests|fuzz|\.cargo)/|Cargo\.(toml|lock)$|^rust-toolchain|^\.?(clippy|rustfmt)\.toml$|^\.github/workflows/ci\.yml$|^spec/(architecture|dependencies)\.yaml$'; then
                 rust=1
               else
                 rust=0
@@ -60,6 +68,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - if: steps.detect.outputs.have == '1' && steps.detect.outputs.rust == '1'
         run: cargo test --workspace
+      # Install smoke (#896): `cargo install` the binary and run it from the install prefix. `--debug` with the
+      # shared target dir reuses the test build, so this costs about a second; the release profile is left to
+      # the release workflow.
+      - name: install smoke
+        if: steps.detect.outputs.have == '1' && steps.detect.outputs.rust == '1'
+        run: |
+          root="$RUNNER_TEMP/ruse-install"
+          cargo install --locked --debug --path apps/tui --root "$root" --target-dir target
+          "$root/bin/ruse" --version | grep -E '^ruse [0-9]+\.[0-9]+\.[0-9]+'
+          "$root/bin/ruse" --help | grep '^usage: ruse' >/dev/null
       - if: steps.detect.outputs.have == '1' && steps.detect.outputs.rust == '1'
         uses: ./.github/actions/setup-python-yaml
       - name: dependency direction + cycle check
@@ -78,3 +96,16 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  rust-release:
+    # Release-profile test suite (#899). Never on pull_request, so it can neither block nor slow a PR.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with: { cache: false, build-warnings: allow }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with: { key: release }
+      - run: cargo test --workspace --release

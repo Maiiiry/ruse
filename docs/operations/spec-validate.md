@@ -20,17 +20,17 @@ related:
 The spec/docs discipline (one fact one home, spec IDs point into docs, records-as-YAML / prose-as-Markdown)
 is only real if a tool enforces it. `spec validate` is that tool. A precise reference implementation is
 [`tools/spec-validate.py`](../../tools/spec-validate.py) (passes on the current tree); D-022 promotes it to
-the repo's `xtask` once code exists. Two subcommands:
+the repo's `xtask`. Two subcommands, of which `spec validate` is built:
 
-- **`spec validate`** — checks; exit 0 = PASS, 1 = FAIL. Runs in fast PR CI ([ci-cd-and-release.md](ci-cd-and-release.md) §1).
-- **`spec build`** — regenerates derived artifacts (below); CI fails if regeneration would change a
+- **`spec validate`** — checks; exit 0 = PASS, 1 = FAIL. Runs in `spec-check.yml` ([workflows](../../.github/workflows/README.md)).
+- **`spec build`** (planned, D-022) — regenerates derived artifacts (below); CI fails if regeneration would change a
   committed generated file (i.e. someone hand-edited it or forgot to rebuild).
 
 ## Inputs
 
 | Kind | Files | Role |
 | --- | --- | --- |
-| State (YAML) | `spec/PRD.yaml`, `spec/POLICY.yaml`, `spec/context-profiles.yaml`, `spec/glossary.yaml` | parsed as data |
+| State (YAML) | `spec/PRD.yaml`, `spec/POLICY.yaml`, `spec/context-profiles.yaml`, `spec/glossary.yaml`, `spec/capabilities.yaml`, `spec/dependencies.yaml`, `spec/config-schema.yaml`, `spec/review-axes.yaml`, `spec/phases.yaml` | parsed as data |
 | ID registries (Markdown) | `docs/invariants/reference-invariants.md` (INV-*), `docs/anti-patterns/anti-patterns.md` (CATEGORY-n), `spec/DECISIONS.md` (D-*), `spec/ARCHITECTURE.md` (ARCH-*) | IDs extracted for cross-ref checks |
 | Link surface | all `*.md` under `spec/` and `docs/` | relative links resolved |
 
@@ -55,7 +55,9 @@ Anti-pattern categories are ALL-CAPS by convention, so section headers like `## 
 2. **PRD component `depends_on`** resolve, and respect **build_stage order** `kernel < input < tui < workspace <
    plugin < remote` (a component may not depend on a later-stage component; D-036). This makes the build order
    machine-checkable (V-10/V-11 could not have slipped past this).
-3. **PRD feature `depends_on`** resolve to a component or feature.
+3. **PRD feature `depends_on`** resolve to a component or feature. A feature's `trace.design` paths resolve,
+   and a `status: done` feature's `trace.verify` is non-empty and every `trace.verify` / `trace.contract`
+   path resolves to a real file (#886; `tools/rusekit/spec_trace.py`).
 4. **POLICY `invariants:`** resolve to the INV-* registry.
 5. **POLICY `antipattern.refs`** resolve to a real anti-pattern catalog ID (`CODE-n` in range).
 6. **context-profiles `include`** resolve to a known ID (F/C/ENG/ARCH/D/INV), an anti-pattern ID, or an
@@ -80,8 +82,10 @@ Authored source → generated output (never hand-edit the outputs — D-021):
 ## Output & exit codes
 
 ```
-registries: INV=29 ENG=17 D=32 ARCH=6 F=21 C=24 anti-pattern-categories=37 glossary-terms=20
-md files checked: 43
+registries: INV=.. ENG=.. D=.. ARCH=.. F=.. C=.. CAP=.. DEP=.. anti-pattern-categories=.. glossary-terms=.. review-axes=.. phases=..
+anti-pattern severity: P0=.. P1=.. P2=.. P3=.. (total ..)
+md files checked: ..
+
 spec validate: PASS
 ```
 
@@ -91,9 +95,9 @@ Exit `0` PASS, `1` FAIL (lists each error). Warnings do not fail the build.
 
 - **PR (fast CI):** `spec validate` must pass to merge (blocks dangling refs, build_stage violations, broken
   links, bad enums, duplicate IDs).
-- **PR:** `spec build` then `git diff --exit-code` on generated files (catches hand-edited or stale
+- **PR (planned, with `spec build`):** `spec build` then `git diff --exit-code` on generated files (catches hand-edited or stale
   generated artifacts).
-- Wire into [ci-cd-and-release.md](ci-cd-and-release.md) §1 (`ci-fast.yml`).
+- Wired through `spec-check.yml` ([workflows](../../.github/workflows/README.md)).
 
 ## Status
 

@@ -3,19 +3,42 @@
 //! the right points — so the loop is no longer sprinkled with LSP logic. `lsp/` stays the pure client
 //! (protocol/codec/model, no app types); THIS is the wiring that touches `Workspace`/`Files`/highlighters.
 //!
-//! Determinism boundary (F-022): the coordinator issues NO `Command`s — its edits go through
-//! `Workspace::apply_edits(_, TransactionOrigin::Lsp)`, external and un-replayed, exactly as before.
+//! Determinism boundary (F-022, RFC-0020 R6): the coordinator issues no key `Command`s. A server's edits
+//! to the focused buffer are external input, so they go to the session as resolved records
+//! (`ExCmd::Edits` with `TransactionOrigin::Lsp`, and `ExCmd::Place` for the cursor it leaves) through a
+//! [`Record`] sink, which records them in the trace and runs them; replay applies the same edit list.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ruse_core::{DocumentId, Mode, Revision, TransactionOrigin, Workspace};
+use ruse_core::{
+    BytePos, DocumentId, ExCmd, ExOutcome, Mode, Revision, TransactionOrigin, Workspace,
+};
 use serde_json::Value;
 
 use crate::app::dispatch::{is_ctrl, open_file_into_buffer, Files, Highlighters};
+use crate::app::messages::Status;
 use crate::input::Ex;
 use crate::lsp::{self, Diag, LspClient};
+
+/// Where the coordinator's writes to the focused buffer go: the session records each resolved command in
+/// the trace and runs it (`dispatch::run_ex`, RFC-0020 R6).
+pub(crate) type Record<'a> = &'a mut dyn FnMut(&mut Workspace, ExCmd) -> ExOutcome;
+
+/// Apply a server's resolved byte edits to the focused buffer as one `Lsp`-origin undo group, through the
+/// trace (`ex_edits`, RFC-0020 R6). Returns whether the batch applied (`apply_edits` refuses a bad one whole).
+pub(crate) fn apply_lsp_edits(
+    ws: &mut Workspace,
+    rec: Record<'_>,
+    edits: Vec<(BytePos, BytePos, String)>,
+) -> bool {
+    let ex = ExCmd::Edits {
+        origin: TransactionOrigin::Lsp,
+        edits,
+    };
+    rec(ws, ex) == ExOutcome::Applied(true)
+}
 
 /// Status shown when a language server is held back because the workspace is not trusted (D-058).
 const UNTRUSTED_NOTICE: &str =
@@ -95,7 +118,7 @@ pub(crate) struct LspCoordinator {
     pending_resolve: Option<usize>,
     // Deferred results — set while polling (inside the frame's `spans` borrow) and drained AFTER render.
     goto_jump: Option<(String, u32, u32)>,
-    pending_edits: Vec<(usize, usize, String)>,
+    pending_edits: Vec<(BytePos, BytePos, String)>,
     pending_rename: Vec<(String, Vec<lsp::protocol::LspTextEdit>)>,
     pending_refs: Option<Vec<(String, u32, u32)>>,
     pending_actions: Option<Vec<lsp::protocol::CodeAction>>,
@@ -133,8 +156,8 @@ impl LspCoordinator {
 
     /// `:trust` — the user trusts this workspace for the session: language servers may start (the next
     /// `sync_and_poll` spawns the focused buffer's server). Not persisted (D-058).
-    pub(crate) fn grant_trust(&mut self, status: &mut String) {
-        *status = if self.trusted {
+    pub(crate) fn grant_trust(&mut self, status: &mut Status) {
+        status.info(if self.trusted {
             "workspace already trusted".to_string()
         } else {
             self.trusted = true;
@@ -142,7 +165,14 @@ impl LspCoordinator {
                 "workspace trusted for this session: language servers enabled ({})",
                 self.cwd.display()
             )
-        };
+        });
+    }
+
+    /// `:untrust` — take back the session's trust: no language server starts from now on (one already
+    /// running keeps running until it exits).
+    pub(crate) fn revoke_trust(&mut self) {
+        self.trusted = false;
+        self.trust_notice_shown = false;
     }
 
     /// The `(server key, uri)` for the FOCUSED buffer, if it is backed by a spawned+opened language server.
@@ -178,7 +208,7 @@ impl LspCoordinator {
         revision: Revision,
     ) {
         if let Some((key_s, uri)) = self.focused_server(ws, files) {
-            let cur = ws.focused().view.cursor().min(snapshot.len());
+            let cur = ws.focused().view.cursor().0.min(snapshot.len());
             let (line, ch) = lsp::model::byte_to_lsp_pos(snapshot, cur);
             self.completion_req = self.send(
                 key_s,
@@ -249,7 +279,7 @@ impl LspCoordinator {
         files: &Files,
         revision: Revision,
         snapshot: &[u8],
-        status: &mut String,
+        status: &mut Status,
     ) {
         let id = ws.focused_buffer();
         let focused_uri = if let Some(bf) = files.get(&id) {
@@ -263,7 +293,7 @@ impl LspCoordinator {
                     if !self.trusted {
                         if !self.trust_notice_shown {
                             self.trust_notice_shown = true;
-                            *status = UNTRUSTED_NOTICE.to_string();
+                            status.warn(UNTRUSTED_NOTICE);
                         }
                         return None;
                     }
@@ -325,8 +355,8 @@ impl LspCoordinator {
                             .into_iter()
                             .map(|((sl, sc), (el, ec), text)| {
                                 (
-                                    lsp::model::lsp_pos_to_byte(snapshot, sl, sc),
-                                    lsp::model::lsp_pos_to_byte(snapshot, el, ec),
+                                    BytePos(lsp::model::lsp_pos_to_byte(snapshot, sl, sc)),
+                                    BytePos(lsp::model::lsp_pos_to_byte(snapshot, el, ec)),
                                     text,
                                 )
                             })
@@ -352,9 +382,9 @@ impl LspCoordinator {
                     Some(LspKind::References) => {
                         let locs = lsp::protocol::parse_locations(&result);
                         if locs.is_empty() {
-                            *status = "no references".to_string();
+                            status.echo("no references");
                         } else {
-                            *status = format!("{} reference(s)", locs.len());
+                            status.echo(format!("{} reference(s)", locs.len()));
                             self.pending_refs = Some(locs);
                         }
                     }
@@ -362,9 +392,9 @@ impl LspCoordinator {
                     Some(LspKind::CodeAction) => {
                         let actions = lsp::protocol::parse_code_actions(&result);
                         if actions.is_empty() {
-                            *status = "no code actions".to_string();
+                            status.echo("no code actions");
                         } else {
-                            *status = format!("{} code action(s)", actions.len());
+                            status.echo(format!("{} code action(s)", actions.len()));
                             self.pending_actions = Some(actions);
                         }
                     }
@@ -382,7 +412,7 @@ impl LspCoordinator {
             }
         }
         // Apply completion responses now the `self.lsp` borrow is released (ingest_completion is `&mut self`).
-        let cur = ws.focused().view.cursor().min(snapshot.len());
+        let cur = ws.focused().view.cursor().0.min(snapshot.len());
         for (rid, req_rev, result) in completion_responses {
             self.ingest_completion(rid, req_rev, &result, cur, snapshot, revision);
         }
@@ -441,14 +471,17 @@ impl LspCoordinator {
     }
 
     /// Apply the deferred goto jump, format edits, and multi-file rename now render is done (opening a
-    /// buffer mutates `highlighters`, which the frame's `spans` borrow forbids during the poll).
+    /// buffer mutates `highlighters`, which the frame's `spans` borrow forbids during the poll). A goto
+    /// into the SAME file moves the cursor, and the edits to the focused buffer apply, through `rec`, which
+    /// the session records in the trace (#1134, RFC-0020 R6).
     pub(crate) fn apply_pending(
         &mut self,
         ws: &mut Workspace,
         files: &mut Files,
         highlighters: &mut Highlighters,
         snapshot: &[u8],
-        status: &mut String,
+        status: &mut Status,
+        rec: Record<'_>,
     ) {
         // Goto: same file → move the cursor; another file → open it, then move.
         if let Some((uri, l, c)) = self.goto_jump.take() {
@@ -458,24 +491,33 @@ impl LspCoordinator {
                 .get(&ws.focused_buffer())
                 .and_then(|bf| std::fs::canonicalize(&bf.path).ok());
             if cur_path.as_deref() == Some(target.as_path()) {
-                ws.place_focused_cursor(lsp::model::lsp_pos_to_byte(snapshot, l, c));
+                rec(
+                    ws,
+                    ExCmd::Place(BytePos(lsp::model::lsp_pos_to_byte(snapshot, l, c))),
+                );
             } else {
-                open_file_into_buffer(&target.display().to_string(), ws, files, highlighters);
-                let bytes = ws.focused().doc.bytes().to_vec();
-                ws.place_focused_cursor(lsp::model::lsp_pos_to_byte(&bytes, l, c));
+                let opened =
+                    open_file_into_buffer(&target.display().to_string(), ws, files, highlighters);
+                if opened.id.is_some() {
+                    let bytes = ws.focused().doc.bytes().to_vec();
+                    ws.place_focused_cursor(BytePos(lsp::model::lsp_pos_to_byte(&bytes, l, c)));
+                } else {
+                    status.give(opened.status);
+                }
             }
         }
         // Format edits: one Lsp-origin undo group.
         if !self.pending_edits.is_empty() {
-            ws.apply_edits(&self.pending_edits, TransactionOrigin::Lsp);
-            self.pending_edits.clear();
-            *status = "formatted".to_string();
+            apply_lsp_edits(ws, rec, std::mem::take(&mut self.pending_edits));
+            status.info("formatted");
         }
         // Rename across every affected file (the multi-file WorkspaceEdit apply, shared with code actions).
         if !self.pending_rename.is_empty() {
             let edit = std::mem::take(&mut self.pending_rename);
-            let (files_n, edits_n) = apply_workspace_edit(edit, ws, files, highlighters);
-            *status = format!("renamed: {edits_n} edit(s) across {files_n} file(s)");
+            let (files_n, edits_n) = apply_workspace_edit(edit, ws, files, highlighters, rec);
+            status.info(format!(
+                "renamed: {edits_n} edit(s) across {files_n} file(s)"
+            ));
         }
         // Server-initiated `workspace/applyEdit` (from an executeCommand): apply the TEXT edits as one
         // Lsp-origin transaction per file, then reply `{applied}` to the (blocked) server request. Trust:
@@ -483,13 +525,30 @@ impl LspCoordinator {
         for (key, id, edit) in std::mem::take(&mut self.pending_server_edits) {
             let applied = !edit.is_empty();
             if applied {
-                apply_workspace_edit(edit, ws, files, highlighters);
-                *status = "applied server edit".to_string();
+                apply_workspace_edit(edit, ws, files, highlighters, rec);
+                status.info("applied server edit");
             }
             if let Some(client) = self.lsp.get_mut(&key) {
                 client.respond(id, serde_json::json!({ "applied": applied }));
             }
         }
+    }
+
+    /// Whether [`LspCoordinator::apply_pending`] has an edit batch to apply (format edits, a rename, a
+    /// server's `workspace/applyEdit`): the session syncs the journal before it (RFC-0023 §4).
+    pub(crate) fn has_edit_batch(&self) -> bool {
+        !self.pending_edits.is_empty()
+            || !self.pending_rename.is_empty()
+            || self
+                .pending_server_edits
+                .iter()
+                .any(|(_, _, e)| !e.is_empty())
+    }
+
+    /// Queue format edits as a server's formatting response does, for a test without a server.
+    #[cfg(test)]
+    pub(crate) fn queue_format_edits(&mut self, edits: Vec<(BytePos, BytePos, String)>) {
+        self.pending_edits = edits;
     }
 
     /// The references locations resolved this frame (the loop opens its generic picker from these).
@@ -513,12 +572,15 @@ impl LspCoordinator {
         ws: &mut Workspace,
         files: &mut Files,
         highlighters: &mut Highlighters,
-        status: &mut String,
+        status: &mut Status,
+        rec: Record<'_>,
     ) {
         if !action.edit.is_empty() {
             let (files_n, edits_n) =
-                apply_workspace_edit(action.edit.clone(), ws, files, highlighters);
-            *status = format!("applied: {edits_n} edit(s) across {files_n} file(s)");
+                apply_workspace_edit(action.edit.clone(), ws, files, highlighters, rec);
+            status.info(format!(
+                "applied: {edits_n} edit(s) across {files_n} file(s)"
+            ));
         }
         if let Some((command, arguments)) = &action.command {
             if let Some((key_s, _uri)) = self.focused_server(ws, files) {
@@ -528,7 +590,7 @@ impl LspCoordinator {
                     serde_json::json!({ "command": command, "arguments": arguments }),
                     LspKind::ExecuteCommand,
                 );
-                *status = format!("running: {}", action.title);
+                status.echo(format!("running: {}", action.title));
             }
         }
     }
@@ -559,7 +621,8 @@ impl LspCoordinator {
         &mut self,
         key: KeyEvent,
         ws: &mut Workspace,
-        status: &mut String,
+        status: &mut Status,
+        rec: Record<'_>,
     ) -> bool {
         let Some(menu) = self.completion.as_mut() else {
             return false;
@@ -583,7 +646,7 @@ impl LspCoordinator {
             let item = menu.items[menu.selected].clone();
             let prefix_len = menu.prefix_len;
             self.close_completion();
-            let cursor = ws.focused().view.cursor();
+            let cursor = ws.focused().view.cursor().0;
             let start = cursor.saturating_sub(prefix_len);
             // A snippet item's `insert` is a snippet body → expand to plain text + the first-tabstop cursor;
             // a plain item inserts literally (cursor after it).
@@ -597,7 +660,7 @@ impl LspCoordinator {
             // CURRENT bytes and combined with the main insert into ONE Lsp-origin transaction. Cross-file
             // edits (uri != focused) are dropped this slice. The caret is shifted by imports landing before it.
             let bytes = ws.focused().doc.bytes().to_vec();
-            let mut edits = vec![(start, cursor, text)];
+            let mut edits = vec![(BytePos(start), BytePos(cursor), text)];
             let mut shift: isize = 0;
             for (uri, ledits) in &item.additional {
                 if !uri.is_empty() {
@@ -609,13 +672,13 @@ impl LspCoordinator {
                     if e <= start {
                         shift += t.len() as isize - (e as isize - s as isize);
                     }
-                    edits.push((s, e, t.clone()));
+                    edits.push((BytePos(s), BytePos(e), t.clone()));
                 }
             }
-            ws.apply_edits(&edits, TransactionOrigin::Lsp);
+            apply_lsp_edits(ws, rec, edits);
             let caret_pos = (start as isize + caret as isize + shift).max(0) as usize;
-            ws.place_focused_cursor(caret_pos);
-            *status = format!("completed: {}", item.label);
+            rec(ws, ExCmd::Place(BytePos(caret_pos)));
+            status.echo(format!("completed: {}", item.label));
             return true;
         }
         // Live-filter: a word char or backspace edits the buffer AND keeps the pum open — the edit falls
@@ -640,7 +703,7 @@ impl LspCoordinator {
         snapshot: &[u8],
         revision: Revision,
         emacs_profile: bool,
-        status: &mut String,
+        status: &mut Status,
     ) -> bool {
         if !(matches!(ws.focused().view.mode(), Mode::Insert) && !emacs_profile) {
             return false;
@@ -650,7 +713,7 @@ impl LspCoordinator {
             if is_ctrl(key, 'o') {
                 self.request_completion(ws, files, snapshot, revision);
                 if self.completion_req.is_some() {
-                    *status = "completing…".to_string();
+                    status.echo("completing…");
                 }
                 return true;
             }
@@ -674,12 +737,14 @@ impl LspCoordinator {
         files: &Files,
         snapshot: &[u8],
     ) -> bool {
-        if !(normal && (matches!(key.code, KeyCode::Char('K')) || is_ctrl(key, ']'))) {
+        // `K` only unmodified (SHIFT aside); `<C-]>` in either encoding (a legacy terminal sends `CTRL-5`).
+        let k = matches!(key.code, KeyCode::Char('K')) && !crate::input::is_chord(key);
+        if !(normal && (k || is_ctrl(key, ']'))) {
             return false;
         }
         if let Some((key_s, uri)) = self.focused_server(ws, files) {
-            let (line, ch) = lsp::model::byte_to_lsp_pos(snapshot, ws.focused().view.cursor());
-            let hover = matches!(key.code, KeyCode::Char('K'));
+            let (line, ch) = lsp::model::byte_to_lsp_pos(snapshot, ws.focused().view.cursor().0);
+            let hover = k;
             let method = if hover {
                 "textDocument/hover"
             } else {
@@ -704,7 +769,7 @@ impl LspCoordinator {
         ws: &Workspace,
         files: &Files,
         snapshot: &[u8],
-        status: &mut String,
+        status: &mut Status,
     ) -> bool {
         if !matches!(
             ex,
@@ -713,12 +778,14 @@ impl LspCoordinator {
             return false;
         }
         let Some((key_s, uri)) = self.focused_server(ws, files) else {
-            *status = if self.trusted {
-                "no language server for this buffer"
-            } else {
-                UNTRUSTED_NOTICE
-            }
-            .to_string();
+            status.warn(
+                if self.trusted {
+                    "no language server for this buffer"
+                } else {
+                    UNTRUSTED_NOTICE
+                }
+                .to_string(),
+            );
             return true;
         };
         match ex {
@@ -729,30 +796,32 @@ impl LspCoordinator {
                     lsp::protocol::formatting_params(&uri, 4, true),
                     LspKind::Format,
                 );
-                *status = "formatting…".to_string();
+                status.echo("formatting…");
             }
             Ex::Rename(new_name) => {
-                let (line, ch) = lsp::model::byte_to_lsp_pos(snapshot, ws.focused().view.cursor());
+                let (line, ch) =
+                    lsp::model::byte_to_lsp_pos(snapshot, ws.focused().view.cursor().0);
                 self.send(
                     key_s,
                     "textDocument/rename",
                     lsp::protocol::rename_params(&uri, line, ch, new_name),
                     LspKind::Rename,
                 );
-                *status = format!("renaming → {new_name}…");
+                status.echo(format!("renaming → {new_name}…"));
             }
             Ex::References => {
-                let (line, ch) = lsp::model::byte_to_lsp_pos(snapshot, ws.focused().view.cursor());
+                let (line, ch) =
+                    lsp::model::byte_to_lsp_pos(snapshot, ws.focused().view.cursor().0);
                 self.send(
                     key_s,
                     "textDocument/references",
                     lsp::protocol::references_params(&uri, line, ch, true),
                     LspKind::References,
                 );
-                *status = "finding references…".to_string();
+                status.echo("finding references…");
             }
             Ex::CodeAction => {
-                let cursor = ws.focused().view.cursor();
+                let cursor = ws.focused().view.cursor().0;
                 let (line, ch) = lsp::model::byte_to_lsp_pos(snapshot, cursor);
                 // Reconstruct the LSP diagnostics overlapping the cursor so the server offers their
                 // quickfixes (alongside cursor-position assists/refactors).
@@ -780,7 +849,7 @@ impl LspCoordinator {
                     lsp::protocol::code_action_params(&uri, line, ch, Value::Array(ctx)),
                     LspKind::CodeAction,
                 );
-                *status = "finding code actions…".to_string();
+                status.echo("finding code actions…");
             }
             _ => unreachable!("guarded by the matches! above"),
         }
@@ -818,12 +887,15 @@ impl LspCoordinator {
 /// `(files, edits)` applied. Each file is focused in turn (reuse an open buffer, else open it), its edits
 /// are mapped to byte offsets against ITS OWN bytes, and applied as one `Lsp`-origin undo group; then the
 /// original buffer is refocused. Opened files are modified buffers the user saves. Shared by rename and
-/// code-action apply. Must run AFTER render (opening a buffer mutates `highlighters`).
+/// code-action apply. Must run AFTER render (opening a buffer mutates `highlighters`). The edits to the
+/// buffer that was focused go through `rec` (the trace, RFC-0020 R6); a trace follows one document, so the
+/// edits to other files are applied without a record, as a cursor placed there is.
 fn apply_workspace_edit(
     edit: Vec<(String, Vec<lsp::protocol::LspTextEdit>)>,
     ws: &mut Workspace,
     files: &mut Files,
     highlighters: &mut Highlighters,
+    rec: Record<'_>,
 ) -> (usize, usize) {
     if edit.is_empty() {
         return (0, 0);
@@ -833,31 +905,30 @@ fn apply_workspace_edit(
     for (uri, ledits) in edit {
         let path = lsp::uri_to_path(&uri);
         let target = std::fs::canonicalize(&path).unwrap_or(path);
-        let existing = files.iter().find_map(|(id, bf)| {
-            (std::fs::canonicalize(&bf.path).ok().as_deref() == Some(target.as_path()))
-                .then_some(*id)
-        });
-        match existing {
-            Some(id) => {
-                ws.focus_buffer(id);
-            }
-            None => {
-                open_file_into_buffer(&target.display().to_string(), ws, files, highlighters);
-            }
+        // The open helper reuses a buffer already holding the file (#848). A file it could not open
+        // (read error, or a recovery journal the user kept) is skipped rather than having its edits
+        // land in whatever buffer happens to be focused.
+        let opened = open_file_into_buffer(&target.display().to_string(), ws, files, highlighters);
+        if opened.id.is_none() {
+            continue;
         }
         let bytes = ws.focused().doc.bytes().to_vec();
-        let byte_edits: Vec<(usize, usize, String)> = ledits
+        let byte_edits: Vec<(BytePos, BytePos, String)> = ledits
             .into_iter()
             .map(|((sl, sc), (el, ec), text)| {
                 (
-                    lsp::model::lsp_pos_to_byte(&bytes, sl, sc),
-                    lsp::model::lsp_pos_to_byte(&bytes, el, ec),
+                    BytePos(lsp::model::lsp_pos_to_byte(&bytes, sl, sc)),
+                    BytePos(lsp::model::lsp_pos_to_byte(&bytes, el, ec)),
                     text,
                 )
             })
             .collect();
         edits_n += byte_edits.len();
-        ws.apply_edits(&byte_edits, TransactionOrigin::Lsp);
+        if ws.focused_buffer() == orig {
+            apply_lsp_edits(ws, rec, byte_edits);
+        } else {
+            ws.apply_edits(&byte_edits, TransactionOrigin::Lsp);
+        }
         files_n += 1;
     }
     ws.focus_buffer(orig);
@@ -990,13 +1061,17 @@ mod tests {
             crate::app::dispatch::BufferFile {
                 path: PathBuf::from("/nonexistent-ruse-trust/src/main.rs"),
                 fmt: Default::default(),
+                read_only: false,
+                reloads: 0,
+                large: false,
+                swapfile: true,
             },
         );
         let bytes = ws.focused().doc.bytes().to_vec();
         let rev = ws.focused().doc.revision();
         let mut c = LspCoordinator::new(PathBuf::from("/nonexistent-ruse-trust"), false);
 
-        let mut status = String::new();
+        let mut status = Status::default();
         c.sync_and_poll(&ws, &files, rev, &bytes, &mut status);
         assert!(
             c.lsp.is_empty() && c.lsp_tried.is_empty(),
@@ -1006,18 +1081,19 @@ mod tests {
         assert!(status.contains("untrusted"), "status explains: {status}");
 
         // The notice is shown once, not re-asserted every frame over other status messages.
-        let mut status = "other".to_string();
+        let mut status = Status::default();
+        status.echo("other");
         c.sync_and_poll(&ws, &files, rev, &bytes, &mut status);
         assert_eq!(status, "other");
         assert!(c.lsp_tried.is_empty());
 
         // An LSP command in an untrusted workspace says why it cannot run.
-        let mut status = String::new();
+        let mut status = Status::default();
         assert!(c.on_ex(&Ex::Format, &ws, &files, &bytes, &mut status));
         assert!(status.contains("untrusted"), "{status}");
 
         // `:trust` grants trust for the session (a second `:trust` is a no-op).
-        let mut status = String::new();
+        let mut status = Status::default();
         c.grant_trust(&mut status);
         assert!(c.trusted && status.contains("trusted"), "{status}");
         c.grant_trust(&mut status);

@@ -7,7 +7,7 @@
 //! which is D-042's stated trigger for incremental parsing.
 
 use crossterm::style::Color;
-use ruse_core::{Regex, RegexOptions, Revision};
+use ruse_core::{DocumentId, Regex, RegexOptions, Revision};
 
 use crate::screen::CellStyle;
 use streaming_iterator::StreamingIterator;
@@ -142,8 +142,16 @@ impl Highlight {
     pub fn for_ext(ext: &str) -> Option<Highlight> {
         let (language, query_src) = grammar_for(ext)?;
         let mut parser = Parser::new();
-        parser.set_language(&language).ok()?;
-        let query = Query::new(&language, query_src).ok()?;
+        // A grammar or query that ships with ruse and does not load drops the file to no highlighting
+        // (stability §7); say so in the log (#966).
+        if parser.set_language(&language).is_err() {
+            crate::log::degrade("syntax", "grammar_load_failed", ext);
+            return None;
+        }
+        let Ok(query) = Query::new(&language, query_src) else {
+            crate::log::degrade("syntax", "query_load_failed", ext);
+            return None;
+        };
         // An injections query is optional: a grammar without one (or with a query that fails to compile)
         // simply never injects — the outer highlighting still applies.
         let injections = injections_for(ext).and_then(|src| Query::new(&language, src).ok());
@@ -355,6 +363,19 @@ impl CachedHighlight {
         self.tree.as_ref()
     }
 
+    /// The cached tree lined up with `src`: when the buffer moved on since the last parse (an edit earlier in
+    /// the same frame), a copy edited by the difference, so its nodes sit at `src`'s offsets (the text that
+    /// changed is not reparsed). For the Python indenter's string and comment lookups (#1205).
+    pub fn tree_matching(&self, src: &[u8]) -> Option<Tree> {
+        let mut tree = self.tree.clone()?;
+        if self.src != src {
+            if let Some(edit) = input_edit(&self.src, src) {
+                tree.edit(&edit);
+            }
+        }
+        Some(tree)
+    }
+
     pub fn spans(&mut self, rev: Revision, src: &[u8], visible: std::ops::Range<usize>) -> &[Span] {
         self.recompute(rev, src, visible);
         &self.spans
@@ -403,7 +424,12 @@ impl CachedHighlight {
                     tree.edit(&edit);
                 }
             }
+            let had_tree = self.tree.is_some() || self.rev.is_none();
             self.tree = self.hl.parser.parse(src, self.tree.as_ref());
+            // No tree means no highlighting until a parse succeeds again: logged when it starts.
+            if self.tree.is_none() && had_tree {
+                crate::log::degrade("syntax", "parse_failed", "");
+            }
             self.src.clear();
             self.src.extend_from_slice(src);
             self.rev = Some(rev);
@@ -466,8 +492,8 @@ fn input_edit(old: &[u8], new: &[u8]) -> Option<InputEdit> {
 /// line math (tree-sitter columns are byte offsets within the line).
 fn point_at(src: &[u8], byte: usize) -> Point {
     Point {
-        row: ruse_core::pos::line_of(src, byte),
-        column: byte.min(src.len()) - ruse_core::pos::line_start(src, byte),
+        row: ruse_core::pos::line_of(src, ruse_core::BytePos(byte)),
+        column: byte.min(src.len()) - ruse_core::pos::line_start(src, ruse_core::BytePos(byte)).0,
     }
 }
 
@@ -475,19 +501,32 @@ fn point_at(src: &[u8], byte: usize) -> Point {
 /// [`CachedHighlight`]: keyed on `(revision, viewport, pattern)`, so an unchanged frame — cursor motion,
 /// a mode switch — does no work, and a scroll or a new revision recomputes only the VISIBLE byte range
 /// rather than re-running a full-buffer regex every frame. The Vim regex is compiled only when the
-/// pattern changes (incsearch re-types the pattern each keystroke; hlsearch holds it fixed).
+/// pattern changes (incsearch re-types the pattern each keystroke; hlsearch holds it fixed). The key
+/// includes the buffer: revisions count per document, so two buffers share revision numbers (#687).
 #[derive(Default)]
 pub struct CachedSearch {
-    key: Option<(Revision, std::ops::Range<usize>, String)>,
+    key: Option<(DocumentId, Revision, std::ops::Range<usize>, String)>,
     compiled: Option<(String, Regex)>,
     spans: Vec<(usize, usize)>,
 }
 
 impl CachedSearch {
-    /// Match spans of `pattern` within the `visible` byte range of `bytes` at `rev`. Empty on an
-    /// unmatchable pattern (highlighting is best-effort). Spans are in absolute buffer byte offsets.
+    /// [`CachedSearch::spans_in`] for a single-buffer caller (benches, tests).
     pub fn spans(
         &mut self,
+        rev: Revision,
+        bytes: &[u8],
+        visible: std::ops::Range<usize>,
+        pattern: &str,
+    ) -> &[(usize, usize)] {
+        self.spans_in(DocumentId(0), rev, bytes, visible, pattern)
+    }
+
+    /// Match spans of `pattern` within the `visible` byte range of buffer `doc`'s `bytes` at `rev`. Empty
+    /// on an unmatchable pattern (highlighting is best-effort). Spans are in absolute buffer byte offsets.
+    pub fn spans_in(
+        &mut self,
+        doc: DocumentId,
         rev: Revision,
         bytes: &[u8],
         visible: std::ops::Range<usize>,
@@ -496,7 +535,7 @@ impl CachedSearch {
         if self
             .key
             .as_ref()
-            .is_some_and(|(r, v, p)| *r == rev && *v == visible && p == pattern)
+            .is_some_and(|(d, r, v, p)| *d == doc && *r == rev && *v == visible && p == pattern)
         {
             return &self.spans;
         }
@@ -511,13 +550,15 @@ impl CachedSearch {
         if let Some((_, re)) = &self.compiled {
             // The viewport range is line-aligned (see `nth_line_start`), so a match on any visible line
             // is fully inside it — searching the slice and offsetting is complete for what render paints.
-            if let Ok(hay) = std::str::from_utf8(&bytes[vis.clone()]) {
-                for m in re.find_all(hay) {
-                    self.spans.push((vis.start + m.start, vis.start + m.end));
-                }
+            // A byte that is not UTF-8 is one char to the pattern (#1243).
+            let hay = ruse_core::pattern::Hay::new(&bytes[vis.clone()]);
+            for m in re.find_all(hay.as_str()) {
+                let m = hay.to_buf_match(m);
+                self.spans
+                    .push((vis.start + m.start.0, vis.start + m.end.0));
             }
         }
-        self.key = Some((rev, visible, pattern.to_string()));
+        self.key = Some((doc, rev, visible, pattern.to_string()));
         &self.spans
     }
 }
@@ -887,7 +928,8 @@ fn inline_decorations(
             // `![alt](url)`: hide the raw markup on the source line and reserve a placeholder BLOCK below
             // it (F-031 slice 3a). Real pixels replace the block on a graphics-capable terminal (3b).
             "image" => {
-                let after_line = ruse_core::pos::line_of(src, base + node.start_byte());
+                let after_line =
+                    ruse_core::pos::line_of(src, ruse_core::BytePos(base + node.start_byte()));
                 // The alt text (`image_description`) labels the placeholder; the destination
                 // (`link_destination`) is the file the render loop reads for real pixels.
                 let child_range = |kind: &str| -> Option<(usize, usize)> {

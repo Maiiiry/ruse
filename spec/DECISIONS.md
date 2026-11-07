@@ -251,7 +251,23 @@ related:
   magic levels `\v \V \m \M`. `'gdefault'` handled at the substitute-command layer; capability-first engine
   router; ReDoS step-budget → typed `BudgetExceeded` + scheduler cancellation. Full design:
   [vim-regex.md](../docs/design/vim-regex.md). Resolves V-8.
-- **Open (details):** OQ-1..6 in the doc (perf tuning, untrusted-pattern policy).
+- **Open (details):** none since the 2026-11-03 amendment; OQ-1..6 are answered in the doc.
+- **Amended 2026-11-03 (#996) — state as built; the decision itself is unchanged.** The Vim front-end is a port
+  of nvim's `regexp.c` reader (#692, PR #1050) that lowers straight to Rust `regex` syntax; the IR and router are
+  not built. The wrapped `regex` engine is the only engine, and the shapes it is trusted to match like nvim are
+  the ones the differential oracle certifies (`tools/parity/pattern_oracle.py` → `crates/core/tests/pattern_oracle*`:
+  553 rows at `87d7ca4`, 522 agree, 27 rejected as unsupported, 4 known divergences; per-class table in
+  vim-regex.md §Current state). That table is the §7 fast-path allow-list, grown by tests instead of starting
+  empty. Unsupported atoms (lookaround, backrefs, position atoms, `\&`, `~`, `\Z`, `[=a=]`) are rejected with
+  `RegexError::Unsupported`, never faked. The one knowing approximation is `\<`/`\>` lowered to Rust word
+  boundaries; interim fix (#745): at the pattern edges, drop them from the Rust pattern, post-check the match
+  boundary with Vim's `utf_class` rule and retry from the next position; mid-pattern stays `known` until the
+  owned engine. The owned Vim engine remains the plan for the residual (lookaround, backrefs, position atoms,
+  mid-pattern `\<`/`\>`, `\&`, `~`), scheduled later (#1128). Answers: OQ-1 the allow-list is the oracle class table;
+  OQ-2 budgets tie to the CTRL-C checkpoint (`crates/core/src/interrupt.rs`, #1122) plus a step budget for the
+  future backtracker, numbers set by bench; OQ-3 `MatchCtx` is needed only by the owned engine; OQ-4 the ripgrep
+  bridge translates from the IR independently; OQ-5 `\=` defers to D-025; OQ-6 no new invariant
+  (INV-FAIL-BOUNDED + INV-SCHED-1).
 - **Re-evaluate:** as F-009 Vim search reaches L2.
 - Refs: [vim-regex.md](../docs/design/vim-regex.md), vim.md VIM-SEARCH-1, DEP-REGEX, F-009.
 
@@ -341,7 +357,7 @@ related:
   shared key invited invalid cross-axis conclusions by humans and LLMs — costlier now that the project is
   multi-contributor.
 - **Re-evaluate if:** a rename of `product_layer`/`allowed_layers` proves worth the churn.
-- Refs: RFC-0011, [../docs/rfc/proposed/RFC-0011-layer-axis-terminology.md](../docs/rfc/proposed/RFC-0011-layer-axis-terminology.md), ENG-DOC-001.
+- Refs: RFC-0011, [../docs/rfc/accepted/RFC-0011-layer-axis-terminology.md](../docs/rfc/accepted/RFC-0011-layer-axis-terminology.md), ENG-DOC-001.
 
 ## D-037 — Delivery phases as a spec-owned axis synced to GitHub · decided
 - **Decision:** A repo's delivery milestones live in `phases.yaml` — an ordered phase ladder that REFINES the
@@ -389,7 +405,7 @@ related:
   protocols) which is normal to fix later.
 - **Re-evaluate if:** a re-boundary trigger fires (RFC-0012 §Re-evaluation) — then that boundary returns as
   its own RFC + crate.
-- Refs: [../docs/rfc/proposed/RFC-0012-collapse-to-two-crate-editor.md](../docs/rfc/proposed/RFC-0012-collapse-to-two-crate-editor.md), RA-RUSE-003, RA-RUSE-004, D-004, D-011, D-014.
+- Refs: [../docs/rfc/accepted/RFC-0012-collapse-to-two-crate-editor.md](../docs/rfc/accepted/RFC-0012-collapse-to-two-crate-editor.md), RA-RUSE-003, RA-RUSE-004, D-004, D-011, D-014.
 
 ## D-040 — v0 stability/observability scope: assert-vs-error + panic-recovery + tracing; supervisor/health deferred · decided
 - **Decision:** For the two-crate v0 editor ([D-039]), the [stability-and-observability](../docs/design/stability-and-observability.md)
@@ -628,7 +644,7 @@ related:
 - **Re-evaluate if:** a profile needs a multi-key RHS whose intermediate keys must themselves re-enter
   resolution (not just be queued literally), or the per-context iminsert/imsearch model proves that one
   global boolean is observably wrong — either would extend the stage, not overturn the pre-dispatch shape.
-- Refs: [../docs/rfc/proposed/RFC-0013-lang-arg-translation-stage.md](../docs/rfc/proposed/RFC-0013-lang-arg-translation-stage.md), D-045, D-046, [parity/concepts/irreconcilable.yaml](parity/concepts/irreconcilable.yaml), [parity/contracts/keymap-layers.yaml](parity/contracts/keymap-layers.yaml), INV-FAIL-BOUNDED, C-INPUT, F-027, nvim.mapmode.lang.
+- Refs: [../docs/rfc/accepted/RFC-0013-lang-arg-translation-stage.md](../docs/rfc/accepted/RFC-0013-lang-arg-translation-stage.md), D-045, D-046, [parity/concepts/irreconcilable.yaml](parity/concepts/irreconcilable.yaml), [parity/contracts/keymap-layers.yaml](parity/contracts/keymap-layers.yaml), INV-FAIL-BOUNDED, C-INPUT, F-027, nvim.mapmode.lang.
 
 ## D-049 — The Emacs profile: prefix-arg is profile-scoped, mark-ring is a C-POSHIST container · decided
 - **Decision:** Emacs Style (F-012) is a CONFIGURATION of decided machinery, not a second engine (accepting
@@ -654,7 +670,7 @@ related:
 - **Re-evaluate if:** a real command needs a prefix argument that is neither the Vim multiplier nor an
   opaque Emacs value (a third interpretation the channel cannot carry); or a position-history surface needs
   a container beyond {NamedMap, Ring, CursoredList}.
-- Refs: [../docs/rfc/proposed/RFC-0014-emacs-input-profile.md](../docs/rfc/proposed/RFC-0014-emacs-input-profile.md), D-045, D-026, D-027, D-047, RFC-0004, [parity/concepts/irreconcilable.yaml](parity/concepts/irreconcilable.yaml), INV-CMD-SEMANTIC, INV-PROFILE-ISOLATION, F-012, C-COMMAND, C-POSHIST.
+- Refs: [../docs/rfc/accepted/RFC-0014-emacs-input-profile.md](../docs/rfc/accepted/RFC-0014-emacs-input-profile.md), D-045, D-026, D-027, D-047, RFC-0004, [parity/concepts/irreconcilable.yaml](parity/concepts/irreconcilable.yaml), INV-CMD-SEMANTIC, INV-PROFILE-ISOLATION, F-012, C-COMMAND, C-POSHIST.
 
 ## D-050 — Caret gravity: the Emacs profile's caret is between-character, not Vim's on-character · decided
 - **Decision:** A caret's rest-relative-to-text is a View-local **`CaretGravity{OnChar, BetweenChar}`**
@@ -675,7 +691,7 @@ related:
 - **Re-evaluate if:** a profile needs a THIRD caret model (e.g. a full `virtualedit=all` free caret past
   line end); or gravity must vary WITHIN a profile by mode in a way `Mode` + `CaretGravity` cannot jointly
   express.
-- Refs: [../docs/rfc/proposed/RFC-0015-emacs-caret-gravity.md](../docs/rfc/proposed/RFC-0015-emacs-caret-gravity.md), [../docs/design/emacs-cursor-and-mark-fidelity.md](../docs/design/emacs-cursor-and-mark-fidelity.md), D-049, D-003, RFC-0004, RFC-0014, INV-DOC-VIEW, INV-PROFILE-ISOLATION, F-012.
+- Refs: [../docs/rfc/accepted/RFC-0015-emacs-caret-gravity.md](../docs/rfc/accepted/RFC-0015-emacs-caret-gravity.md), [../docs/design/emacs-cursor-and-mark-fidelity.md](../docs/design/emacs-cursor-and-mark-fidelity.md), D-049, D-003, RFC-0004, RFC-0014, INV-DOC-VIEW, INV-PROFILE-ISOLATION, F-012.
 
 ## D-051 — An Emacs operation that diverges from its Vim counterpart is a distinct Command, not a profile-gated shared one · decided
 - **Decision:** When an Emacs-profile command differs from the Vim command it superficially resembles in
@@ -698,7 +714,7 @@ related:
 - **Re-evaluate if:** the count of Emacs-only command variants grows large enough that a profile signal +
   shared-planner gating would materially cut duplication (a scaling threshold, not a correctness one); then
   introduce the signal and collapse the variants, superseding this.
-- Refs: [../docs/rfc/proposed/RFC-0016-emacs-command-divergence.md](../docs/rfc/proposed/RFC-0016-emacs-command-divergence.md), [../docs/design/emacs-cursor-and-mark-fidelity.md](../docs/design/emacs-cursor-and-mark-fidelity.md), D-047, D-049, D-050, D-026, D-027, INV-CMD-SEMANTIC, F-012.
+- Refs: [../docs/rfc/accepted/RFC-0016-emacs-command-divergence.md](../docs/rfc/accepted/RFC-0016-emacs-command-divergence.md), [../docs/design/emacs-cursor-and-mark-fidelity.md](../docs/design/emacs-cursor-and-mark-fidelity.md), D-047, D-049, D-050, D-026, D-027, INV-CMD-SEMANTIC, F-012.
 
 ## D-052 — Conceal is presentation-only with reveal-at-point; default off, auto-markers for prose · decided
 - **Decision:** In rich in-buffer rendering (F-031), **conceal hides a buffer range from layout but never
@@ -745,7 +761,7 @@ related:
   placeholder).
 - **Re-evaluate if:** a fourth protocol appears, or the GUI backend (F-018) makes native raster the primary
   path and the terminal ladder becomes one lowering among several.
-- Refs: [../docs/design/rich-rendering.md](../docs/design/rich-rendering.md), [../docs/rfc/proposed/RFC-0005-terminal-capability.md](../docs/rfc/proposed/RFC-0005-terminal-capability.md), [../docs/rfc/proposed/RFC-0009-render-model.md](../docs/rfc/proposed/RFC-0009-render-model.md), D-015, INV-CAP-DEGRADE, INV-RENDER-PROFILE, F-031, F-010, CAP-GRAPHICS.
+- Refs: [../docs/design/rich-rendering.md](../docs/design/rich-rendering.md), [../docs/rfc/accepted/RFC-0005-terminal-capability.md](../docs/rfc/accepted/RFC-0005-terminal-capability.md), [../docs/rfc/accepted/RFC-0009-render-model.md](../docs/rfc/accepted/RFC-0009-render-model.md), D-015, INV-CAP-DEGRADE, INV-RENDER-PROFILE, F-031, F-010, CAP-GRAPHICS.
 
 ## D-054 — A second render tier reactivates only the TUI-local layout pass, not the full render IR · decided
 - **Decision:** Rich in-buffer rendering (F-031) is a second render **tier within the one TUI**, not a second
@@ -766,7 +782,7 @@ related:
 - **Re-evaluate if:** the GUI backend (F-018) lands — then §§1–7 reactivate in full and the layout pass is
   re-expressed as the TUI lowering of the shared Render Tree; superseding this requires superseding it together
   with the RFC-0009 deferral, never editing the addendum alone.
-- Refs: [../docs/rfc/proposed/RFC-0009-render-model.md](../docs/rfc/proposed/RFC-0009-render-model.md), [../docs/rfc/proposed/RFC-0012-collapse-to-two-crate-editor.md](../docs/rfc/proposed/RFC-0012-collapse-to-two-crate-editor.md), [../docs/design/rich-rendering.md](../docs/design/rich-rendering.md), D-014, D-052, D-053, INV-RENDER-IR, INV-DOC-VIEW, F-031, F-018, CAP-DECORATION.
+- Refs: [../docs/rfc/accepted/RFC-0009-render-model.md](../docs/rfc/accepted/RFC-0009-render-model.md), [../docs/rfc/accepted/RFC-0012-collapse-to-two-crate-editor.md](../docs/rfc/accepted/RFC-0012-collapse-to-two-crate-editor.md), [../docs/design/rich-rendering.md](../docs/design/rich-rendering.md), D-014, D-052, D-053, INV-RENDER-IR, INV-DOC-VIEW, F-031, F-018, CAP-DECORATION.
 
 ## D-055 — Vim macros record RAW KEYSTROKES into the shared a-z registers, replayed by re-feeding the input engine · decided
 - **Decision:** Macro recording (`q{a-z}` … `q`) captures the literal `KeyEvent` stream and stores it as **raw
@@ -791,7 +807,7 @@ related:
   the raw-key byte encoding as a stable on-disk contract — promoting this from architecture to a persistent
   format/contract decision); or if a non-keystroke frontend (GUI, F-018) needs to record macros without a
   `KeyEvent` stream, at which point the recording unit is re-examined at the command/intent layer.
-- Refs: [../docs/design/macros.md](../docs/design/macros.md), [../docs/rfc/proposed/RFC-0004-input-profiles.md](../docs/rfc/proposed/RFC-0004-input-profiles.md), D-025, D-026, F-003, F-029, CAP-VIM-PROFILE.
+- Refs: [../docs/design/macros.md](../docs/design/macros.md), [../docs/rfc/accepted/RFC-0004-input-profiles.md](../docs/rfc/accepted/RFC-0004-input-profiles.md), D-025, D-026, F-003, F-029, CAP-VIM-PROFILE.
 
 ## D-056 — ruse ships better-than-Vim interactive defaults at the frontend/Workspace layer; the engine keeps the Vim factory default · decided
 - **Decision:** Where a Vim default persists only for backwards-compatibility that ruse has no legacy of
@@ -815,7 +831,7 @@ related:
   reads, and this becomes "the profile layer sets them" rather than a hardcoded frontend call); or if a
   divergence is proposed whose vanilla rationale still applies (muscle-memory / current script compat), in
   which case it does NOT qualify under this decision and stays at the Vim default.
-- Refs: [../docs/rfc/proposed/RFC-0017-better-than-vanilla-defaults.md](../docs/rfc/proposed/RFC-0017-better-than-vanilla-defaults.md), D-043, D-049, F-009, C-CONFIG.
+- Refs: [../docs/rfc/accepted/RFC-0017-better-than-vanilla-defaults.md](../docs/rfc/accepted/RFC-0017-better-than-vanilla-defaults.md), D-043, D-049, F-009, C-CONFIG.
 
 ## D-057 — Editor-global state is owned by the Workspace, not the per-View EditorState; buffers gain disposition + kind · decided (design)
 - **Decision:** The buffer ARENA already exists (F-007, `crates/core/src/workspace.rs`: a `Workspace`
@@ -848,16 +864,29 @@ related:
   Putting the state on a `Document` (violates INV-DOC-VIEW) or in a process-global singleton (violates
   INV-NO-GLOBAL-STATE + the D-002 single-executor) are the two wrong shapes; the `Workspace` is the single
   legitimate owner, and "editor-global" here means workspace-SCOPED, which INV-NO-GLOBAL-STATE permits.
-- **Open (design):** lowercase-marks→anchors timing; exactly which registers are global vs. buffer-local
-  (proposal: all global, D-026); `q:` re-entry via the `:normal`/`:g` executor; per-View vs. single
-  jumplist; whether to pull generational handles (INV-HANDLE) forward; the file picker's read boundary
-  (buffers vs. CAP-FS/SEARCH). Resolved at review before slice 2 (the ownership move) lands. Details in the
-  RFC/design Open questions.
+- **Open (design):** none since the 2026-11-03 amendment below. Proposed as: lowercase-marks→anchors timing;
+  exactly which registers are global vs. buffer-local; `q:` re-entry; per-View vs. single jumplist;
+  generational handles (INV-HANDLE); the file picker's read boundary.
+- **Amended 2026-11-03 (#508, RFC-0018 accepted).** The maintainer follows this design as written.
+  *Shipped:* registers on the Workspace, lent by `Workspace::lend`/`reclaim` with `from_parts`/`into_parts`
+  unchanged, and `"#` (#1114); a buffer whose last window closes stays loaded and hidden (#1044); uppercase
+  marks, kept with their own buffer (#1103); marks, special marks, the jumplist and the change list carried
+  through edits as line anchors by nvim's `mark_adjust` rule (#1124). *Remaining:* cross-buffer global marks
+  (F-032); lowercase marks per buffer rather than per View (#636); jumplist entries `(DocumentId, Anchor)`;
+  `Disposition`/`BufferKind`; the retirement Effect; editable `q:`; other-buffers completion.
+  *Answers:* (1) lowercase marks are anchors (done, #1124); (2) registers are workspace-global (done, #1114);
+  (3) `q:` runs its line through the `:normal`/`:g` driven executor (the session key path, #1096), refusing a
+  nested command-line window with nvim's E1292 and keeping `:normal`'s E192 depth limit; (4) the jumplist is
+  per View with `(DocumentId, Anchor)` entries, as in Vim and Helix; (5) generational handles are a separate
+  issue, #973; (6) the buffer picker is in scope, the file picker is a later consumer of CAP-FS/CAP-SEARCH.
+  *Added rule:* when a named buffer is retired, its global marks and cross-buffer jumplist entries degrade to
+  `(path, line, col)` (Vim's file mark with a file name) instead of being pruned, and re-attach as anchors
+  when that path is opened again; entries into an unnamed buffer are dropped.
 - **Re-evaluate if:** a second client is enabled (D-012) — some registers/marks may need a client-scope
   split; or session persistence (mksession/shada) lands — the global store gains a serialized on-disk form,
   promoting the register/mark byte encoding to a persistent-format CONTRACT decision (as D-055 notes for
   macros), superseding the "internal only" stance here.
-- Refs: [../docs/rfc/proposed/RFC-0018-multi-buffer-arena.md](../docs/rfc/proposed/RFC-0018-multi-buffer-arena.md),
+- Refs: [../docs/rfc/accepted/RFC-0018-multi-buffer-arena.md](../docs/rfc/accepted/RFC-0018-multi-buffer-arena.md),
   [../docs/design/buffer-arena-and-global-state.md](../docs/design/buffer-arena-and-global-state.md),
   [../docs/design/view-window-workspace.md](../docs/design/view-window-workspace.md),
   D-003, D-023, D-026, D-027, D-039, D-055, INV-DOC-VIEW, INV-NO-GLOBAL-STATE, INV-ANCHOR, INV-HANDLE,
@@ -896,3 +925,117 @@ related:
   with `ecosystem` and `ide-grade` is the v0.3.0 step toward it.
 - **Re-evaluate if:** a release needs features from more than one phase, or phases and tagged releases diverge.
 - Refs: D-037, `spec/phases.yaml`, `tools/phase_sync.py`, [../docs/parity/roadmap.md](../docs/parity/roadmap.md).
+
+## D-060 — Intermediate release milestones between phases · decided
+- **Decision:** GitHub may carry version milestones between phase milestones (for example `v0.1.1` to `v0.1.9`
+  before `v0.2.0`) to keep each release a plannable size. They have no `ruse-phase` marker, so `ruse phase sync`
+  neither owns nor reports them. They hold issues only; features still belong to phases in `spec/phases.yaml`,
+  and each phase milestone stays the release that completes its phase. This amends the one-milestone-per-phase
+  mirror of D-037 and D-059.
+- **Reason:** the audits left 231 open issues on v0.2.0, too many to plan or finish as one release. Adding phases
+  does not fit, because a phase must own PRD features and most of these issues are bugs and tests.
+- **Re-evaluate if:** intermediate milestones need gating, or tagged releases stop following them.
+- Refs: D-037, D-059, `spec/phases.yaml`, `tools/phase_sync.py`.
+
+## D-061 — Ex edits are recorded in the trace as resolved semantic commands · decided (design)
+- **Decision:** Every Ex edit is recorded in the command trace as resolved commands (command-engine.md §7.3).
+  Pure edits (`:s` and its repeats `&`/`g&`/`:&`, `:d`, `:m`, `:t`, `:sort`, `:j`, `:>`/`:<`, `:retab`, `:pu`)
+  record as one `Command::Ex(ExCmd)` with RESOLVED 1-based line numbers and the literal pattern, replacement and
+  effective flags used, never the address text or "the last pattern"; `:s///c` records the user's answers.
+  IO-dependent edits record the bytes the frontend obtained as data (`ReadText { after_line, bytes }` for `:r
+  file`/`:r !cmd`, `FilterReplace { range, bytes }` for `:{range}!cmd`), so the core stays IO-free (D-039) and
+  replay never reads a file or spawns a process. `:g/pat/normal` and `:normal` record as a `Begin`/`End` group
+  of their resolved children (the Commands its keys produced plus its per-line cursor placement), and replay
+  opens one undo block per group as the live command does; `:g` with a core payload (`d`, `s`) records as one
+  command holding the lines it marked, because live it runs as one transaction, not as children (#1105). Non-edit Ex (`:w`, `:e`, `:cd`, …) is not
+  recorded, except `:set` of an option the core reads while editing (for example `ts`, `sw`, `et`, `tw`, `ic`,
+  `scs`); those options' values are also written at the start of the trace. The format stays `v1` with
+  additive verbs; older traces parse and replay unchanged. Full design:
+  [RFC-0020](../docs/rfc/accepted/RFC-0020-ex-edits-in-the-trace.md).
+  **Amended (#1134, RFC-0020 R6):** the rule is general. Any core state the session writes outside `run_cmd`
+  that a later command reads is recorded as an `ExCmd`: LSP edit lists as `ex_edits` (external input as data,
+  replayed through the same `apply_edits`), the `:keepjumps` switch as `ex_keepjumps`, and register contents no
+  recorded command produced (the `"/ ": ". "%` syncs, clipboard reads, raw macro writes) as `ex_register`. The
+  trace start also writes the registers that already hold a value.
+- **Reason:** Ex edits call `Workspace` ops straight from `Session::execute_ex_one`, and `&`/`g&` return before
+  `run_cmd`, so none of them reach the trace: a session that used `:s`, `:g` or `:sort` replays to a different
+  document and reports success. Recording raw Ex text would re-resolve history, cursor and IO at replay time;
+  one variant per verb would scatter Ex across the key-command namespace with no home for groups; an effect-only
+  `EditList` would drop registers, marks and cursor behaviour and stop the corpus testing Ex at all.
+- **Re-evaluate if:** a trace `v2` or session persistence lands; Ex parsing moves into the core; or another
+  frontend path is found mutating outside `run_cmd` (the rule then becomes general).
+- Refs: [RFC-0020](../docs/rfc/accepted/RFC-0020-ex-edits-in-the-trace.md),
+  [command-engine.md](../docs/design/command-engine.md), RFC-0012, D-001, D-006, D-025, D-039, INV-CMD-SEMANTIC,
+  INV-ADDITIVE, INV-TXN, F-009.
+
+## D-062 — The workspace config boundary: user-only keymaps, product-owned `.ruse/`, content-bound trust · decided (design)
+- **Decision:** Three rules for what a workspace contributes and how it is trusted.
+  (1) **Keymaps (#1026):** `keymap.*` stay `scope: user` in `spec/config-schema.yaml`; a workspace, even a
+  trusted one, cannot add or change active key bindings. Projects contribute COMMANDS (trust- and
+  capability-gated; project commands are #647) and may declare SUGGESTED bindings, which enter the existing
+  plugin-suggested, opt-in tier: they appear only as hints in which-key and the palette and take effect only
+  when the user opts in. Relaxing this needs a new D-*.
+  (2) **`.ruse/` ownership (#987):** `.ruse/` at a workspace root belongs to the PRODUCT and holds only
+  committed project configuration (e.g. `.ruse/config.toml`); ruse never writes local or per-user state into a
+  user's repository. The ruse repo's own development tooling moves out of `.ruse/`: per-change contracts to
+  `$(git rev-parse --git-path ruse/work)` (inside `.git`, per worktree, never committed) and the upstream-source
+  cache to `${XDG_CACHE_HOME:-~/.cache}/ruse-dev/` (shared across worktrees). The tooling migration is #1137.
+  (3) **Content-bound trust (adopted from Helix):** trust is stored on the user side, never in the repository,
+  and records with the trusted root a hash of the workspace's `.ruse/` contents; if they change after the grant,
+  the workspace config is treated as untrusted (stale) and is not loaded until the user re-confirms. This amends
+  D-058 for the config layer; the D-058 language-server gate stays root-bound. Full design:
+  [RFC-0021](../docs/rfc/accepted/RFC-0021-workspace-config-boundary.md).
+- **Reason:** a binding invokes a command, so a project rebinding common keys is a confused-deputy risk; trust
+  means "may run this repo's tools", not "may rewire my keys"; keys are muscle memory and per-profile
+  (INV-PROFILE-ISOLATION). Precedent: VS Code keybindings are application-scoped (user file only); Zed limits
+  project settings to editor behaviour and language tooling and keeps `vim_mode` user-only. A shared `.ruse/`
+  would mix committed project config with never-committed per-user state (precedent: `.helix/`, `.zed/` hold
+  project config only). A root-only grant lets a later pull or branch switch load config the user never saw
+  (Helix workspace trust; helix-editor/helix#9514).
+- **Re-evaluate if:** project commands (#647) and project views exist and users ask for view-local project
+  bindings; re-confirmation on every `.ruse/` change proves noisy; or a workspace contributes config the loader
+  reads from outside `.ruse/` (it must then be hashed too).
+- Refs: [RFC-0021](../docs/rfc/accepted/RFC-0021-workspace-config-boundary.md), D-058, D-046, D-008, #1026,
+  #987, #1137, #647, INV-TRUST-1, INV-PROFILE-ISOLATION, INV-PRIORITY, CAP-LSP-COORD, F-014,
+  [config-model.md](../docs/design/config-model.md), [change-workflow.md](../docs/operations/change-workflow.md).
+
+## D-063 — Positions are typed at the core boundary · decided (design)
+- **Decision:** A byte position that crosses the public API of `crates/core` (`pub` functions and methods,
+  `pub` fields, `Command`/`ExCmd`/`Edit`/`Transaction` payloads) is a `BytePos`. Char, grapheme, UTF-16 and
+  screen-cell positions keep their own types where they cross. Inside a function a position may be unwrapped
+  to `usize` for arithmetic. Line and column numbers are named indices (`line`, `col`, `vcol`, `row`) and stay
+  `usize`. A source-scan test (`no-usize-coords`) fails on a `pub` core signature or field whose name says
+  position but whose type is a bare `usize`, with an explained allow-list that can only shrink. The trace
+  text format is unchanged. INV-POS-TYPED and F-002 acceptance 4 are amended to this boundary rule. Full
+  design: [RFC-0022](../docs/rfc/accepted/RFC-0022-typed-positions-at-the-core-boundary.md).
+- **Reason:** #889: the invariant claimed untyped coordinates never occur, while about 130 `pub` core
+  functions passed positions as `usize`, so review trusted a guard that did not exist. Units mix at
+  boundaries (frontend, LSP, renderer), and that is where types pay. Typing single-unit arithmetic inside
+  motions adds noise and no safety. Weakening the claim to "bytes are canonical" would drop the guard where it
+  matters.
+- **Re-evaluate if:** a bug mixes line or column units (then type `col`/`vcol`); or a second consumer of
+  `ruse-core` appears (a plugin host or GUI).
+- Refs: [RFC-0022](../docs/rfc/accepted/RFC-0022-typed-positions-at-the-core-boundary.md), RFC-0008, D-023,
+  INV-POS-TYPED, ENG-POS-001, F-002, #889.
+
+## D-064 — The recovery journal is per-transaction RJ01 in the state dir · decided (design)
+- **Decision:** Refines D-005. The journal is a stream of `RJ01` records (layout of persistence-and-recovery.md
+  §2, CRC32C, `schema_ver` = major.minor): a Header (owner pid/host/start time, path, file format, base), a
+  Checkpoint or, above 32 MiB, a `DiskBase` (length + SHA-256 of the disk file), one Edit record per applied
+  change with forward and inverse edits and metadata, Meta save-points and fsync Markers. The core exposes a
+  bounded drainable change log and does no I/O; the frontend writes it, synced after 4000 ms idle, 200
+  changes, or before a risky operation, never per keystroke. Journals live in `$XDG_STATE_HOME/ruse/journal/`
+  (`0700`/`0600`), named `<basename>.<path hash>.rj`, not next to the file. A clean buffer, `:q!`, `:bd!` and
+  `:e!` delete the journal; discard from the recovery prompt archives it (14 days, 20 per path). Recovery
+  offers recover / diff / edit the disk file / discard / quit, or open read-only when a live owner holds it;
+  a recovered buffer is the disk text plus one change, so it is modified and undoable. The status line adds
+  `[journal!]` and `[disk changed]` only. Legacy `RJS0` sidecars are read once and archived. Full design:
+  [RFC-0023](../docs/rfc/accepted/RFC-0023-per-transaction-journal.md).
+- **Reason:** #932/#933/#938: the shipped snapshot journal has no version, metadata or inverse edits, loses up
+  to N changes on a hard kill, writes into the project tree, and recovery is two-way with a destructive
+  discard. Neovim's state-dir swap and Vim's `updatetime`/`updatecount` batching are the standard answers.
+- **Re-evaluate if:** persistent undo is designed (compaction must keep the tree); multi-client or remote
+  journals arrive (Header gains a peer identity); measured sync cost or loss window contradicts the defaults.
+- Refs: [RFC-0023](../docs/rfc/accepted/RFC-0023-per-transaction-journal.md), D-005, D-034, RFC-0007,
+  INV-ADDITIVE, INV-TXN, INV-UNDO, INV-BUFFER-KIND, INV-TRUST-1, PERSIST-003/005/007/009, F-008, #932, #933,
+  #938.

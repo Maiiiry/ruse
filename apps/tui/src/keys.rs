@@ -1,28 +1,27 @@
 //! The macro key codec (D-055): a round-trippable `KeyEvent` ↔ bytes encoding. A recorded Vim macro is the
 //! RAW keystroke stream stored as bytes in a register, so `encode` mirrors what a terminal delivers (and what
-//! `pty::encode_key` forwards — but that one is lossy/one-way) and `decode` inverts it. The slice-1 alphabet
-//! is printable UTF-8 + `Esc`/`Enter`/`Tab`/`Backspace` + `Ctrl-a..z` + the navigation keys (arrows,
-//! Home/End, PageUp/Down, Delete/Insert, BackTab) via a reserved `0x80`+tag prefix. Fn/Alt/Shift-specials are
-//! still DEFERRED (they encode to nothing, and `decode` skips bytes it does not recognise, so a hand-edited
-//! register still runs).
+//! `pty::encode_key` forwards — but that one is lossy/one-way) and `decode` inverts it. The alphabet is
+//! printable UTF-8 + `Esc`/`Enter`/`Tab`/`Backspace` + the C0 control chords + the navigation and function
+//! keys via a reserved `0x80`+tag prefix, and a `0x80 'm' {bits}` prefix that carries the modifiers a byte
+//! cannot (`<M-x>`, `<C-1>`), so a recorded chord replays as itself, never as its bare key (#812). Shift is
+//! not carried: the char already says it. `decode` skips bytes it does not recognise, so a hand-edited
+//! register still runs.
 
 use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// The recursion guard for macro replay (D-055): the maximum keys ONE top-level `@` may expand to, across
-/// any nested `@` it triggers. A self-invoking macro hits this and stops rather than hanging.
+/// The recursion guard for macro replay (D-055): the maximum keys ONE typed key may expand to, across
+/// every `@` (and `:normal`) its replay triggers. A self-invoking macro hits this and stops rather than
+/// hanging; CTRL-C stops it sooner.
 pub const MACRO_KEY_CAP: u32 = 100_000;
 
 /// Enqueue a replayed macro's decoded keys onto `queue`, honouring `budget` — the remaining key allowance
-/// shared across a whole top-level `@` expansion (nested `@`s draw from the same budget, so recursion
-/// terminates). A top-level `@` (empty queue, spent budget) starts a fresh [`MACRO_KEY_CAP`]. Returns
-/// `false` if the macro was TRUNCATED at the cap (the caller shows a status), `true` if fully enqueued.
+/// shared across everything one typed key expands to (nested `@`s draw from the same budget, so recursion
+/// terminates). Returns `false` if the macro was TRUNCATED at the cap (the caller shows a status), `true`
+/// if fully enqueued.
 pub fn enqueue_macro(queue: &mut VecDeque<KeyEvent>, budget: &mut u32, bytes: &[u8]) -> bool {
     let mut keys = decode(bytes);
-    if queue.is_empty() && *budget == 0 {
-        *budget = MACRO_KEY_CAP; // top-level `@`: a fresh budget for its whole expansion
-    }
     let take = keys.len().min(*budget as usize);
     let full = take == keys.len();
     keys.truncate(take);
@@ -46,6 +45,15 @@ pub struct MacroState {
     last_recorded: Option<char>, // the last register a recording COMPLETED into (lowercased), for `Q`
     queue: VecDeque<KeyEvent>,
     budget: u32,
+    /// A linewise-Visual `@{reg}` still to run on lines `.0..=.1` (0-based): the register's bytes, run once
+    /// per line from its column 0 (nvim `v_@-default`, i.e. `:'<,'>normal! @{reg}`; #1068).
+    line_run: Option<(usize, usize, Vec<u8>)>,
+}
+
+/// The replay state [`MacroState::suspend_replay`] set aside.
+pub struct SuspendedReplay {
+    queue: VecDeque<KeyEvent>,
+    line_run: Option<(usize, usize, Vec<u8>)>,
 }
 
 /// What the session should do with a key after [`MacroState::step`] has processed it.
@@ -67,10 +75,14 @@ pub enum Step {
     /// `q:` / `q/` / `q?` — NOT a macro recording: the `q`-prefixed `:`/`/`/`?` opens the command-line window
     /// (`:help cmdwin`) for that history ring. The caller calls `engine.open_cmdwin(char)`.
     OpenCmdWin(char),
+    /// `@@` before any register was played: Vim's `E748` (`:help E748`); nothing runs.
+    NoPreviousRegister,
 }
 
+/// `key` is the plain char `c`. `SHIFT` is allowed: a terminal reports an uppercase letter with it (crossterm
+/// sets `SHIFT` on `Q`), and the char already says it is uppercase (#681). A chord never is.
 fn is_bare(key: KeyEvent, c: char) -> bool {
-    key.code == KeyCode::Char(c) && key.modifiers.is_empty()
+    key.code == KeyCode::Char(c) && !crate::input::is_chord(key)
 }
 
 impl MacroState {
@@ -79,21 +91,61 @@ impl MacroState {
         Self::default()
     }
 
-    /// Whether a recording is currently in progress (`q{reg}` seen, no stopping `q` yet).
+    /// Whether a recording is currently in progress (`q{reg}` seen, no stopping `q` yet). Only the tests
+    /// observe it; the session never needs to ask (#890).
+    #[cfg(test)]
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.recording.is_some()
     }
 
-    /// Pop the next queued replay key, or `None` when the queue is empty. Draining to empty resets the
-    /// recursion budget, so the NEXT top-level `@` starts fresh. The session calls this before reading the
-    /// terminal; a `None` key came from the terminal (a *typed* key).
+    /// Pop the next queued replay key, or `None` when the queue is empty. The session calls this before
+    /// reading the terminal; a `None` key came from the terminal (a *typed* key).
     pub fn next_replay(&mut self) -> Option<KeyEvent> {
-        let k = self.queue.pop_front();
-        if k.is_none() {
-            self.budget = 0;
+        self.queue.pop_front()
+    }
+
+    /// Set aside the keys still queued (and any linewise run), so a `:normal` can run the replays its own
+    /// keys start to completion before the outer replay resumes. The recursion budget stays shared.
+    pub fn suspend_replay(&mut self) -> SuspendedReplay {
+        SuspendedReplay {
+            queue: std::mem::take(&mut self.queue),
+            line_run: self.line_run.take(),
         }
-        k
+    }
+
+    /// Put back what [`MacroState::suspend_replay`] set aside, after anything still queued.
+    pub fn resume_replay(&mut self, saved: SuspendedReplay) {
+        let inner = std::mem::replace(&mut self.queue, saved.queue);
+        self.queue.extend(inner);
+        if saved.line_run.is_some() {
+            self.line_run = saved.line_run;
+        }
+    }
+
+    /// Whether replay keys are still to run: queued keys, or more lines of a linewise-Visual run.
+    #[must_use]
+    pub fn replay_pending(&self) -> bool {
+        !self.queue.is_empty() || self.line_run.is_some()
+    }
+
+    /// Pop the next queued replay key WITHOUT resetting the budget when empty (a nested drain: the outer
+    /// expansion still owns the budget).
+    pub fn pop_replay(&mut self) -> Option<KeyEvent> {
+        self.queue.pop_front()
+    }
+
+    /// Drop the queued replay keys: a command failed, and Vim flushes the keys that were not typed, so a
+    /// macro stops at its first failure (#1085). A linewise-Visual run goes on with its next line, which
+    /// nvim runs as a `:normal` of its own.
+    pub fn flush_replay(&mut self) {
+        self.queue.clear();
+    }
+
+    /// Drop every key still to replay, the rest of a linewise-Visual run included: CTRL-C interrupted it.
+    pub fn interrupt_replay(&mut self) {
+        self.queue.clear();
+        self.line_run = None;
     }
 
     /// Enqueue register bytes for replay, honouring the shared recursion budget. Returns `false` if the
@@ -102,13 +154,71 @@ impl MacroState {
         enqueue_macro(&mut self.queue, &mut self.budget, bytes)
     }
 
-    /// Process one key. `from_replay` is true for a key drained from the replay queue (never re-recorded —
-    /// Vim records `@x`, not its expansion); `normal` is whether the focused view is in Normal mode with no
-    /// command-line open (the `q`/`@` prefixes only arm there).
+    /// Replay `bytes` once for each line `first..=last` (0-based), after the keys already queued: the
+    /// linewise-Visual `@{reg}` and `Q`. Lines are numbered as they are now and not adjusted for lines the
+    /// runs add or delete, as in nvim's `:{range}normal`.
+    pub fn replay_lines(&mut self, first: usize, last: usize, bytes: Vec<u8>) {
+        self.line_run = Some((first, last, bytes));
+    }
+
+    /// Once the queue has drained, start the next line of a [`MacroState::replay_lines`] run: queue its keys
+    /// and an `<Esc>` that ends whatever they left unfinished (`:normal` aborts an incomplete command), and
+    /// return the line the caller puts the cursor on (column 0) first.
+    pub fn next_line_run(&mut self) -> Option<usize> {
+        if !self.queue.is_empty() {
+            return None;
+        }
+        let (next, last, bytes) = self.line_run.as_mut()?;
+        let line = *next;
+        if line > *last {
+            self.line_run = None;
+            return None;
+        }
+        *next += 1;
+        let mut keys = bytes.clone();
+        keys.push(0x1b);
+        if !enqueue_macro(&mut self.queue, &mut self.budget, &keys) {
+            self.line_run = None; // the key budget ran out: stop, like the other replays
+        }
+        Some(line)
+    }
+
+    /// Whether `@` is armed and the next key names the register to replay. The session keeps the count typed
+    /// before `@` for that replay; every other key the macro layer consumes discards it (#850).
+    #[must_use]
+    pub fn awaits_replay_register(&self) -> bool {
+        self.pending_at
+    }
+
+    /// [`step_gated`](Self::step_gated) where `normal` gates both `@`/`Q` and the `q` command.
     pub fn step(&mut self, key: KeyEvent, from_replay: bool, normal: bool) -> Step {
+        self.step_gated(key, from_replay, normal, normal)
+    }
+
+    /// Process one key. `from_replay` is true for a key drained from the replay queue (never re-recorded —
+    /// Vim records `@x`, not its expansion). The session derives both gates from one command-boundary test
+    /// (`InputEngine::pending() == Pending::Base`, no command line, overlay or session prefix owning the
+    /// key; #679, #680, #851):
+    /// - `normal`: where `@` and `Q` arm: that boundary in Normal or Visual mode (#1068).
+    /// - `q_cmd`: that boundary in Normal or Visual mode. A typed `q` is the record command only here: it
+    ///   arms a recording or stops the live one. Anywhere else (Insert, the command line, a char argument
+    ///   like `fq`/`"q`, an armed operator like `gq`/`dq`) it is an ordinary key (matches nvim v0.12.6).
+    pub fn step_gated(
+        &mut self,
+        key: KeyEvent,
+        from_replay: bool,
+        normal: bool,
+        q_cmd: bool,
+    ) -> Step {
+        // A typed key starts a fresh recursion budget for everything it replays. The budget is never reset
+        // by the queue running dry: a self-invoking macro whose length divides the cap empties the queue
+        // exactly as the budget runs out, and resetting there let it run forever (#787).
+        if !from_replay {
+            self.budget = MACRO_KEY_CAP;
+        }
         // A typed bare `q` STOPS a live recording — unless it is the register-name for a pending `q`/`@`
         // (e.g. `@q` while recording runs macro q; it must not be read as a stop).
-        if !from_replay && !self.pending_q && !self.pending_at {
+        if q_cmd && !from_replay && !self.pending_q && !self.pending_at {
             if let Some((reg, buf)) = self.recording.as_ref() {
                 if is_bare(key, 'q') {
                     let bytes = encode_all(buf);
@@ -134,8 +244,10 @@ impl MacroState {
         // non-letter aborts the arm.
         if self.pending_q {
             self.pending_q = false;
-            if let KeyCode::Char(c) = key.code {
-                if c.is_ascii_alphabetic() {
+            // A chord is not a register name (`q<C-a>` records nothing, as in nvim).
+            if let (KeyCode::Char(c), false) = (key.code, crate::input::is_chord(key)) {
+                // `q{0-9a-zA-Z"}` (`:help q`): a digit names a numbered register, `"` the unnamed one.
+                if c.is_ascii_alphanumeric() || c == '"' {
                     self.recording = Some((c, Vec::new()));
                     return Step::Consumed;
                 }
@@ -152,11 +264,18 @@ impl MacroState {
         if self.pending_at {
             self.pending_at = false;
             let target = match key.code {
+                _ if crate::input::is_chord(key) => None, // `@<C-a>` replays nothing
                 KeyCode::Char(c) if c.is_ascii_alphabetic() => Some(c.to_ascii_lowercase()),
+                // `@0`-`@9` and `@"` replay the numbered and unnamed registers.
+                KeyCode::Char(c @ ('0'..='9' | '"')) => Some(c),
                 // `@:` — repeat the last-executed Ex command-line (`:help @:`). Carried as the pseudo
                 // register `:` so a following `@@` (which re-plays `last_played`) repeats it too.
                 KeyCode::Char(':') => Some(':'),
-                KeyCode::Char('@') => self.last_played, // `@@` — repeat the last-played macro
+                // `@@` — repeat the last-played macro.
+                KeyCode::Char('@') if self.last_played.is_none() => {
+                    return Step::NoPreviousRegister
+                }
+                KeyCode::Char('@') => self.last_played,
                 _ => None,
             };
             return match target {
@@ -172,8 +291,9 @@ impl MacroState {
                 None => Step::Consumed,
             };
         }
-        // Arm the prefixes (Normal only). `q` only arms when NOT recording (a recording `q` stopped above).
-        if normal && self.recording.is_none() && is_bare(key, 'q') {
+        // Arm the prefixes (Normal and Visual). `q` only arms when NOT recording (a recording `q` stopped
+        // above).
+        if q_cmd && self.recording.is_none() && is_bare(key, 'q') {
             self.pending_q = true;
             return Step::Consumed;
         }
@@ -201,10 +321,71 @@ impl MacroState {
     }
 }
 
-/// Encode one key event to its macro bytes, or `None` for a key outside the slice-1 alphabet (arrows, Fn,
-/// Alt, …) — the recorder simply drops those for now (D-055 defers them). Printable chars encode as UTF-8;
-/// `Ctrl`-`a`..`z` collapse to `0x01`..`0x1a`, matching the control bytes a terminal actually sends.
+/// The character a legacy terminal's `CTRL-<c>` arrives as when `c` is C0 punctuation: crossterm decodes
+/// `CTRL-\ CTRL-] CTRL-^ CTRL-_` (0x1c..0x1f) as `CTRL-4`..`CTRL-7` and `CTRL-@` (NUL) as `CTRL-Space`.
+/// `CTRL-[` is ESC and arrives as the `Esc` key. Every session handler that matches one of these chords
+/// accepts both forms (through `is_ctrl`), so the chord works with and without the kitty protocol.
+#[must_use]
+pub fn legacy_ctrl_alias(c: char) -> Option<char> {
+    match c {
+        '\\' => Some('4'),
+        ']' => Some('5'),
+        '^' => Some('6'),
+        '_' => Some('7'),
+        '@' => Some(' '),
+        _ => None,
+    }
+}
+
+/// The modifier tag after `0x80`: `0x80 'm' {bits}` then one key's bytes, which take those modifiers.
+const MOD_TAG: u8 = b'm';
+/// The function-key tag after `0x80`: `0x80 'f' {n}` is `F(n)`.
+const FN_TAG: u8 = b'f';
+/// The modifiers no plain byte holds, so only the [`MOD_TAG`] prefix carries them.
+const CARRIED: KeyModifiers = KeyModifiers::ALT
+    .union(KeyModifiers::SUPER)
+    .union(KeyModifiers::HYPER)
+    .union(KeyModifiers::META);
+/// The modifiers [`MOD_TAG`] carries, by bit.
+const MOD_BITS: [(KeyModifiers, u8); 5] = [
+    (KeyModifiers::CONTROL, 1),
+    (KeyModifiers::ALT, 2),
+    (KeyModifiers::SUPER, 4),
+    (KeyModifiers::HYPER, 8),
+    (KeyModifiers::META, 16),
+];
+
+/// Encode one key event to its macro bytes, or `None` for a key outside the alphabet (media keys, a bare
+/// modifier). Printable chars encode as UTF-8; `Ctrl`-`a`..`z` collapse to `0x01`..`0x1a` and the other C0
+/// chords to their bytes, matching the control bytes a terminal actually sends. A modifier no byte holds
+/// (`Alt`, `Ctrl` on a char with no control byte) rides the [`MOD_TAG`] prefix (#812).
 pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
+    let carried = CARRIED;
+    let mut extra = key.modifiers & carried;
+    let mut base = KeyEvent::new(key.code, key.modifiers - carried);
+    let mut bytes = plain_bytes(base);
+    if bytes.is_none() && base.modifiers.contains(KeyModifiers::CONTROL) {
+        // `<C-1>`, `<C-Up>`, `<C-F5>`: no control byte, so the tag carries the Ctrl too.
+        extra |= KeyModifiers::CONTROL;
+        base = KeyEvent::new(key.code, base.modifiers - KeyModifiers::CONTROL);
+        bytes = plain_bytes(base);
+    }
+    let bytes = bytes?;
+    if extra.is_empty() {
+        return Some(bytes);
+    }
+    let bits = MOD_BITS
+        .iter()
+        .filter(|(m, _)| extra.contains(*m))
+        .fold(0u8, |acc, (_, bit)| acc | bit);
+    let mut out = vec![0x80, MOD_TAG, bits];
+    out.extend(bytes);
+    Some(out)
+}
+
+/// [`encode`] for a key whose modifiers are at most `Ctrl` (and Shift, which the char already carries):
+/// `None` when no byte sequence holds it.
+fn plain_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let utf8 = |c: char| {
         let mut b = [0u8; 4];
@@ -214,14 +395,24 @@ pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) if ctrl && c.to_ascii_lowercase().is_ascii_alphabetic() => {
             vec![c.to_ascii_lowercase() as u8 - b'a' + 1] // C-a=0x01 … C-z=0x1a
         }
+        // The other C0 chords, as a legacy terminal sends them: `C-@`/`C-Space` = NUL, `C-[` = ESC, and
+        // `C-\ C-] C-^ C-_` = 0x1c..0x1f (which crossterm decodes as `Ctrl-4`..`Ctrl-7`). A chord never
+        // records as its plain char, or replaying `i<C-]>` would type `5`.
+        KeyCode::Char(' ' | '@' | '2') if ctrl => vec![0x00],
+        KeyCode::Char('[') if ctrl => vec![0x1b],
+        KeyCode::Char(c @ ('\\' | ']' | '^' | '_' | '4'..='7')) if ctrl => {
+            let i = "\\]^_".find(c).unwrap_or(c as usize - '4' as usize);
+            vec![0x1c + i as u8]
+        }
+        _ if ctrl => return None,
         KeyCode::Char(c) => utf8(c),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
+        KeyCode::F(n) => vec![0x80, FN_TAG, n],
         // Navigation keys ride a reserved `0x80` prefix + a tag byte. `0x80` is an invalid UTF-8 lead, so
-        // an older `decode` already skipped it — this encoding is backward-compatible. Fn/Alt/Shift-specials
-        // have no tag and fall out as `None` (still deferred).
+        // an older `decode` already skipped it — this encoding is backward-compatible.
         code => vec![0x80, special_tag(code)?],
     };
     Some(bytes)
@@ -264,68 +455,12 @@ fn special_from_tag(tag: u8) -> Option<KeyCode> {
     })
 }
 
-/// Parse a `:normal` key payload into key events, understanding Vim's `<>` key-notation
-/// (`:help key-notation`) on top of literal characters. `<Esc>`/`<CR>`/`<Tab>`/`<BS>`/`<Space>`/`<lt>`/`<Bar>`
-/// and `<C-x>` (control-letter) resolve to their macro bytes; every other run of characters is literal. The
-/// notation is converted to the SAME macro-byte encoding the record/replay path uses and handed to [`decode`],
-/// so `:normal` and `@{reg}` share one byte→[`KeyEvent`] codec (no second key interpreter). An unrecognised
-/// `<…>` token is treated literally (Vim does the same for an unknown key name).
+/// Parse a `:normal` key payload into key events. The payload is taken LITERALLY, as Vim does: `<Esc>` is
+/// five keys, not Escape (`:help :normal` says to use `:exe "normal \<Esc>"`; here type the key with
+/// `c_CTRL-V`, which puts its raw byte in the payload, #815). The bytes go through the macro codec's
+/// [`decode`], so `:normal` and `@{reg}` share one byte→[`KeyEvent`] codec.
 pub fn parse_normal_keys(payload: &str) -> Vec<KeyEvent> {
-    let chars: Vec<char> = payload.chars().collect();
-    let mut bytes: Vec<u8> = Vec::new();
-    let push_char = |c: char, out: &mut Vec<u8>| {
-        let mut b = [0u8; 4];
-        out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
-    };
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '<' {
-            // A `<…>` token: find the closing `>` and try to resolve the name to macro bytes.
-            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '>') {
-                let name: String = chars[i + 1..i + 1 + rel].iter().collect();
-                if let Some(b) = key_notation_bytes(&name) {
-                    bytes.extend(b);
-                    i += rel + 2; // skip `<name>`
-                    continue;
-                }
-            }
-            // Not a recognised token — treat the `<` literally.
-            push_char('<', &mut bytes);
-            i += 1;
-        } else {
-            push_char(chars[i], &mut bytes);
-            i += 1;
-        }
-    }
-    decode(&bytes)
-}
-
-/// Resolve one `<>` key-notation name (WITHOUT the angle brackets) to its macro bytes, or `None` if it is
-/// not a name this MVP understands (the caller then treats the `<` literally). Names are case-insensitive,
-/// matching Vim. `<C-x>` maps to the control byte `decode` reads back as `Ctrl-x`.
-fn key_notation_bytes(name: &str) -> Option<Vec<u8>> {
-    let lower = name.to_ascii_lowercase();
-    // `<C-x>` / `<c-x>` — a control-modified letter. Reuse the same control-byte range `encode` produces
-    // for `Ctrl`-`a`..`z`, so `decode` reads it straight back as the modified key.
-    if let Some(rest) = lower.strip_prefix("c-") {
-        let mut cs = rest.chars();
-        let c = cs.next()?;
-        if cs.next().is_none() && c.is_ascii_alphabetic() {
-            return Some(vec![c as u8 - b'a' + 1]);
-        }
-        return None;
-    }
-    Some(match lower.as_str() {
-        "esc" => vec![0x1b],
-        "cr" | "enter" | "return" => vec![b'\r'],
-        "tab" => vec![b'\t'],
-        "bs" | "backspace" => vec![0x7f],
-        "space" => vec![b' '],
-        "lt" => vec![b'<'],
-        "bar" => vec![b'|'],
-        "bslash" => vec![b'\\'],
-        _ => return None,
-    })
+    decode(payload.as_bytes())
 }
 
 /// Encode a whole key sequence to bytes (concatenation of [`encode`], skipping unencodable keys).
@@ -344,43 +479,86 @@ pub fn encode_all(keys: &[KeyEvent]) -> Vec<u8> {
 /// control bytes (`Esc`/`CR`/`Tab`/`BS`) take priority over the generic `Ctrl`-letter rule, matching how
 /// [`encode`] produced them; the rest of `0x01`..`0x1a` become `Ctrl`-letter.
 pub fn decode(bytes: &[u8]) -> Vec<KeyEvent> {
-    let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
-    let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            0x1b => out.push(plain(KeyCode::Esc)),
-            b'\r' | b'\n' => out.push(plain(KeyCode::Enter)),
-            b'\t' => out.push(plain(KeyCode::Tab)),
-            0x7f | 0x08 => out.push(plain(KeyCode::Backspace)),
-            0x01..=0x1a => out.push(ctrl((b - 1 + b'a') as char)), // C-a..C-z (Tab/CR handled above)
-            0x00..=0x1f => {} // other C0 controls not in the alphabet — skip
-            0x80 => {
-                // A navigation key: `0x80` + tag. Consume both; an unknown/absent tag is skipped.
-                if let Some(code) = bytes.get(i + 1).copied().and_then(special_from_tag) {
-                    out.push(plain(code));
+        // Gather a run of modifier prefixes (iteratively: a hostile register of nothing but prefixes must not
+        // recurse), then the one key they apply to.
+        let mut mods = KeyModifiers::NONE;
+        while bytes.get(i) == Some(&0x80) && bytes.get(i + 1) == Some(&MOD_TAG) {
+            let bits = bytes.get(i + 2).copied().unwrap_or(0);
+            for (m, bit) in MOD_BITS {
+                if bits & bit != 0 {
+                    mods |= m;
                 }
-                i += 2;
-                continue;
             }
-            _ => {
-                // A UTF-8 scalar: consume its full width (1–4 bytes); a malformed lead byte is skipped.
-                let width = utf8_width(b);
-                if let Ok(s) = std::str::from_utf8(&bytes[i..(i + width).min(bytes.len())]) {
-                    if let Some(c) = s.chars().next() {
-                        out.push(plain(KeyCode::Char(c)));
-                        i += c.len_utf8();
-                        continue;
-                    }
-                }
-                // not valid UTF-8 here — skip this byte
-            }
+            i += 3;
         }
-        i += 1;
+        let Some(&b) = bytes.get(i) else {
+            break;
+        };
+        let (key, width) = decode_one(bytes, i, b);
+        if let Some(mut key) = key {
+            key.modifiers |= mods;
+            out.push(if mods.is_empty() { key } else { canonical(key) });
+        }
+        i += width;
     }
     out
+}
+
+/// A tagged key as [`encode`] would read it back: a `Ctrl` chord with a control byte (`<C-2>`, `<C-]>`,
+/// `<C-[>`) collapses to the key that byte decodes as (`<C-Space>`, `<C-5>`, `<Esc>`), keeping the
+/// modifiers the tag carries. Without this a tag spelling `Ctrl` on such a char decodes to a key that
+/// re-encodes as the control byte and decodes as another key (#1150).
+fn canonical(key: KeyEvent) -> KeyEvent {
+    let carried = CARRIED;
+    let extra = key.modifiers & carried;
+    let base = KeyEvent::new(key.code, key.modifiers - carried);
+    if !base.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    match plain_bytes(base).map(|b| decode_one(&b, 0, b[0])) {
+        Some((Some(mut k), _)) => {
+            k.modifiers |= extra;
+            k
+        }
+        _ => key,
+    }
+}
+
+/// One key from `bytes[i]` (`b`), and the bytes it took; `None` for an unrecognised byte, which is skipped.
+fn decode_one(bytes: &[u8], i: usize, b: u8) -> (Option<KeyEvent>, usize) {
+    let plain = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
+    let ctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    match b {
+        0x1b => (plain(KeyCode::Esc), 1),
+        b'\r' => (plain(KeyCode::Enter), 1),
+        b'\t' => (plain(KeyCode::Tab), 1),
+        0x7f => (plain(KeyCode::Backspace), 1),
+        // `0x08` and `0x0a` are `<C-h>` and `<NL>` (`<C-j>`), as in Vim: a linewise register's line break
+        // replays as `<NL>`, which moves down like `j` (keeping the column), not like `<CR>` (#812).
+        0x01..=0x1a => (ctrl((b - 1 + b'a') as char), 1), // C-a..C-z (Tab/CR handled above)
+        0x00 => (ctrl(' '), 1),                           // C-@ / C-Space, as crossterm decodes NUL
+        0x1c..=0x1f => (ctrl((b - 0x1c + b'4') as char), 1), // C-\ C-] C-^ C-_ = Ctrl-4..7
+        0x80 => match bytes.get(i + 1).copied() {
+            // A function key: `0x80 'f' {n}`.
+            Some(FN_TAG) => (bytes.get(i + 2).and_then(|&n| plain(KeyCode::F(n))), 3),
+            // A navigation key: `0x80` + tag. Consume both; an unknown/absent tag is skipped.
+            tag => (tag.and_then(special_from_tag).and_then(plain), 2),
+        },
+        _ => {
+            // A UTF-8 scalar: consume its full width (1–4 bytes); a malformed lead byte is skipped.
+            let width = utf8_width(b);
+            match std::str::from_utf8(&bytes[i..(i + width).min(bytes.len())])
+                .ok()
+                .and_then(|s| s.chars().next())
+            {
+                Some(c) => (plain(KeyCode::Char(c)), c.len_utf8()),
+                None => (None, 1),
+            }
+        }
+    }
 }
 
 /// The byte-width of a UTF-8 sequence from its lead byte (1 for ASCII / invalid lead, so the caller advances).
@@ -440,15 +618,111 @@ mod tests {
     fn ctrl_letters_map_to_control_bytes() {
         assert_eq!(encode(ctrl('a')).unwrap(), vec![0x01]);
         assert_eq!(encode(ctrl('z')).unwrap(), vec![0x1a]);
-        // Ctrl-I / Ctrl-M are the Tab / Enter bytes, so they decode to Tab / Enter (terminal ambiguity).
+        // Ctrl-I / Ctrl-M are the Tab / Enter bytes, so they decode to Tab / Enter (one key in Vim too);
+        // 0x08 / 0x0a are `<C-h>` / `<NL>`, distinct from `<BS>` / `<CR>` (#812).
         assert_eq!(decode(&[0x09]), vec![key(KeyCode::Tab)]);
+        assert_eq!(decode(&[0x08, 0x0a]), vec![ctrl('h'), ctrl('j')]);
         assert_eq!(decode(&[0x0d]), vec![key(KeyCode::Enter)]);
+    }
+
+    /// The C0 chords outside `C-a..C-z` record as the bytes a terminal sends and replay as the keys crossterm
+    /// decodes from them; no chord records as its plain char (`i<C-]>` replayed as `i5`).
+    #[test]
+    fn other_c0_chords_record_as_control_bytes() {
+        assert_eq!(encode(ctrl(' ')).unwrap(), vec![0x00]);
+        assert_eq!(encode(ctrl('@')).unwrap(), vec![0x00]);
+        assert_eq!(encode(ctrl('[')).unwrap(), vec![0x1b]);
+        assert_eq!(encode(ctrl('\\')).unwrap(), vec![0x1c]);
+        assert_eq!(encode(ctrl(']')).unwrap(), vec![0x1d]);
+        assert_eq!(encode(ctrl('^')).unwrap(), vec![0x1e]);
+        assert_eq!(encode(ctrl('_')).unwrap(), vec![0x1f]);
+        for k in [ctrl(' '), ctrl('4'), ctrl('5'), ctrl('6'), ctrl('7')] {
+            assert_eq!(decode(&encode(k).unwrap()), vec![k], "round-trip {k:?}");
+        }
+    }
+
+    /// A modifier no byte holds rides the `0x80 'm'` prefix, so the chord replays as itself (#812): a
+    /// recorded `<M-x>` used to replay as `x`.
+    #[test]
+    fn chords_without_a_control_byte_keep_their_modifiers() {
+        let with = |code, mods| KeyEvent::new(code, mods);
+        let alt = KeyModifiers::ALT;
+        let keys = [
+            with(KeyCode::Char('x'), alt),
+            with(KeyCode::Char('x'), alt | KeyModifiers::CONTROL),
+            with(KeyCode::Char('1'), KeyModifiers::CONTROL),
+            with(KeyCode::Up, KeyModifiers::CONTROL),
+            with(KeyCode::Esc, alt),
+            with(KeyCode::Char('가'), KeyModifiers::META),
+            with(KeyCode::F(5), KeyModifiers::NONE),
+            with(KeyCode::F(12), KeyModifiers::SUPER),
+            ctrl('h'),
+            ctrl('j'),
+        ];
+        for k in keys {
+            let b = encode(k).expect("encodes");
+            assert_eq!(decode(&b), vec![k], "round-trip {k:?} via {b:?}");
+        }
+        assert_eq!(encode(keys[0]).unwrap(), vec![0x80, b'm', 2, b'x']);
+        assert_eq!(encode(keys[1]).unwrap(), vec![0x80, b'm', 2, 0x18]);
+        // A run of prefixes is one key with every modifier; a prefix with no key is nothing.
+        assert_eq!(
+            decode(&[0x80, b'm', 1, 0x80, b'm', 2, b'1']),
+            vec![with(KeyCode::Char('1'), KeyModifiers::CONTROL | alt)]
+        );
+        assert_eq!(decode(&[b'a', 0x80, b'm', 2]), vec![ch('a')]);
+        assert_eq!(encode(key(KeyCode::Null)), None);
+    }
+
+    /// A chord is never a `q`/`@` register name, nor the `q` that stops a recording (#1059). nvim: `q<C-a>`
+    /// and `@<C-a>` do nothing.
+    #[test]
+    fn chords_are_not_register_names() {
+        let mut m = MacroState::new();
+        // `q<C-a>` and `@<C-a>` arm, then drop the chord: no recording, no replay.
+        assert_eq!(m.step(ch('q'), false, true), Step::Consumed);
+        assert_eq!(m.step(ctrl('a'), false, true), Step::Consumed);
+        assert!(!m.is_recording());
+        assert_eq!(m.step(ch('@'), false, true), Step::Consumed);
+        assert_eq!(m.step(ctrl('a'), false, true), Step::Consumed);
+        // `<C-q>` is not the `q` that stops a recording.
+        m.step(ch('q'), false, true);
+        m.step(ch('b'), false, true);
+        assert_eq!(m.step(ctrl('q'), false, true), Step::Dispatch(ctrl('q')));
+        assert!(m.is_recording());
+    }
+
+    #[test]
+    fn a_tagged_ctrl_chord_with_a_control_byte_decodes_as_that_byte() {
+        // `0x80 'm' {Ctrl|Super|Hyper} '2'` (#1150): `<C-2>` is NUL, so it reads as `<C-Space>` with the
+        // tag's other modifiers, the key its re-encoding decodes as.
+        let with = KeyEvent::new;
+        let sh = KeyModifiers::SUPER | KeyModifiers::HYPER;
+        let k = decode(&[0x80, MOD_TAG, 13, b'2']);
+        assert_eq!(
+            k,
+            vec![with(KeyCode::Char(' '), KeyModifiers::CONTROL | sh)]
+        );
+        assert_eq!(decode(&encode_all(&k)), k);
+        // `<C-]>` reads as `<C-5>`, `<C-[>` as `<Esc>`; a chord with no control byte keeps its char.
+        assert_eq!(
+            decode(&[0x80, MOD_TAG, 3, b']']),
+            vec![with(
+                KeyCode::Char('5'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )]
+        );
+        assert_eq!(
+            decode(&[0x80, MOD_TAG, 5, b'[']),
+            vec![with(KeyCode::Esc, KeyModifiers::SUPER)]
+        );
+        assert_eq!(decode(&[0x80, MOD_TAG, 1, b'1']), vec![ctrl('1')]);
     }
 
     #[test]
     fn decode_skips_unrecognised_bytes_without_panic() {
-        // A stray 0x00 and an incomplete UTF-8 lead byte are skipped; the surrounding keys survive.
-        let bytes = vec![b'x', 0x00, 0xff, b'y'];
+        // An incomplete UTF-8 lead byte and an unknown navigation tag are skipped; the surrounding keys survive.
+        let bytes = vec![b'x', 0xff, 0x80, b'?', b'y'];
         assert_eq!(decode(&bytes), vec![ch('x'), ch('y')]);
     }
 
@@ -479,10 +753,9 @@ mod tests {
 
     #[test]
     fn unencodable_keys_are_still_dropped() {
-        // Fn / Alt / etc. stay deferred: encoded to nothing, skipped by encode_all.
-        assert_eq!(encode(key(KeyCode::F(5))), None);
+        // A key outside the alphabet encodes to nothing and is skipped by encode_all.
         assert_eq!(
-            encode_all(&[ch('a'), key(KeyCode::F(5)), ch('b')]),
+            encode_all(&[ch('a'), key(KeyCode::CapsLock), ch('b')]),
             vec![b'a', b'b']
         );
         // A stray/trailing 0x80 with no tag decodes to nothing (no panic).
@@ -491,32 +764,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_normal_keys_reads_literals_and_key_notation() {
-        // Literal characters (including spaces) pass through unchanged.
+    fn parse_normal_keys_takes_the_payload_literally() {
         assert_eq!(parse_normal_keys("dwx"), vec![ch('d'), ch('w'), ch('x')]);
         assert_eq!(parse_normal_keys("A;"), vec![ch('A'), ch(';')]);
-        // `<Esc>`/`<CR>`/`<Tab>`/`<BS>` resolve to their keys (case-insensitive), so `Ihi<Esc>` reads as
-        // enter-insert, `h`, `i`, Esc.
+        // No `<>` notation (#815): `<Esc>` is five keys, as in nvim; a raw ESC byte (typed with
+        // `c_CTRL-V`) is Escape.
         assert_eq!(
-            parse_normal_keys("Ihi<Esc>"),
-            vec![ch('I'), ch('h'), ch('i'), key(KeyCode::Esc)]
+            parse_normal_keys("i<Esc>"),
+            vec![ch('i'), ch('<'), ch('E'), ch('s'), ch('c'), ch('>')]
         );
-        assert_eq!(parse_normal_keys("<cr>"), vec![key(KeyCode::Enter)]);
-        // `<C-w>` is control-w; `<lt>` is a literal `<`.
-        assert_eq!(parse_normal_keys("<C-w>"), vec![ctrl('w')]);
-        assert_eq!(parse_normal_keys("<lt>x"), vec![ch('<'), ch('x')]);
-        // An unknown `<…>` name is treated literally (Vim's behaviour for an unknown key name).
         assert_eq!(
-            parse_normal_keys("<foo>"),
-            vec![ch('<'), ch('f'), ch('o'), ch('o'), ch('>')]
+            parse_normal_keys("Ihi\u{1b}x"),
+            vec![ch('I'), ch('h'), ch('i'), key(KeyCode::Esc), ch('x')]
         );
+        assert_eq!(parse_normal_keys("\u{17}"), vec![ctrl('w')]);
     }
 
     #[test]
     fn enqueue_macro_pushes_decoded_keys_within_budget() {
         let mut q = VecDeque::new();
-        let mut budget = 0;
-        // A top-level @ (empty queue, no budget) seeds MACRO_KEY_CAP, then enqueues "ax".
+        let mut budget = MACRO_KEY_CAP; // what a typed key seeds
         assert!(enqueue_macro(&mut q, &mut budget, b"ax"));
         assert_eq!(q, VecDeque::from(vec![ch('a'), ch('x')]));
         assert_eq!(
@@ -524,6 +791,30 @@ mod tests {
             MACRO_KEY_CAP - 2,
             "budget decremented by keys pushed"
         );
+    }
+
+    #[test]
+    fn a_q_off_the_command_boundary_is_captured_not_a_stop() {
+        // #679/#851: while recording, a `q` in Insert or after `f` is text or an argument, not a stop.
+        let mut m = MacroState::new();
+        assert_eq!(m.step(ch('q'), false, true), Step::Consumed);
+        assert_eq!(m.step(ch('a'), false, true), Step::Consumed);
+        assert_eq!(
+            m.step_gated(ch('q'), false, false, false),
+            Step::Dispatch(ch('q'))
+        );
+        assert!(m.is_recording());
+        // Off the boundary nothing arms either.
+        assert_eq!(
+            m.step_gated(ch('@'), false, false, false),
+            Step::Dispatch(ch('@'))
+        );
+        assert!(!m.awaits_replay_register());
+        // Back at the boundary (Visual may stop but not arm) the `q` stops the recording.
+        assert!(matches!(
+            m.step_gated(ch('q'), false, false, true),
+            Step::Store('a', _)
+        ));
     }
 
     #[test]
@@ -665,12 +956,12 @@ mod tests {
     }
 
     #[test]
-    fn at_at_before_any_play_is_a_noop() {
+    fn at_at_before_any_play_is_e748() {
         let mut m = MacroState::new();
         m.step(ch('@'), false, true);
         assert_eq!(
             m.step(ch('@'), false, true),
-            Step::Consumed,
+            Step::NoPreviousRegister,
             "nothing to repeat yet"
         );
     }
@@ -708,6 +999,39 @@ mod tests {
         assert_eq!(budget, 0, "budget exhausted");
         // The 3 taken keys were appended after the sentinel.
         assert_eq!(q.len(), 1 + 3);
+    }
+
+    /// #787: a self-invoking macro stops at the cap whatever its length. The budget used to be reseeded
+    /// whenever the queue ran dry with the budget spent, which happens exactly when the body length divides
+    /// the cap (`@a` = `xx@a`, 4 keys), so the replay never ended. The session loop is modelled here: drain
+    /// the queue, resolving each `@a` the replay reaches.
+    #[test]
+    fn a_self_invoking_macro_stops_at_the_cap_for_every_body_length() {
+        for body in [
+            &b"@a"[..],
+            b"x@a",
+            b"xx@a",
+            b"xxx@a",
+            b"xxxxxxx@a",
+            b"xxxxxxxx@a",
+        ] {
+            let mut m = MacroState::new();
+            m.step(ch('@'), false, true);
+            assert_eq!(m.step(ch('a'), false, true), Step::Replay('a'));
+            assert!(m.replay(body));
+            let mut ran = 0u32;
+            while let Some(k) = m.next_replay() {
+                ran += 1;
+                assert!(ran <= MACRO_KEY_CAP, "body {body:?} ran past the cap");
+                if let Step::Replay(_) = m.step(k, true, true) {
+                    m.replay(body);
+                }
+            }
+            assert!(
+                ran > MACRO_KEY_CAP / 2,
+                "body {body:?} stopped early at {ran}"
+            );
+        }
     }
 
     #[test]
@@ -760,6 +1084,15 @@ mod tests {
             Step::Replay('b'),
             "Q repeats the last RECORDED register (b), not the last played (a)"
         );
+    }
+
+    #[test]
+    fn q_replays_when_the_terminal_reports_shift() {
+        // A real terminal delivers `Q` as `Char('Q')` + SHIFT; it must still replay.
+        let mut m = MacroState::new();
+        record(&mut m, 'a', &[ch('x')]);
+        let shifted_q = KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT);
+        assert_eq!(m.step(shifted_q, false, true), Step::Replay('a'));
     }
 
     #[test]
@@ -819,5 +1152,26 @@ mod tests {
         let mut m = MacroState::new();
         record(&mut m, 'A', &[ch('x')]);
         assert_eq!(m.step(ch('Q'), false, true), Step::Replay('a'));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(crate::test_cases(512))]
+
+        /// Arbitrary register bytes (a hand-edited or binary-yanked register replayed with `@`) never panic
+        /// the decoder, and decoding is a fixpoint: what it yields re-encodes to bytes that decode the same.
+        #[test]
+        fn decode_never_panics_and_is_a_fixpoint(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let keys = decode(&bytes);
+            proptest::prop_assert!(keys.len() <= bytes.len());
+            proptest::prop_assert_eq!(decode(&encode_all(&keys)), keys);
+        }
+
+        /// Arbitrary `:normal` payloads (including stray and unterminated `<`) never panic.
+        #[test]
+        fn parse_normal_keys_never_panics(s in "([<>]|<[cC]-|[a-zA-Z-]{0,4}|\\PC){0,24}") {
+            let _ = parse_normal_keys(&s);
+        }
     }
 }

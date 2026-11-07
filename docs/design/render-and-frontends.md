@@ -10,7 +10,7 @@ summary: >
 audience: [maintainers, contributors, llm-agents]
 status: draft
 related:
-  - architecture.md
+  - ../architecture/architecture.md
   - ../protocols/versioning-and-evolution.md
   - ../invariants/reference-invariants.md
   - ../parity/terminal.md
@@ -163,15 +163,16 @@ Debug surfaces are **product features**, not ad-hoc logging — specified in
 Keep apps thin so the TUI doesn't become a monolith; the engine is reusable.
 
 ```
-workspace-kernel          editor-tui                 editor-gui
+ruse-core (crates/core)   ruse-tui (apps/tui)        GUI (future, F-018)
 ├─ document               ├─ terminal input          ├─ native window
 ├─ command                ├─ ANSI rendering          ├─ GPU rendering
-├─ plugin                 ├─ clipboard               └─ OS integration
-├─ remote                 └─ process bootstrap
-└─ render-model
+├─ transaction, undo      ├─ clipboard               └─ OS integration
+└─ registers, anchors     ├─ LSP, remote, persistence
+                          └─ process bootstrap
 ```
 
-Maps to the repo layout in [../README.md](../README.md): `crates/*` = engine, `apps/*` = thin frontends.
+`crates/core` is IO-free and reusable. `apps/tui` holds everything that does IO, so it is not thin today; a
+second frontend is what would force more of it into a shared crate (D-039).
 
 ## 7. Structural Guardrails
 
@@ -179,42 +180,100 @@ Maps to the repo layout in [../README.md](../README.md): `crates/*` = engine, `a
   samples, and generated outputs becomes unmanageable. ruse splits strictly early (`crates/ apps/
   extensions/ sdk/ tests/ docs/ tools/`) and keeps sample outputs / large corpora in a separate repo or
   Git LFS.
-- **Too many backends early.** Follow the render sequencing in §4 of [../README.md](../README.md).
-- **Folder ≠ crate.** Start with big crate boundaries (`editor-core`, `terminal-client`,
-  `workspace-runtime`, `plugin-protocol`); keep `document/transaction/command/anchor` as modules inside
-  `core` until a real boundary demands a split. (Guards CORE-11/12/13.)
+- **Too many backends early.** Follow the render sequencing under Build Order in [../README.md](../README.md).
+- **Folder ≠ crate.** Two crates (D-039); `document/transaction/command/anchor` are modules inside `core`
+  until a real boundary demands a split. (Guards CORE-11/12/13.)
 
 ## v0 — TUI viewport & vertical scroll (SHIPPED, not the deferred IR above)
 
 > Sections 1–7 describe the **deferred** multi-frontend render-IR architecture (paused per RFC-0012 until a
 > second frontend is actually started). This section is the **live v0**: the single `ruse` TUI binary
-> renders a plain `Document` directly, with no IR. It exists so tall files are editable — the correctness
-> gap this slice closes (before it, `render` always started at buffer row 0, so the cursor could sit off
-> the bottom of the screen and its line was never drawn).
+> renders a plain `Document` directly, with no IR. Folds (`apps/tui/src/folds.rs`) and virtual rows
+> ([rich-rendering.md](rich-rendering.md)) adjust the row walk on top of this model.
 
-**View state is frontend-only.** The core stays IO-free / view-free (INV-DOC-VIEW): it knows nothing of
-rows, columns, terminal size, or scroll. The viewport is a single `top` offset (the first visible buffer
-line) held in the TUI event loop, recomputed each frame from the cursor's row — never stored in `EditorState`.
+**The frontend computes the viewport.** The core stays IO-free (INV-DOC-VIEW): it knows nothing of columns,
+terminal size, or the scroll rule. The viewport is a single `top` offset (the first visible buffer line) stored
+per View (`View.top`, so two Views of one buffer scroll independently) and recomputed each frame by the
+frontend viewport pass from the cursor's row.
 
-**Scroll-to-cursor (the one rule).** Before each draw, `top` is adjusted so the cursor stays visible with a
-`scrolloff` margin of context above and below (Vim's `scrolloff`). Given the cursor's buffer row, the text
-height (screen rows minus the status line), the current `top`, and the margin:
+**Line layout (#615, #616).** `ui/line_layout.rs` lays out one buffer line as nvim v0.12.6's
+`charsize_regular` does: every grapheme gets a size in virtual columns that includes what the screen inserts
+for it (the `>` filler for a wide glyph that does not fit in a row's last cell, the `'showbreak'` /
+`'breakindent'` head of each continuation row, the `'linebreak'` padding), so with `'wrap'` a cell's virtual
+column is `row × width + col`. `'list'` / `'listchars'` decide what tabs, spaces, nbsp and the line end show.
+A character nvim does not print shows transcribed, one cell per character, never raw (#1181): `^X` for a C0
+control and `^?` for DEL (`<xx>` under `'display'` `uhex`), `<xx>` for a C1 control, `<xxxx>` for the format
+and bidi-control characters nvim's `utf_printable` refuses. `Screen::put_styled` transcribes too, so no
+control byte from a buffer, a file name or a message ever reaches the terminal. The window's gutter
+(`'foldcolumn'` with nvim's `fill_foldcolumn` marks, `'signcolumn'` with the diagnostics' `E`/`W`/`I`/`H`,
+then `'number'` / `'relativenumber'` / `'numberwidth'`) narrows the text area; `ui/window_view.rs` resolves a window's options
+(window-local on its View, global-local over the session's globals) into a `WinView` per frame, which the
+viewport pass, the painter and the key handlers share. The layout is unit-tested against 528 nvim screens.
 
-- cursor above the top margin (`cursor_row < top + margin`) → scroll up: `top = cursor_row − margin`.
-- cursor below the bottom margin (`cursor_row + margin ≥ top + height`) → scroll down:
-  `top = cursor_row + margin + 1 − height`.
-- otherwise `top` is unchanged (no scroll on pure horizontal / in-viewport motion).
+**Scroll-to-cursor.** Before each draw, `viewport::update_topline` (nvim's `update_topline` without
+'smoothscroll': `scroll_cursor_top` / `scroll_cursor_bot` / `scroll_cursor_halfway`) moves `top` so the cursor
+line shows whole with `'scrolloff'` rows of context, counting wrapped rows and a closed fold as one row; a jump
+further than about half a window centres the cursor line, and `'scrolljump'` is the least it scrolls. A cursor
+line taller than the window shows from the row that keeps the cursor on screen (nvim's `curs_columns`
+`w_skipcol`, kept on the View as `skipcol`). Without `'wrap'` the window
+scrolls sideways (`View.leftcol`): nvim's `curs_columns` with `'sidescroll'` / `'sidescrolloff'`, plus
+`zh` / `zl` / `zH` / `zL` / `zs` / `ze`. The screen-line motions `gj` / `gk` / `g0` / `g^` / `gm` / `g$` are
+resolved by the frontend in these rows (nvim's `nv_screengo`) and handed to the engine as a `go`-style byte
+target, so operators compose and the trace replays them.
 
-All arithmetic saturates at 0, and the margin is clamped to `(height−1)/2` so it always fits (a 3-row window
-can't reserve 5 rows of context). The function is **pure and unit-tested** (`viewport::scroll_top`); the
-event loop owns only the `mut top` it threads through.
+**Scroll keys.** `scroll.rs` ports nvim's `move.c` scroll commands over the same rows: `CTRL-E` / `CTRL-Y`
+(`scroll_redraw`, `scrollup`, `scrolldown`), `CTRL-D` / `CTRL-U` by the window's `'scroll'` and
+`CTRL-F` / `CTRL-B` by a page less nvim's overlap (`pagescroll`, `scroll_with_sms`, `get_scroll_overlap`), with
+the `'scrolloff'` correction (`cursor_correct`, `cursor_correct_sms`). As in nvim the page commands scroll by
+rows with `'smoothscroll'` switched on and then put the top line back on a line boundary, so over wrapped
+lines the view and the cursor move by different amounts. With `'smoothscroll'` the top line can start inside
+a line (`skipcol`), marked `<<<`. A scroll that nvim marks `VALID_TOPLINE` is kept by the next frame until
+the cursor or the text moves. Known gap: after a scroll that lands short of nvim's wanted column (the
+`CTRL-U` screen column on a shorter line), a later `j` / `G` aims at the landing column, because the core has
+no command that sets the wanted column alone.
 
-**Rendering.** `render` draws the `height` buffer lines starting at `top`, and places the terminal cursor at
-`(cursor_row − top, col)`. Long lines are **truncated at the terminal width** (no wrap) so screen-row math
-stays exact; **horizontal scroll and soft-wrap are deferred** (daily-driver code lines fit; revisit when a
-real wide-line/wrap need appears). This is the same "over-invest in semantics, under-invest in structure"
-posture as the rest of v0 — the scroll *contract* is nailed down and tested; the *mechanism* is the simplest
-thing that renders a buffer.
+**Rendering.** `render` paints each window's lines from `top` through the layout, the last line that does not
+fit as `'display'` says (`lastline` `@@@`, `truncate`, or `@` rows), and places the terminal cursor on the
+cursor's cell (a tab's last cell in Normal mode, as nvim). Rows after the last line show `'fillchars'` `eob`
+(`~`); a closed fold's row is filled with `fold`; `vert` / `horiz` draw the split dividers. `'cursorline'`
+(`'cursorlineopt'` `line` / `screenline` / `number`), `'cursorcolumn'` and `'colorcolumn'` are background
+overlays at virtual columns, as nvim places them: on the row of a wrapped line that holds that column, and on
+no row past the line's last. `'statuscolumn'` is not supported: its value is an expression language
+(`%{...}` evaluates Vimscript), and running Vimscript is a non-goal; `:set stc=...` says
+`option not supported`.
+
+**Long messages (#1222).** The last row is both the status bar and the message area: the message follows the
+mode, name and flags. A message that does not fit in the rest of that row is not cut. It is shown the way
+nvim v0.12.6 shows a message longer than its command line (probed in a PTY at 80x24, `:help hit-enter`):
+wrapped at any cell across the rows above, and `Press ENTER or type command to continue` on the last row
+(`ui/message.rs`). `<CR>`, `<NL>`, `<Space>` and `CTRL-C` clear it and are used up; any other key clears it
+and then runs as typed, `<Esc>` and `:` included. nvim's `wait_return` puts those keys back the same way. A
+file message (`"name" 3L, 12B written`, `"name" [New]`) is cut at its start with `<` instead, as nvim's
+default `'shortmess'` flag `t` does; when the bar's mode and name alone are wider than the screen, the file
+message is cut to the whole row and the prefix is left out (#1235).
+
+**Paging and history (#1235).** A message taller than the screen is paged from its top with nvim's
+`-- More --` keys (`:help more-prompt`, probed at 80x24): `<CR>`/`<NL>`/`j`/`<Down>` one row,
+`d` half a screen, `<Space>`/`f`/`<PageDown>`/`CTRL-F` a screen, `G` the end; `<BS>`/`k`/`<Up>`,
+`u`, `b`/`<PageUp>`/`CTRL-B` and `g` back; `q`/`<Esc>`/`CTRL-C` end it, `:` ends it and opens the command
+line, and any other key shows the key help after `-- More --`. The last page ends at the hit-enter prompt,
+where `b`/`k`/`u`/`g`/`<Up>`/`<PageUp>` scroll back and `j`/`d`/`f`/`<Down>`/`<PageDown>` are ignored.
+Every message is given with a kind where it is set (`app/messages.rs`: error, warning, info, echo); errors
+fail the command, and all but echoes are kept in the history `:[count]mes[sages]` shows and
+`:[count]mes[sages] clear` trims, sized by `'messagesopt'` `history:` (default 500). What nvim keeps and does
+not keep is listed at the top of `app/messages.rs`. A command's line-count report (`3 fewer lines`, `3 lines
+yanked`, `3 lines >ed 1 time`, `3 substitutions on 2 lines`) is given only when its count is more than
+`'report'` (default 2), with nvim's wording; `app/report.rs` lists them (#1276). Differences from nvim:
+- nvim's message gets a whole command-line row. ruse's shares the row with the bar, so a message that would
+  fit nvim's row, but not the space left after a long file name, also asks for `<CR>`.
+- The pager's first page starts at the message, not at the typed command line nvim scrolls up with it; there
+  is no `g<`, `'more'`, `'cmdheight'`, or `'shortmess'` flag other than the built-in `t`; `'messagesopt'`
+  `wait:` and `progress:` are checked and kept but ruse always behaves as `hit-enter`.
+- There is no undo/redo report (`1 more line; before #2  0 seconds ago`), nor the `3 lines changed` /
+  `indented` / `filtered` reports of `g~`, `=` and `!`. A Visual put over a charwise selection reports the
+  net line change, where nvim counts the lines the put itself added.
+- Listings ruse shows in an overlay (`:reg`, `:marks`, `:jumps`, `[I`, multi-row `:p`) and `:!` output (one
+  row joined with ` | `) do not go through the pager.
 
 ## Reference Invariants (this doc)
 

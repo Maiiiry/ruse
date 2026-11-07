@@ -11,7 +11,7 @@ summary: >
 audience: [maintainers, contributors, llm-agents]
 status: draft
 related:
-  - ../rfc/proposed/RFC-0004-input-profiles.md
+  - ../rfc/accepted/RFC-0004-input-profiles.md
   - view-window-workspace.md
 ---
 
@@ -45,15 +45,13 @@ bytes** — Vim's model, where a register is one thing:
 - text yanked into `a` can be run as a macro with `@a`.
 
 A private, frontend-only macro store would be simpler but would break this identity, so it is rejected
-(D-055). The frontend needs to WRITE a named register, which the core does not expose today
-(`EditorState::registers()` is read-only) — so a small accessor `EditorState::set_register_raw(name, bytes)`
-is added (writes a charwise `Register`), with a `Workspace` passthrough. Reads use the existing
-`registers().get(name)`.
+(D-055). The frontend writes a named register through `EditorState::set_register_raw(name, bytes)` (a charwise
+`Register`), with a `Workspace` passthrough. Reads use `registers().get(name)`.
 
 ## 3. The key codec (`apps/tui/src/keys.rs`)
 
-Recording serializes each `KeyEvent` to bytes; replay parses them back. No round-trippable codec exists
-(`apps/tui/src/pty.rs::encode_key` is one-way and lossy), so this module is new.
+Recording serializes each `KeyEvent` to bytes; replay parses them back. (`apps/tui/src/pty.rs::encode_key` is
+one-way and lossy, so it is not usable here.)
 
 The byte alphabet mirrors what a terminal actually delivers, so a recorded macro is also legible when pasted:
 
@@ -65,34 +63,45 @@ The byte alphabet mirrors what a terminal actually delivers, so a recorded macro
 | `Tab`                   | `0x09`           |
 | `Backspace`             | `0x7f`           |
 | `Ctrl`-`a`..`z`         | `0x01`..`0x1a`   |
+| arrows, Home/End, PageUp/PageDown, Delete, Insert, BackTab | `0x80` + a tag byte |
 
 `decode` is **tolerant**: an unrecognized byte is skipped (never a panic), so a hand-edited or partial register
-still runs as far as it can. Arrows, Fn, Alt, and Shift-specials are **deferred** (PR C): they will encode to a
-reserved multi-byte escape that current `decode` already skips, so extending the alphabet stays
-backward-compatible.
+still runs as far as it can. `0x80` is an invalid UTF-8 lead, so an unknown tag is skipped too and the alphabet
+stays backward-compatible. Fn, Alt, and Shift-specials have no encoding yet (#812).
 
 ## 4. Frontend flow (session)
 
-All recording/replay lives in the session key loop (`apps/tui/src/app/session.rs`), mirroring the existing
-`pending_z` / `pending_window` prefix intercepts and adding one queue:
+The state machine is `keys::MacroState` (`apps/tui/src/keys.rs`), so the record→stop→replay cycle is unit-testable
+off the terminal. The session key loop (`apps/tui/src/app/session.rs`) calls it for every key and keeps the
+register I/O, which lives in the core `Workspace`:
 
-- **State:** `recording: Option<(char, Vec<KeyEvent>)>`, `replay_queue: VecDeque<KeyEvent>`.
-- **Read step:** if `replay_queue` is non-empty, pop from it (source = *replay*), else `event::read()` (source =
+- **State:** the recording buffer (`Option<(char, Vec<KeyEvent>)>`), the `q`/`@` prefix flags, the replay queue,
+  the last played and last recorded registers, and the recursion budget.
+- **Read step:** if the replay queue is non-empty, pop from it (source = *replay*), else `event::read()` (source =
   *typed*). Only **typed** keys are appended to a live recording — Vim records `@x` literally, not its
   expansion.
 - **`q` (Normal, not in cmdline/insert):** not recording ⇒ arm a `pending_q` prefix; the next key `a`–`z`
-  starts recording into that register. `q` again while recording ⇒ stop: `encode` the buffer and
-  `set_register_raw`.
+  starts recording into that register, and `A`–`Z` appends to it on stop. `q` again while recording ⇒ stop:
+  `encode` the buffer and `set_register_raw`. `q:`, `q/` and `q?` open the command-line window instead.
 - **`@` (Normal):** arm `pending_at`; the next key `a`–`z` reads that register, `decode`s it, and pushes the
-  keys onto `replay_queue`.
-- **Recursion guard:** a cap on total replayed keys per top-level `@` (e.g. 100k) so a self-invoking macro
-  terminates with a status line instead of hanging.
+  keys onto the replay queue. `{count}@{reg}` repeats, `@@` replays the last register, `@:` re-drives the last
+  Ex line, and `Q` replays the last recorded register. The prefix keys match an unchorded key with SHIFT
+  allowed, since a terminal reports `Q` as SHIFT+`Q` (#681); a chord is never a register name.
+- **Recursion guard:** a cap of 100,000 replayed keys for everything one TYPED key expands to (its `@`, the
+  `@`s and `:normal`s that replay reaches), so a self-invoking macro terminates with a status line instead of
+  hanging. The budget is reseeded only by a typed key, never by the queue running dry: a body whose length
+  divides the cap empties the queue exactly as the budget runs out, and reseeding there looped forever
+  (#787).
+- **Interrupt:** CTRL-C (`C-g` under Emacs) stops a replay between two keys, as nvim's `got_int` does: the
+  session polls the terminal while replay keys remain (`breakcheck.rs` →
+  `ruse_core::interrupt`), drops the keys still queued, closes the replay's undo step, and shows
+  `Interrupted`. The CTRL-C itself is then read as a key (nvim's `process_ctrl_c`), so an interrupted Insert
+  ends. While a replay runs the screen repaints at most every 100 ms, not once per key.
 
 ## 5. Scope
 
-**Slice 1 (D-055 + this doc + PR B impl):** `q{a-z}`/`q`, `@{a-z}`, the codec above, the core accessor, the
-recursion guard.
+**Shipped:** §4, the codec above, the core accessor, the recursion guard, and `:reg`/`:registers`, except for the
+open bug #787.
 
-**Deferred (PR C):** `@@` (repeat last macro), `{count}@{reg}`, `q{A-Z}` append-record, arrow/Fn/Alt keys,
-`:reg`/`:registers` display, running a macro inside `:g`, and cross-session persistence (which would promote
+**Deferred:** Fn/Alt/Shift keys (#812), running a macro inside `:g`, and cross-session persistence (which would promote
 the byte encoding to a persisted-format contract — see D-055 *Re-evaluate if*).

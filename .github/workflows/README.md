@@ -6,16 +6,20 @@ verified artifact.
 
 | Workflow | Trigger | Purpose | Required check |
 | --- | --- | --- | --- |
-| [`spec-check.yml`](spec-check.yml) | PR / push | `spec validate`, docs hygiene, toolchain unit tests, **actionlint** over these workflows | `spec-validate` |
+| [`spec-check.yml`](spec-check.yml) | PR / push | `spec validate`, docs hygiene, `gov check` (waivers, ratchet, parity corpus, perf baselines…), toolchain unit tests, **actionlint** over these workflows | `spec-validate` |
 | [`change-policy.yml`](change-policy.yml) | PR | merge gate: re-derives change kind + blast radius from the diff vs the `ruse-gate:v1` block in the PR body (`dependabot[bot]` / `renovate[bot]` are auto-declared) | `gate` |
-| [`ci.yml`](ci.yml) | PR / push | Rust: fmt · clippy `-D warnings` · test · `arch deps`; heavy steps self-skip on PRs with no Rust-relevant change. `rust-macos` (advisory) repeats clippy + test on macOS | `rust` |
+| [`ci.yml`](ci.yml) | PR / push / weekly / manual | Rust: fmt · clippy `-D warnings` · test · `arch deps`; heavy steps self-skip on PRs with no Rust-relevant change. `rust-macos` (advisory) repeats clippy + test on macOS. `rust-release` (advisory, **never on PRs** — push to `main`, weekly, `workflow_dispatch`) runs `cargo test --workspace --release`, the profile shipped binaries use (#899) | `rust` |
 | [`security.yml`](security.yml) | PR / push / weekly | `rustsec` advisory scan (PRs only when a Cargo manifest changed); CodeQL + secret scanning live in repo settings | — |
 | [`labeler.yml`](labeler.yml) | PR | path-based `area/*` labels via [`.github/labeler.yml`](../labeler.yml) | — |
+| [`labels.yml`](labels.yml) | push to `main` changing [`.github/labels.yml`](../labels.yml) / manual | applies the label file (creates, updates color/description; never deletes unlisted labels) | — |
 | [`perf.yml`](perf.yml) | nightly / manual | benches vs `spec/perf-baseline.yaml`; trend + warn only, never fails on regressions (D-019) | — |
-| [`release.yml`](release.yml) | tag `v*` | **stub** — build-once release (binaries + SHA256SUMS + SBOM + provenance) not implemented yet | — |
+| [`fuzz.yml`](fuzz.yml) | weekly / manual (**never on PRs**) | the deep tier (#920): the test suite with proptests at 16x cases (new regression lines uploaded on failure), and each cargo-fuzz target in `fuzz/` for 15 minutes on nightly (crash inputs uploaded) | — |
+| [`oracle.yml`](oracle.yml) | weekly / manual / PRs changing it or `tools/parity/install_pin.py` | the oracle recapture (#904): installs the nvim and Emacs pinned in `spec/parity/upstreams.yaml` (URL + sha256), runs each oracle's `--selftest` and `--generate`, and fails when a recaptured corpus differs from the committed one (the diff is uploaded) | — |
+| [`release.yml`](release.yml) | tag `v*` | **placeholder that fails on purpose** (#887) — build-once release (binaries + SHA256SUMS + SBOM + provenance) not implemented yet | — |
 
 Not yet as workflows (planned — see the ci-cd doc): `ci-full` (3-OS/integration/benchmarks), `compatibility`
-(parity/plugin/protocol fixtures), `nightly` (WSL/tmux/SSH matrix, fuzzing, soak, fault-injection).
+(parity/plugin/protocol fixtures), `nightly` (WSL/tmux/SSH matrix, soak, fault-injection); fuzzing runs weekly
+in `fuzz.yml`.
 
 Notes:
 - **Security (ci-cd §11):** every `uses:` is pinned by commit SHA with a `# vN` comment (Dependabot's

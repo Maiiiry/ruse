@@ -5,11 +5,15 @@
 //! the same commands on the same initial document is deterministic (see [`crate::trace`]). This is the split
 //! that captures most of a Haskell rewrite's benefit in Rust — enforced by an empty dependency set.
 
+use std::borrow::Cow;
+
+use crate::anchor::Tracked;
+use crate::cells::{Tabs, VarStops};
 use crate::command::{
     BlockInsertKind, Command, ForcedWise, MarkOp, OpKind, OpenKind, SearchOffset, SearchOp,
-    SelectKind, WordCase,
+    SelectKind, VisualOp, WordCase,
 };
-use crate::document::{Document, DocumentId};
+use crate::document::{Document, DocumentId, TxnError};
 use crate::edit::{Edit, EditList};
 use crate::effect::Effect;
 use crate::motion::{
@@ -17,6 +21,7 @@ use crate::motion::{
     prev_grapheme, snap, Motion,
 };
 use crate::pattern::RegexError;
+use crate::pos::BytePos;
 use crate::register::{Register, RegisterStore};
 use crate::transaction::{GroupHint, Transaction, TransactionOrigin};
 
@@ -71,29 +76,165 @@ pub enum IndentStyle {
 }
 
 /// One `:set` option this MVP honors, mapped onto the existing indent/search-case config. `bool` options
-/// carry their on/off value (`:set ic` = `IgnoreCase(true)`, `:set noic` = `IgnoreCase(false)`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// carry their on/off value (`:set ic` = `IgnoreCase(true)`, `:set noic` = `IgnoreCase(false)`). The string
+/// options carry their text, so the type is `Clone`, not `Copy`.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum EditorOption {
     /// `'ignorecase'` (`ic`).
     IgnoreCase(bool),
     /// `'smartcase'` (`scs`).
     SmartCase(bool),
-    /// `'shiftwidth'` (`sw`) — one indent level's width (also drives `editor.tab_width` here).
+    /// `'shiftwidth'` (`sw`) — one indent level's width (`editor.shift_width`). `0` follows `'tabstop'`
+    /// (Vim's `sw=0`).
     ShiftWidth(usize),
+    /// `'tabstop'` (`ts`) — the columns a `<Tab>` character spans (`editor.tab_width`): rendering, virtual
+    /// columns, `<Tab>` insertion stops and the tabs+spaces mix of a `noexpandtab` indent. Clamped to
+    /// `1..=`[`MAX_TABSTOP`].
+    TabStop(usize),
     /// `'expandtab'` (`et`) — indent with spaces (`true`) vs a tab (`false`).
     ExpandTab(bool),
     /// `'textwidth'` (`tw`) — the width `gq`/`gw` wrap to; `0` means use the 79-column fallback.
     TextWidth(usize),
+    /// `'softtabstop'` (`sts`) — the columns a `<Tab>` / `<BS>` in Insert counts as while editing; `0` is
+    /// off, a negative value follows the effective `'shiftwidth'` (#617).
+    SoftTabStop(i64),
+    /// `'autoindent'` (`ai`) — a line opened with `o`/`O`/`<CR>` takes the indent of the line it opens from,
+    /// and `cc`/`S` keep the line's indent (#617).
+    AutoIndent(bool),
+    /// `'smartindent'` (`si`) — C-like extra indent after `{` or a `'cinwords'` keyword, and `{`/`}`/`#`
+    /// realigned when typed first on a new line (#617).
+    SmartIndent(bool),
+    /// `'copyindent'` (`ci`) — an autoindent copies the source line's indent characters as far as they fit
+    /// (#617).
+    CopyIndent(bool),
+    /// `'preserveindent'` (`pi`) — changing a line's indent (`>>`, `<<`, `i_CTRL-T`, `i_CTRL-D`) keeps as
+    /// much of its existing indent characters as fit (#617).
+    PreserveIndent(bool),
+    /// `'smarttab'` (`sta`, Vim-global) — `<Tab>`/`<BS>` in a line's indent step by `'shiftwidth'` (#617).
+    SmartTab(bool),
+    /// `'shiftround'` (`sr`, Vim-global) — `>`/`<` round the indent to a multiple of `'shiftwidth'` (#617).
+    ShiftRound(bool),
+    /// The caret gravity the input profile installs (D-050; not a Vim option, so `:set` never makes it).
+    /// The core reads it on every edit, so a trace starts with it (RFC-0020 R4, #1134): an Emacs session
+    /// replays with point between characters.
+    CaretGravity(CaretGravity),
+    /// `'formatoptions'` (`fo`) — the flag letters that steer auto-wrap, comment leaders, `gq` and `J`
+    /// (#618). nvim's default is `tcqj`.
+    FormatOptions(String),
+    /// `'comments'` (`com`) — the comma-separated `{flags}:{string}` comment leaders (#618).
+    Comments(String),
+    /// `'commentstring'` (`cms`) — the `%s` template the `gc` comment operator wraps a line in (#618).
+    CommentString(String),
+    /// `'formatlistpat'` (`flp`) — the pattern of a numbered-list item for `'formatoptions'` `n` (#618).
+    FormatListPat(String),
+    /// `'formatprg'` (`fp`, global here) — the external program `gq` filters lines through (#618).
+    FormatPrg(String),
+    /// `'equalprg'` (`ep`, global here) — the external program `=` filters lines through (#617).
+    EqualPrg(String),
+    /// `'cinwords'` (`cinw`) — the comma-separated keywords after which `'smartindent'` indents the next
+    /// line (#617).
+    CinWords(String),
+    /// `'joinspaces'` (`js`, Vim-global) — `J` and `gq` put two spaces after a `.`, `?` or `!` (#618).
+    JoinSpaces(bool),
+    /// `'wrapmargin'` (`wm`) — with `'textwidth'` 0, wrap this many columns before the window's right edge
+    /// (#618).
+    WrapMargin(i64),
+    /// `'vartabstop'` (`vts`) — the comma-separated widths of the successive tab stops, the last one
+    /// repeating; empty is off, and then `'tabstop'` applies (#1163). An invalid list is ignored.
+    VarTabStop(String),
+    /// `'varsofttabstop'` (`vsts`) — the same for the soft tab stops an Insert `<Tab>`/`<BS>` steps by;
+    /// empty is off, and then `'softtabstop'` applies (#1163).
+    VarSoftTabStop(String),
+    /// `'lisp'` — `=` and, under `'autoindent'`, `o`/`O`/`<CR>`/`cc` indent by the Lisp rules (#1163).
+    Lisp(bool),
+    /// `'lispwords'` (`lw`) — the comma-separated words whose forms `'lisp'` indents as a body (#1163).
+    LispWords(String),
+    /// `'cindent'` (`cin`) — `o`/`O`/`<CR>`, `cc`/`S` and the keys of `'cinkeys'` indent by the C rules
+    /// (`=` always does, as in nvim when no `'indentexpr'` is set, #1163).
+    CIndent(bool),
+    /// `'cinoptions'` (`cino`) — how the C indent lays out code (#1163).
+    CinOptions(String),
+    /// `'cinkeys'` (`cink`) — the keys that re-indent the line in Insert mode under `'cindent'` (#1163).
+    CinKeys(String),
+    /// `'cinscopedecls'` (`cinsd`) — the C++ scope declarations the C indent knows (#1163).
+    CinScopeDecls(String),
 }
 
-/// The indent config a shift/indent operator (`>>`/`<<`) reads: `editor.tab_width` +
-/// `editor.indent_style`. Grouped so the "config" concern is one field on [`View`], not four loose ones.
+impl EditorOption {
+    /// Whether the option is GLOBAL in Vim (`'ignorecase'`, `'smartcase'`): one value for every window,
+    /// so `:set`, `:setlocal` and `:setglobal` all write it everywhere. The others are buffer-local, and
+    /// ruse keeps their local value per View with the global copy on the Workspace.
+    #[must_use]
+    pub fn is_global(&self) -> bool {
+        // The caret gravity is the input profile's, one for the whole session (`Workspace::set_caret_gravity`).
+        matches!(
+            self,
+            EditorOption::IgnoreCase(_)
+                | EditorOption::SmartCase(_)
+                | EditorOption::SmartTab(_)
+                | EditorOption::ShiftRound(_)
+                | EditorOption::CaretGravity(_)
+                | EditorOption::JoinSpaces(_)
+                | EditorOption::FormatPrg(_)
+                | EditorOption::EqualPrg(_)
+        )
+    }
+}
+
+/// Whether `value` is a valid `'formatoptions'` (nvim's `FO_ALL`), else nvim's error message (#618).
+///
+/// # Errors
+/// `E539: Illegal character <c>` for a letter no flag uses.
+pub fn check_formatoptions(value: &str) -> Result<(), OptionValueError> {
+    format::check_formatoptions(value)
+}
+
+/// Whether `value` is a valid `'comments'` (nvim's `did_set_comments`), else nvim's error message (#618).
+///
+/// # Errors
+/// `E539` for a bad flag, `E524` for a part without `:`, `E525` for an empty leader.
+pub fn check_comments(value: &str) -> Result<(), OptionValueError> {
+    format::check_comments(value)
+}
+
+/// The largest value a number option holds (nvim's C `int`).
+pub const MAX_OPTION_INT: usize = i32::MAX as usize;
+
+/// The largest `'tabstop'` (nvim's `TABSTOP_MAX`).
+pub const MAX_TABSTOP: usize = 9999;
+
+/// The indent config a shift/indent operator (`>>`/`<<`) reads: `editor.tab_width` (`'tabstop'`),
+/// `editor.shift_width` (`'shiftwidth'`) and `editor.indent_style` (`'expandtab'`). Grouped so the "config"
+/// concern is one field on [`View`], not four loose ones.
 #[derive(Clone, Copy)]
 struct IndentConfig {
-    /// `editor.tab_width` — one indent level's width in columns/spaces. Schema default 4.
+    /// `editor.tab_width` / `'tabstop'` — the columns one `\t` spans. Schema default 4. Always `>= 1`.
     tab_width: usize,
+    /// `editor.shift_width` / `'shiftwidth'` — one indent level's width in columns. `0` follows
+    /// [`IndentConfig::tab_width`], as Vim's `sw=0` does. Schema default 4.
+    shift_width: usize,
     /// `editor.indent_style` — whether an indent level is spaces or a tab. Schema default `space`.
     style: IndentStyle,
+    /// `'softtabstop'`: `0` off, negative follows the effective shiftwidth (`editor.softtabstop`).
+    soft_tab: i64,
+    /// `'vartabstop'` (`vts`): the widths of the successive tab stops; wins over `tab_width` when set
+    /// (#1163).
+    vts: VarStops,
+    /// `'varsofttabstop'` (`vsts`): the widths of the successive soft tab stops; wins over `soft_tab`
+    /// when set (#1163).
+    vsts: VarStops,
+    /// `'autoindent'` (`editor.autoindent`, default on as in nvim).
+    autoindent: bool,
+    /// `'smartindent'` (`editor.smartindent`).
+    smartindent: bool,
+    /// `'copyindent'` (`editor.copyindent`).
+    copyindent: bool,
+    /// `'preserveindent'` (`editor.preserveindent`).
+    preserveindent: bool,
+    /// `'smarttab'` (`editor.smarttab`, default on as in nvim). Vim-global.
+    smarttab: bool,
+    /// `'shiftround'` (`editor.shiftround`). Vim-global.
+    shiftround: bool,
 }
 
 /// The search-case config: `'ignorecase'` and `'smartcase'` (F-009). Default off — the factory Vim
@@ -102,6 +243,239 @@ struct IndentConfig {
 struct SearchCase {
     ignore: bool,
     smart: bool,
+}
+
+/// The text-formatting options (#618): `'formatoptions'`, `'comments'`, `'commentstring'`,
+/// `'formatlistpat'`, `'formatprg'`, `'joinspaces'` and `'wrapmargin'`. The strings borrow nvim's defaults
+/// until a `:set` replaces them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct FormatConfig {
+    pub(crate) options: Cow<'static, str>,
+    pub(crate) comments: Cow<'static, str>,
+    pub(crate) commentstring: Cow<'static, str>,
+    pub(crate) listpat: Cow<'static, str>,
+    pub(crate) prg: Cow<'static, str>,
+    pub(crate) equalprg: Cow<'static, str>,
+    pub(crate) cinwords: Cow<'static, str>,
+    pub(crate) lisp: bool,
+    pub(crate) lispwords: Cow<'static, str>,
+    pub(crate) cindent: bool,
+    pub(crate) cinoptions: Cow<'static, str>,
+    pub(crate) cinkeys: Cow<'static, str>,
+    pub(crate) cinscopedecls: Cow<'static, str>,
+    pub(crate) joinspaces: bool,
+    pub(crate) wrapmargin: i64,
+}
+
+impl FormatConfig {
+    /// Whether `'formatoptions'` holds flag `c`.
+    pub(crate) fn has(&self, c: char) -> bool {
+        self.options.contains(c)
+    }
+}
+
+/// The option values a [`View`] carries (indent, `'textwidth'`, formatting, search case, caret gravity),
+/// grouped so the Workspace can keep the GLOBAL values Vim's `:set` also writes and hand them to every View
+/// it creates (`:enew`, `:e`, `:bd`'s replacement), as Vim copies global options into a new buffer (#754).
+#[derive(Clone)]
+pub(crate) struct ViewOptions {
+    indent: IndentConfig,
+    text_width: usize,
+    format: FormatConfig,
+    search_case: SearchCase,
+    caret: CaretGravity,
+}
+
+impl ViewOptions {
+    /// Vim's factory values (`spec/config-schema.yaml` for the indent: `editor.tab_width=4`,
+    /// `editor.indent_style=space`), on-character caret.
+    pub(crate) const DEFAULT: ViewOptions = ViewOptions {
+        indent: IndentConfig {
+            tab_width: 4,
+            shift_width: 4,
+            style: IndentStyle::Space,
+            soft_tab: 0,
+            vts: VarStops::NONE,
+            vsts: VarStops::NONE,
+            autoindent: true,
+            smartindent: false,
+            copyindent: false,
+            preserveindent: false,
+            smarttab: true,
+            shiftround: false,
+        },
+        text_width: 0,
+        format: FormatConfig {
+            options: Cow::Borrowed("tcqj"),
+            comments: Cow::Borrowed(format::DEFAULT_COMMENTS),
+            commentstring: Cow::Borrowed(""),
+            listpat: Cow::Borrowed(format::DEFAULT_LISTPAT),
+            prg: Cow::Borrowed(""),
+            equalprg: Cow::Borrowed(""),
+            cinwords: Cow::Borrowed(indent::DEFAULT_CINWORDS),
+            lisp: false,
+            lispwords: Cow::Borrowed(lisp::DEFAULT_LISPWORDS),
+            cindent: false,
+            cinoptions: Cow::Borrowed(""),
+            cinkeys: Cow::Borrowed(cindent::DEFAULT_CINKEYS),
+            cinscopedecls: Cow::Borrowed(cindent::DEFAULT_CINSCOPEDECLS),
+            joinspaces: false,
+            wrapmargin: 0,
+        },
+        search_case: SearchCase {
+            ignore: false,
+            smart: false,
+        },
+        caret: CaretGravity::OnChar,
+    };
+
+    /// Set one `:set` option, clamped as [`EditorState::set_option`] documents.
+    pub(crate) fn set(&mut self, opt: EditorOption) {
+        match opt {
+            EditorOption::IgnoreCase(v) => self.search_case.ignore = v,
+            EditorOption::SmartCase(v) => self.search_case.smart = v,
+            // Clamped to nvim's bounds (a C `int`; `'tabstop'` 1..=9999), so an API caller cannot make
+            // `>>` or a `<Tab>` allocate without limit (#684); `:set` rejects a value past them first.
+            EditorOption::ShiftWidth(n) => self.indent.shift_width = n.min(MAX_OPTION_INT),
+            EditorOption::TabStop(n) => self.indent.tab_width = n.clamp(1, MAX_TABSTOP),
+            EditorOption::ExpandTab(v) => {
+                self.indent.style = if v {
+                    IndentStyle::Space
+                } else {
+                    IndentStyle::Tab
+                }
+            }
+            EditorOption::TextWidth(n) => self.text_width = n.min(MAX_OPTION_INT),
+            EditorOption::VarTabStop(v) => {
+                if let Some(v) = VarStops::parse(&v) {
+                    self.indent.vts = v;
+                }
+            }
+            EditorOption::VarSoftTabStop(v) => {
+                if let Some(v) = VarStops::parse(&v) {
+                    self.indent.vsts = v;
+                }
+            }
+            EditorOption::SoftTabStop(n) => {
+                self.indent.soft_tab = n.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+            }
+            EditorOption::AutoIndent(v) => self.indent.autoindent = v,
+            EditorOption::SmartIndent(v) => self.indent.smartindent = v,
+            EditorOption::CopyIndent(v) => self.indent.copyindent = v,
+            EditorOption::PreserveIndent(v) => self.indent.preserveindent = v,
+            EditorOption::SmartTab(v) => self.indent.smarttab = v,
+            EditorOption::ShiftRound(v) => self.indent.shiftround = v,
+            EditorOption::CaretGravity(g) => self.caret = g,
+            EditorOption::FormatOptions(v) => self.format.options = Cow::Owned(v),
+            EditorOption::Comments(v) => self.format.comments = Cow::Owned(v),
+            EditorOption::CommentString(v) => self.format.commentstring = Cow::Owned(v),
+            EditorOption::FormatListPat(v) => self.format.listpat = Cow::Owned(v),
+            EditorOption::FormatPrg(v) => self.format.prg = Cow::Owned(v),
+            EditorOption::EqualPrg(v) => self.format.equalprg = Cow::Owned(v),
+            EditorOption::CinWords(v) => self.format.cinwords = Cow::Owned(v),
+            EditorOption::JoinSpaces(v) => self.format.joinspaces = v,
+            EditorOption::Lisp(v) => self.format.lisp = v,
+            EditorOption::LispWords(v) => self.format.lispwords = Cow::Owned(v),
+            EditorOption::CIndent(v) => self.format.cindent = v,
+            EditorOption::CinOptions(v) => self.format.cinoptions = Cow::Owned(v),
+            EditorOption::CinKeys(v) => self.format.cinkeys = Cow::Owned(v),
+            EditorOption::CinScopeDecls(v) => self.format.cinscopedecls = Cow::Owned(v),
+            EditorOption::WrapMargin(n) => {
+                self.format.wrapmargin = n.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+            }
+        }
+    }
+
+    /// These values as the `:set`s that would install them (`ic`, `scs`, `ts`, `sw`, `et`, `tw`; `sw` is
+    /// the raw value, `0` follows `ts`), then the caret gravity.
+    pub(crate) fn editing_options(&self) -> Vec<EditorOption> {
+        vec![
+            EditorOption::IgnoreCase(self.search_case.ignore),
+            EditorOption::SmartCase(self.search_case.smart),
+            EditorOption::TabStop(self.indent.tab_width),
+            EditorOption::ShiftWidth(self.indent.shift_width),
+            EditorOption::ExpandTab(self.indent.style == IndentStyle::Space),
+            EditorOption::TextWidth(self.text_width),
+            EditorOption::SoftTabStop(self.indent.soft_tab),
+            EditorOption::VarTabStop(stops_text(&self.indent.vts)),
+            EditorOption::VarSoftTabStop(stops_text(&self.indent.vsts)),
+            EditorOption::AutoIndent(self.indent.autoindent),
+            EditorOption::SmartIndent(self.indent.smartindent),
+            EditorOption::CopyIndent(self.indent.copyindent),
+            EditorOption::PreserveIndent(self.indent.preserveindent),
+            EditorOption::SmartTab(self.indent.smarttab),
+            EditorOption::ShiftRound(self.indent.shiftround),
+            EditorOption::CaretGravity(self.caret),
+            EditorOption::FormatOptions(self.format.options.to_string()),
+            EditorOption::Comments(self.format.comments.to_string()),
+            EditorOption::CommentString(self.format.commentstring.to_string()),
+            EditorOption::FormatListPat(self.format.listpat.to_string()),
+            EditorOption::FormatPrg(self.format.prg.to_string()),
+            EditorOption::EqualPrg(self.format.equalprg.to_string()),
+            EditorOption::CinWords(self.format.cinwords.to_string()),
+            EditorOption::JoinSpaces(self.format.joinspaces),
+            EditorOption::WrapMargin(self.format.wrapmargin),
+            EditorOption::Lisp(self.format.lisp),
+            EditorOption::LispWords(self.format.lispwords.to_string()),
+            EditorOption::CIndent(self.format.cindent),
+            EditorOption::CinOptions(self.format.cinoptions.to_string()),
+            EditorOption::CinKeys(self.format.cinkeys.to_string()),
+            EditorOption::CinScopeDecls(self.format.cinscopedecls.to_string()),
+        ]
+    }
+
+    /// Set the tabstop AND the shiftwidth to `tab_width`, and the indent style ([`EditorState::set_indent`]).
+    pub(crate) fn set_indent(&mut self, tab_width: usize, style: IndentStyle) {
+        let tab_width = tab_width.clamp(1, MAX_TABSTOP);
+        self.indent = IndentConfig {
+            tab_width,
+            shift_width: tab_width,
+            style,
+            ..self.indent
+        };
+    }
+
+    /// Set `'ignorecase'` and `'smartcase'`.
+    pub(crate) fn set_search_case(&mut self, ignore: bool, smart: bool) {
+        self.search_case = SearchCase { ignore, smart };
+    }
+
+    /// Set the caret gravity (D-050).
+    pub(crate) fn set_caret(&mut self, caret: CaretGravity) {
+        self.caret = caret;
+    }
+}
+
+/// A stop list as its option value: the widths joined by `,`, empty when unset.
+pub(crate) fn stops_text(v: &VarStops) -> String {
+    let parts: Vec<String> = v.stops().iter().map(u16::to_string).collect();
+    parts.join(",")
+}
+
+impl IndentConfig {
+    /// The effective shiftwidth: `shift_width`, or when it is `0` the tabstop (Vim's `sw=0`), under
+    /// `'vartabstop'` its first stop (nvim's `get_sw_value`, #1163).
+    fn shift_width(self) -> usize {
+        if self.shift_width == 0 {
+            self.tabs().interval_width(0, false)
+        } else {
+            self.shift_width
+        }
+    }
+
+    /// The tab stops (`'tabstop'`, `'vartabstop'`) this config lays a line out with (#1163).
+    pub(crate) fn tabs(self) -> Tabs {
+        Tabs::new(self.tab_width, self.vts)
+    }
+
+    /// The leading whitespace that spans `cols` columns in this style: `cols` spaces (`expandtab`), else as
+    /// many `\t` as fit at the tab stops plus a spaces remainder (Vim's `noexpandtab` indent).
+    fn whitespace(self, cols: usize) -> Vec<u8> {
+        match self.style {
+            IndentStyle::Space => vec![b' '; cols],
+            IndentStyle::Tab => self.tabs().fill(cols),
+        }
+    }
 }
 
 impl Mode {
@@ -135,6 +509,63 @@ pub enum CaretGravity {
     BetweenChar,
 }
 
+/// The wanted column (Vim `curswant`), measured only when something reads it (#1231). Most commands
+/// reset the column to the cursor's, but only vertical moves, block selections and a few edits ever read
+/// it, and measuring walks the line from its start: on a multi-megabyte line that walk dominated every
+/// keypress. As nvim (`w_set_curswant`), the column is set to "where the cursor is now" and measured on
+/// first read. The pending form keeps what the measure reads (the buffer version, cursor, `'tabstop'` and
+/// the tab-end rule), so it gives the value the eager measure would have given, whatever happens to the
+/// buffer or the View before the read. Holding the buffer version is a refcount on the document's
+/// `Arc`; it keeps at most one older version alive until the next command replaces the column.
+#[derive(Clone)]
+pub(crate) struct Want(WantKind);
+
+#[derive(Clone)]
+enum WantKind {
+    /// A known column ([`range::MAXCOL`] after `$`).
+    Col(usize),
+    /// The column of `pos` in `text`, measured once on first read.
+    At {
+        text: std::sync::Arc<Vec<u8>>,
+        pos: usize,
+        ts: Tabs,
+        tab_end: bool,
+        col: std::sync::OnceLock<usize>,
+    },
+}
+
+impl Want {
+    pub(crate) const fn col(c: usize) -> Self {
+        Want(WantKind::Col(c))
+    }
+
+    /// The column: measured now when pending ([`range::wanted_vcol`]), then remembered.
+    pub(crate) fn get(&self) -> usize {
+        match &self.0 {
+            WantKind::Col(c) => *c,
+            WantKind::At {
+                text,
+                pos,
+                ts,
+                tab_end,
+                col,
+            } => *col.get_or_init(|| range::wanted_vcol(text, *pos, *ts, *tab_end)),
+        }
+    }
+}
+
+/// `curswant == MAXCOL` and friends. A pending column is a measured position, never [`range::MAXCOL`], so
+/// that test does not measure.
+impl PartialEq<usize> for Want {
+    fn eq(&self, other: &usize) -> bool {
+        match &self.0 {
+            WantKind::Col(c) => c == other,
+            WantKind::At { .. } if *other == range::MAXCOL => false,
+            WantKind::At { .. } => self.get() == *other,
+        }
+    }
+}
+
 /// Editor state over one document: the buffer, a byte cursor (always on a char boundary), and the mode.
 /// View-local state lives here for the headless spine; a real multi-view split comes later (INV-DOC-VIEW).
 /// A **View**: the per-view state over a shared [`Document`] (F-007 Buffer/View split). Cursor,
@@ -151,6 +582,24 @@ pub struct View {
     /// First visible buffer row — this View's scroll position. View-local so two Views of one buffer
     /// scroll independently (F-007 acceptance #1). Maintained by the frontend viewport pass.
     top: usize,
+    /// Vim's window-local 'scroll' (the `CTRL-D`/`CTRL-U` amount) as `(lines, height)`: a count given to
+    /// `CTRL-D`/`CTRL-U` sets it, and it holds only while the window keeps the height it was set at (Vim
+    /// recomputes 'scroll' as half the height on a resize). `None` = half the window height. Frontend-owned,
+    /// like `top`.
+    scroll: Option<(usize, usize)>,
+    /// This window's own `'scrolloff'` (#1151), or `None` to use the global value (nvim's local `-1`).
+    /// Frontend-owned, like `top`: the viewport pass reads it, and a split copies it with the View.
+    scrolloff: Option<i64>,
+    /// The first displayed screen column when `'wrap'` is off (nvim's `w_leftcol`). Frontend-owned, like
+    /// `top`: the viewport pass and `zh`/`zl`/`zs`/`ze` set it (#615).
+    leftcol: usize,
+    /// The virtual columns of the top line scrolled out of the window (nvim's `w_skipcol`):
+    /// `'smoothscroll'` scrolling, or a cursor line taller than the window. Frontend-owned, like `top`
+    /// (#615).
+    skipcol: usize,
+    /// nvim's window-local display options (#615, #616). The core only stores them: the frontend lays
+    /// out with them, and a split copies them with the View.
+    window: crate::WindowOptions,
     cursor: usize,
     mode: Mode,
     /// Whether the previous command edited text — drives undo grouping: an edit right after a non-edit
@@ -198,39 +647,70 @@ pub struct View {
     /// (issued with no anchor on `.`) reads it. `None` until the first block insert; survives leaving Insert
     /// (unlike [`Self::block_insert`]) so it is available to a later `.`. See [`BlockGeom`].
     last_block_geom: Option<BlockGeom>,
+    /// The amount of text the last Visual-selection operator covered, for its dot-repeat (#794). See
+    /// [`VisualOpGeom`]; set and read by [`prepare_selection_op`].
+    last_visual_op: Option<VisualOpGeom>,
     /// Whether the current Insert session opened a line with AUTO-INDENT and nothing non-blank has been
     /// typed on it since (Vim). While true, leaving Insert (`<Esc>`) on an all-whitespace line removes the
     /// auto-inserted indent so `o<Esc>` never leaves trailing whitespace. Set/cleared in [`apply_command`]
     /// (which sees the `Command`); read by the `EnterNormal` planner arm. Cleared on any non-blank insert
     /// and on every Insert entry/exit, so it never survives to a later line.
     auto_indent_pending: bool,
+    /// The `'smartindent'` rules armed on a line just opened, until the first key typed on it (#617).
+    si_state: indent::SiState,
+    /// The last character of the comment-end string a line opened inside a three-part comment may close
+    /// with (nvim's `end_comment_pending`, the `x` flag of `'comments'`): typing it first on the line
+    /// replaces the middle leader by the end one (` * /` → ` */`, #618).
+    end_comment: Option<u8>,
+    /// The indent `^ CTRL-D` deleted, which the next Insert `<CR>` gives back under `'autoindent'` (nvim's
+    /// `old_indent`, #617). `0` when there is none.
+    old_indent: usize,
+    /// Whether the character before the caret is a space typed in this Insert (nvim's `inserted_space`),
+    /// which a `'softtabstop'` `<BS>` deletes alone (#617).
+    typed_space: bool,
     /// The indent config (`editor.tab_width` + `editor.indent_style`).
     indent: IndentConfig,
     /// `'textwidth'` (`tw`): the column `gq`/`gw` wrap to; `0` = use the 79-column fallback (Vim).
     text_width: usize,
+    /// The text-formatting options (#618).
+    format: FormatConfig,
+    /// The columns of this View's text area (the window width less its gutter), set by the frontend:
+    /// `'wrapmargin'` counts from its right edge and a `gq` with neither `'textwidth'` nor `'wrapmargin'`
+    /// wraps one short of it (at most 79). 80 until the frontend says otherwise (a headless nvim's width).
+    text_cols: usize,
     /// The STICKY desired column (Vim `curswant`): the char column `j`/`k` aim for, preserved across shorter
     /// interior lines rather than collapsing to the short line's end. Maintained in [`apply_command`] — kept
     /// on a vertical move, set to [`MAXCOL`] by `$`/`<End>` (ride each line's end), and recomputed from the
     /// landing column after any other command. Read by the `plan` Move Up/Down arm via [`motion::vmove`].
-    curswant: usize,
+    curswant: Want,
     /// The search-case config (`'ignorecase'` + `'smartcase'`, F-009).
     search_case: SearchCase,
     /// Caret gravity (D-050): `OnChar` for Vim/Neovim (default), `BetweenChar` for the Emacs profile. Gates
     /// the Normal-mode on-character edit clamp in [`commit`] so Emacs point rests after the last char.
     caret: CaretGravity,
     /// The change list (Vim `:changes`): recent EDIT positions, oldest → newest, bounded to
-    /// [`MAX_CHANGES`]. Its last entry is the `` `. `` mark. Pushed in [`commit`] after any committing edit
-    /// (adjacent identical positions coalesce) and snapped so a later buffer-resizing edit keeps every entry
-    /// in range. Navigated by `g;` / `g,` through [`change_idx`].
+    /// [`MAX_CHANGES`]. Its last entry is the `` `. `` mark. Kept in [`commit`] after any committing edit by
+    /// Vim's rule (`changed_common`): an entry per undo step, not per keystroke — see [`View::push_change`] —
+    /// and snapped so a later buffer-resizing edit keeps every entry in range. Navigated by `g;` / `g,`
+    /// through [`change_idx`].
     changes: Vec<usize>,
+    /// Vim's `b_new_change`: an undo step began since the change list last took a new entry, so the next
+    /// change far enough from the newest entry takes one (#722).
+    new_change: bool,
     /// The current cursor into [`changes`] for `g;`/`g,`. Equals `changes.len()` (past the newest) right
     /// after an edit, so the first `g;` lands on the newest change; walks toward 0 (oldest) on `g;` and back
     /// toward the newest on `g,`. Reset to `changes.len()` whenever a new change is pushed.
     change_idx: usize,
-    /// The per-buffer named marks `a`–`z` (Vim `m{a-z}` / `` `{a-z} ``), indexed by `c - 'a'`. `None` = unset.
-    /// Set by [`Command::SetNamedMark`], read by [`Command::GotoNamedMark`], and snapped on every commit like
-    /// the change list. Uppercase/global marks and numbered marks stay deferred.
-    named_marks: [Option<usize>; 26],
+    /// The named marks `a`–`z`, `A`–`Z`, then `0`–`9` (Vim `m{a-zA-Z}` / `` `{a-zA-Z0-9} ``), indexed by
+    /// [`mark_slot`]. `None` = unset. Set by [`Command::SetNamedMark`] (a numbered mark only by `:mark`,
+    /// #1241), read by [`Command::GotoNamedMark`], and snapped on every commit like the change list. An
+    /// uppercase or numbered (file) mark is kept with this view's buffer: a jump to one set in another
+    /// buffer is deferred (#1088), and the numbered marks are not filled from a shada file.
+    named_marks: [Option<usize>; 62],
+    /// The one end of the last Visual area that is set (`'<'`, its start, or `'>'`, its end) when `:mark <`
+    /// or `:mark >` made it with no Visual area before (#1241). Vim's other end is then unset: both `<` and
+    /// `>` read the one that is (so [`View::last_visual`] holds it twice), but `gv` has nothing to reselect.
+    visual_one_end: Option<char>,
     /// Where Insert mode was last left (Vim's `` `^ `` mark), for `gi` to resume Insert there. Set in
     /// [`commit`] on an Insert→Normal transition to the pre-clamp caret, and snapped like the marks. `None`
     /// until the first Insert session ends.
@@ -249,17 +729,46 @@ pub struct View {
     /// Combined with the caret when the session is left, it bounds the inserted run for `[`/`]`. `None`
     /// outside a session. Snapped like the marks so a buffer-resizing edit under it stays valid.
     insert_start: Option<usize>,
+    /// Vim's `Insstart` column (char column) for `i_CTRL-G_j`/`k`: where the current insert run started —
+    /// the caret at Insert entry, or where an edit next happened after a caret jump inside Insert
+    /// (`insert_jumped`). Maintained in [`apply_command`].
+    insert_col: usize,
+    /// Vim's `Insstart_orig` as a byte offset, for `i_CTRL-U`: where the Insert session began (a caret key
+    /// inside it does not move it), lowered when a delete reaches before it. Maintained with
+    /// [`View::insert_col`].
+    insstart: Option<usize>,
+    /// The line number the Insert session began on and that line's width in cells then (nvim's
+    /// `Insstart.lnum` and `Insstart_textlen`), for `'formatoptions'` `l` (#618).
+    insstart_line: Option<(usize, usize)>,
+    /// A caret jump (a cursor key, `CTRL-G j`, …) happened in Insert since the last edit, so the next edit
+    /// restarts `insert_col` there.
+    insert_jumped: bool,
     /// The jumplist (Vim): the cursor positions BEFORE each jump (search / `G` / `%` / a mark / paragraph),
     /// oldest → newest, bounded to [`MAX_CHANGES`]. Navigated by `CTRL-O` (older) / `CTRL-I` (newer) through
     /// [`jump_idx`]; recorded in [`apply_command`] and snapped every commit like the marks.
     jumps: Vec<usize>,
+    /// `:keepjumps` (#609): while set, [`View::push_jump`] and [`View::push_change`] record nothing.
+    pub(crate) keep_jumps: bool,
     /// The current cursor into [`jumps`] for `CTRL-O`/`CTRL-I`. Equals `jumps.len()` (past the newest) until
     /// the first `CTRL-O`, which saves the current position so `CTRL-I` can return, then walks the list.
     jump_idx: usize,
 }
 
+/// The [`View::named_marks`] slot of mark `c`: `a`–`z` are 0–25, `A`–`Z` 26–51, `0`–`9` 52–61.
+fn mark_slot(c: char) -> Option<usize> {
+    match c {
+        'a'..='z' => Some(c as usize - 'a' as usize),
+        'A'..='Z' => Some(26 + c as usize - 'A' as usize),
+        '0'..='9' => Some(52 + c as usize - '0' as usize),
+        _ => None,
+    }
+}
+
 /// Maximum entries kept in a View's change list (Vim's default `:changes` history is ~100).
 const MAX_CHANGES: usize = 100;
+
+/// The fixed-position entries of [`View::tracked`], before the change list and the jumplist.
+const TRACKED_FIXED: usize = 67;
 
 /// The editor over a single [`Document`] and its [`View`] — the top-level headless handle the TUI and
 /// tests drive. F-007's Workspace will own many `(Document, View)` pairs referenced by handle; today
@@ -268,9 +777,171 @@ const MAX_CHANGES: usize = 100;
 pub struct EditorState {
     pub doc: Document,
     view: View,
+    /// Who causes the edits this state makes (INV-ORIGIN): [`TransactionOrigin::UserInput`] unless the
+    /// Workspace lends it under another origin, as for a macro replay ([`Workspace::set_origin`], #880).
+    ///
+    /// [`Workspace::set_origin`]: crate::Workspace::set_origin
+    origin: TransactionOrigin,
 }
 
 impl View {
+    /// Clamp and snap every stored offset (change list, marks, `gi`, `gv`, `[`/`]`, jumps) into `bytes`, so an
+    /// edit that shrank the buffer or split a character under one can never make a later jump slice out of
+    /// bounds or inside a UTF-8 sequence.
+    pub(crate) fn snap_offsets(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        for c in self.changes.iter_mut() {
+            *c = snap(bytes, (*c).min(len));
+        }
+        // Named marks (`m{a-z}`) snap into range too, so an edit that shrank the buffer under a mark can never
+        // make a later `` `{a-z} `` jump out of bounds.
+        for m in self.named_marks.iter_mut().flatten() {
+            *m = snap(bytes, (*m).min(len));
+        }
+        // The last-insert position (`gi`) snaps the same way.
+        if let Some(li) = self.last_insert {
+            self.last_insert = Some(snap(bytes, li.min(len)));
+        }
+        // The last-visual store (behind `gv` and the `<`/`>` marks) snaps both ends into range so an edit that
+        // shrank the buffer under a remembered selection can never make a later `gv`/`` `< ``/`` `> `` slice out
+        // of bounds. (Vim keeps the raw columns; snapping only clamps out-of-buffer offsets, never in-range ones.)
+        if let Some((a, e, kind)) = self.last_visual {
+            self.last_visual = Some((snap(bytes, a.min(len)), snap(bytes, e.min(len)), kind));
+        }
+        // The `[`/`]` change marks, an in-flight Insert-session start, the Visual anchor and the Emacs mark
+        // snap into range too.
+        for p in [
+            &mut self.anchor,
+            &mut self.mark,
+            &mut self.change_start,
+            &mut self.change_end,
+            &mut self.insert_start,
+            &mut self.insstart,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *p = snap(bytes, (*p).min(len));
+        }
+        // Jumplist entries snap into range too (a buffer-resizing edit under a jump keeps it valid).
+        for j in self.jumps.iter_mut() {
+            *j = snap(bytes, (*j).min(len));
+        }
+    }
+
+    /// Every long-lived position this View keeps, for its Document to carry through a change as nvim's
+    /// `mark_adjust` does (#686), in the order [`View::untrack`] reads back: `a`–`z` (dropped with their
+    /// line, restored by undo), the last Visual area (restored by undo), `A`–`Z`, `` `^ `` (dropped), `[`
+    /// and `]`, `0`–`9` (kept, as file marks are), then the change list and the jumplist. The cursor is the command's to place, so it is not
+    /// here; the Emacs mark stays a snapped offset (a byte anchor moved it off Emacs's in-place casing).
+    pub(crate) fn tracked(&self) -> Vec<Tracked> {
+        use crate::anchor::{LineGravity::Drop, LineGravity::Keep};
+        let mut t = Vec::with_capacity(TRACKED_FIXED + self.changes.len() + self.jumps.len());
+        t.extend(
+            self.named_marks[..26]
+                .iter()
+                .map(|&m| Tracked::line(m.map(BytePos), Drop).restored()),
+        );
+        let (va, ve) = self
+            .last_visual
+            .map_or((None, None), |(a, e, _)| (Some(a), Some(e)));
+        t.push(Tracked::line(va.map(BytePos), Keep).restored());
+        t.push(Tracked::line(ve.map(BytePos), Keep).restored());
+        t.extend(
+            self.named_marks[26..52]
+                .iter()
+                .map(|&m| Tracked::line(m.map(BytePos), Keep)),
+        );
+        t.push(Tracked::line(self.last_insert.map(BytePos), Drop));
+        t.push(Tracked::line(self.change_start.map(BytePos), Keep));
+        t.push(Tracked::line(self.change_end.map(BytePos), Keep));
+        t.extend(
+            self.named_marks[52..]
+                .iter()
+                .map(|&m| Tracked::line(m.map(BytePos), Keep)),
+        );
+        debug_assert_eq!(t.len(), TRACKED_FIXED);
+        t.extend(
+            self.changes
+                .iter()
+                .map(|&p| Tracked::line(Some(BytePos(p)), Keep)),
+        );
+        t.extend(
+            self.jumps
+                .iter()
+                .map(|&p| Tracked::line(Some(BytePos(p)), Keep)),
+        );
+        t
+    }
+
+    /// Take back the positions [`View::tracked`] gave out, as the Document left them.
+    pub(crate) fn untrack(&mut self, t: &[Tracked]) {
+        let pos = |i: usize| t.get(i).and_then(|t| t.pos).map(|p| p.0);
+        for i in 0..26 {
+            self.named_marks[i] = pos(i);
+        }
+        if let (Some((_, _, kind)), Some(a), Some(e)) = (self.last_visual, pos(26), pos(27)) {
+            self.last_visual = Some((a, e, kind));
+        }
+        for i in 26..52 {
+            self.named_marks[i] = pos(i + 2);
+        }
+        self.last_insert = pos(54);
+        self.change_start = pos(55);
+        self.change_end = pos(56);
+        for i in 52..62 {
+            self.named_marks[i] = pos(i + 5);
+        }
+        let n = self.changes.len();
+        for (i, c) in self.changes.iter_mut().enumerate() {
+            *c = pos(TRACKED_FIXED + i).unwrap_or(0);
+        }
+        for (i, j) in self.jumps.iter_mut().enumerate() {
+            *j = pos(TRACKED_FIXED + n + i).unwrap_or(0);
+        }
+    }
+
+    /// The invariant walker for one view over `bytes` (#906): the cursor and every stored position (marks,
+    /// change list, jumplist, `[`/`]`, `gi`, `gv`, the Visual anchor, the Emacs mark) lie inside the text
+    /// and on a char boundary of valid UTF-8, and the change and jump cursors stay within their lists.
+    /// Panics on the first broken rule; for property and fuzz tests.
+    pub fn assert_invariants(&self, bytes: &[u8]) {
+        let len = bytes.len();
+        let utf8 = std::str::from_utf8(bytes).ok();
+        let check = |what: &str, p: usize| {
+            assert!(p <= len, "{what} at {p}, past the end {len}");
+            if let Some(s) = utf8 {
+                assert!(s.is_char_boundary(p), "{what} at {p} splits a character");
+            }
+        };
+        check("the cursor", self.cursor);
+        for (i, t) in self.tracked().iter().enumerate() {
+            if let Some(p) = t.pos {
+                check(&format!("tracked position {i}"), p.0);
+            }
+        }
+        for (what, p) in [
+            ("the Visual anchor", self.anchor),
+            ("the Emacs mark", self.mark),
+            ("the Insert start", self.insert_start),
+            ("Insstart", self.insstart),
+        ] {
+            if let Some(p) = p {
+                check(what, p);
+            }
+        }
+        assert!(self.changes.len() <= MAX_CHANGES, "change list overflow");
+        assert!(self.jumps.len() <= MAX_CHANGES, "jumplist overflow");
+        assert!(
+            self.change_idx <= self.changes.len(),
+            "change cursor past the list"
+        );
+        assert!(
+            self.jump_idx <= self.jumps.len(),
+            "jump cursor past the list"
+        );
+    }
+
     /// A fresh view over `doc`: cursor at the start, Normal mode, empty registers/sessions. Config
     /// fields hold the schema defaults (spec/config-schema.yaml: editor.tab_width=4,
     /// editor.indent_style=space); runtime config wiring is deferred (as with editor.scrolloff).
@@ -278,6 +949,11 @@ impl View {
         View {
             doc,
             top: 0,
+            scroll: None,
+            scrolloff: None,
+            leftcol: 0,
+            skipcol: 0,
+            window: crate::WindowOptions::default(),
             cursor: 0,
             mode: Mode::Normal,
             last_was_edit: false,
@@ -290,25 +966,33 @@ impl View {
             replace_stack: Vec::new(),
             block_insert: None,
             last_block_geom: None,
+            last_visual_op: None,
             auto_indent_pending: false,
-            indent: IndentConfig {
-                tab_width: 4,
-                style: IndentStyle::Space,
-            },
-            text_width: 0,
-            curswant: 0,
-            search_case: SearchCase {
-                ignore: false,
-                smart: false,
-            },
-            caret: CaretGravity::OnChar,
+            si_state: indent::SiState::default(),
+            typed_space: false,
+            old_indent: 0,
+            end_comment: None,
+            indent: ViewOptions::DEFAULT.indent,
+            text_width: ViewOptions::DEFAULT.text_width,
+            format: ViewOptions::DEFAULT.format,
+            text_cols: 80,
+            curswant: Want::col(0),
+            keep_jumps: false,
+            search_case: ViewOptions::DEFAULT.search_case,
+            caret: ViewOptions::DEFAULT.caret,
             changes: Vec::new(),
+            new_change: false,
             change_idx: 0,
-            named_marks: [None; 26],
+            named_marks: [None; 62],
+            visual_one_end: None,
             last_insert: None,
             change_start: None,
             change_end: None,
             insert_start: None,
+            insert_col: 0,
+            insstart: None,
+            insstart_line: None,
+            insert_jumped: false,
             jumps: Vec::new(),
             jump_idx: 0,
         }
@@ -319,62 +1003,147 @@ impl View {
         self.last_insert
     }
 
-    /// The byte offset of named mark `c` (`a`–`z`), or `None` if unset / not a lowercase letter.
-    fn named_mark(&self, c: char) -> Option<usize> {
-        let i = (c as usize).checked_sub('a' as usize)?;
-        self.named_marks.get(i).copied().flatten()
+    /// The fixed end of the Visual area being made (nvim's `getpos('v')`; the cursor is the other end), or
+    /// `None` outside Visual and Select mode. The parity comparator reads it (#900).
+    #[must_use]
+    pub fn visual_anchor(&self) -> Option<BytePos> {
+        self.anchor.map(BytePos)
     }
 
-    /// Set named mark `c` (`a`–`z`) to `pos`. A non-lowercase `c` is ignored (the input layer only sends
-    /// `a`–`z`, so this is a defensive guard).
-    fn set_named_mark(&mut self, c: char, pos: usize) {
-        if let Some(i) = (c as usize).checked_sub('a' as usize) {
-            if let Some(slot) = self.named_marks.get_mut(i) {
-                *slot = Some(pos);
+    /// The byte offset of mark `c`, or `None` if unset or not a mark this resolves: a letter (`a`–`z`,
+    /// `A`–`Z`), `^` (where Insert stopped) or `<`/`>` (the last Visual area's start / end; a linewise one
+    /// from its first line's start to its last line's end). The marks a jump or an operator reads by name
+    /// (`` `^ ``, `` d`> ``, #1088).
+    #[must_use]
+    pub fn named_mark(&self, c: char) -> Option<BytePos> {
+        match c {
+            '^' => self.last_insert,
+            '<' | '>' => {
+                let (s, e, _) = self.last_visual_bounds()?;
+                return Some(if c == '<' { s } else { e });
             }
+            _ => self.named_marks[mark_slot(c)?],
         }
+        .map(BytePos)
+    }
+
+    /// Set named mark `c` (`a`–`z`, `A`–`Z`) to `pos`. Any other `c` is ignored (the input layer only sends
+    /// letters, so this is a defensive guard).
+    pub(crate) fn set_named_mark(&mut self, c: char, pos: usize) {
+        if let Some(i) = mark_slot(c) {
+            self.named_marks[i] = Some(pos);
+        }
+    }
+
+    /// Set mark `c` at `pos` the way nvim's `setmark_pos` does for `:mark` (#1241): a letter or digit is
+    /// that named or numbered mark, `'`/`` ` `` the context mark (a jumplist entry), `[`/`]` a change mark
+    /// and `<`/`>` one end of the last Visual area (with none, the only end). `false` for any other `c`,
+    /// which sets nothing (`E191`).
+    pub(crate) fn set_mark(&mut self, c: char, pos: usize) -> bool {
+        match c {
+            '\'' | '`' => self.push_jump(pos),
+            '[' => self.change_start = Some(pos),
+            ']' => self.change_end = Some(pos),
+            '<' | '>' => {
+                let start = c == '<';
+                self.last_visual = Some(match (self.last_visual, self.visual_one_end) {
+                    // The other end is still unset: this one is the only end again.
+                    (Some((_, _, kind)), Some(only)) if only == c => (pos, pos, kind),
+                    // The end that was missing: the area is whole now.
+                    (Some((a, _, kind)), Some(_)) => {
+                        self.visual_one_end = None;
+                        if start {
+                            (pos, a, kind)
+                        } else {
+                            (a, pos, kind)
+                        }
+                    }
+                    (Some((a, e, kind)), None) => {
+                        if start {
+                            (pos, e, kind)
+                        } else {
+                            (a, pos, kind)
+                        }
+                    }
+                    (None, _) => {
+                        self.visual_one_end = Some(c);
+                        (pos, pos, SelectKind::Charwise)
+                    }
+                });
+            }
+            _ if mark_slot(c).is_some() => self.set_named_mark(c, pos),
+            _ => return false,
+        }
+        true
     }
 
     /// The position of the last change (Vim `` `. ``), or `None` before the first edit.
     #[must_use]
-    pub fn last_change(&self) -> Option<usize> {
-        self.changes.last().copied()
+    pub fn last_change(&self) -> Option<BytePos> {
+        self.changes.last().copied().map(BytePos)
     }
 
     /// Vim's `[` mark — the first char of the last changed/yanked text, or `None` before the first change.
-    pub fn change_mark_start(&self) -> Option<usize> {
-        self.change_start
+    pub fn change_mark_start(&self) -> Option<BytePos> {
+        self.change_start.map(BytePos)
     }
 
     /// Vim's `]` mark — the end of the last changed/yanked text (see [`View::change_end`]), or `None`.
-    pub fn change_mark_end(&self) -> Option<usize> {
-        self.change_end
+    pub fn change_mark_end(&self) -> Option<BytePos> {
+        self.change_end.map(BytePos)
     }
 
     /// The last visual selection's bounds `(start, end, kind)` — the byte-min and byte-max of the remembered
     /// selection's two ends, in its kind. This is the store behind Vim's `<`/`>` marks (`` `< ``/`` `> ``/
     /// `'<`/`'>`) and `gv`, all reading the one depth-1 `last_visual` (set on every Visual/Select exit). `None`
     /// before any visual selection has ended. The planner turns `(start, end, kind)` into the per-mark target.
-    pub fn last_visual_bounds(&self) -> Option<(usize, usize, SelectKind)> {
+    pub fn last_visual_bounds(&self) -> Option<(BytePos, BytePos, SelectKind)> {
         let (a, e, kind) = self.last_visual?;
-        Some((a.min(e), a.max(e), kind))
+        Some((BytePos(a.min(e)), BytePos(a.max(e)), kind))
     }
 
     /// The context mark (Vim `` ` ``/`'`): the position before the latest jump — the newest jumplist entry.
     /// `None` before any jump. Read by `` `` ``/`''`; the jump they perform then records a fresh entry, so
     /// repeating toggles between the two positions.
-    pub fn context_mark(&self) -> Option<usize> {
-        self.jumps.last().copied()
+    pub fn context_mark(&self) -> Option<BytePos> {
+        self.jumps.last().copied().map(BytePos)
     }
 
-    /// Record `pos` as the newest change (Vim change list). Adjacent identical positions coalesce; the list
-    /// is bounded to [`MAX_CHANGES`] (oldest dropped). Resets the `g;`/`g,` cursor past the newest entry.
-    fn push_change(&mut self, pos: usize) {
-        if self.changes.last() != Some(&pos) {
-            self.changes.push(pos);
-            if self.changes.len() > MAX_CHANGES {
-                self.changes.remove(0);
+    /// Record a change at `pos` in the change list, as Vim's `changed_common` does (#722): a change that
+    /// began a new undo step (`new_step`) takes a new entry unless it is on the newest entry's line within
+    /// `'textwidth'` (79 when unset) columns of it; every change then moves the newest entry to `pos`. So
+    /// typing a word, or `xxx`, leaves one entry. The list is bounded to [`MAX_CHANGES`] (oldest dropped).
+    /// Resets the `g;`/`g,` cursor past the newest entry.
+    fn push_change(&mut self, b: &[u8], pos: usize, new_step: bool) {
+        if self.keep_jumps {
+            return;
+        }
+        self.new_change |= new_step;
+        if self.new_change || self.changes.is_empty() {
+            let line_col = |p: usize| {
+                let p = p.min(b.len());
+                let ls = line_start(b, p);
+                (crate::pos::raw::line_of(b, p), p - ls)
+            };
+            let add = self.changes.last().is_none_or(|&last| {
+                let ((line, col), (l, c)) = (line_col(pos), line_col(last));
+                let cols = if self.text_width == 0 {
+                    79
+                } else {
+                    self.text_width
+                };
+                l != line || c + cols < col || col + cols < c
+            });
+            if add {
+                self.new_change = false;
+                self.changes.push(pos);
+                if self.changes.len() > MAX_CHANGES {
+                    self.changes.remove(0);
+                }
             }
+        }
+        if let Some(last) = self.changes.last_mut() {
+            *last = pos;
         }
         self.change_idx = self.changes.len();
     }
@@ -399,9 +1168,13 @@ impl View {
         self.changes.get(self.change_idx).copied()
     }
 
-    /// Record `from` as a jumplist entry — the position a jump command LEFT (Vim). Adjacent identical
-    /// positions coalesce; bounded to [`MAX_CHANGES`]; resets the `CTRL-O`/`CTRL-I` cursor past the newest.
-    fn push_jump(&mut self, from: usize) {
+    /// Record `from` as a jumplist entry — the position a jump command LEFT (Vim's `setpcmark`). Adjacent
+    /// identical positions coalesce; bounded to [`MAX_CHANGES`]; resets the `CTRL-O`/`CTRL-I` cursor past
+    /// the newest. Entries on one line are folded when the list is next walked ([`View::clean_jumps`]).
+    pub(crate) fn push_jump(&mut self, from: usize) {
+        if self.keep_jumps {
+            return;
+        }
         if self.jumps.last() != Some(&from) {
             self.jumps.push(from);
             if self.jumps.len() > MAX_CHANGES {
@@ -411,27 +1184,59 @@ impl View {
         self.jump_idx = self.jumps.len();
     }
 
-    /// Step the jumplist (`CTRL-O` = `older`, `CTRL-I` = newer) from the current position `now`, returning
-    /// the position to jump to or `None` at an end. The FIRST `CTRL-O` saves `now` onto the list so a later
-    /// `CTRL-I` returns to it (Vim); subsequent steps just walk the cursor.
-    fn nav_jump(&mut self, older: bool, now: usize) -> Option<usize> {
-        if older {
-            if self.jump_idx == self.jumps.len() {
-                // First move back: remember where we are so `CTRL-I` can return, then step onto the list.
-                if self.jumps.last() != Some(&now) {
-                    self.jumps.push(now);
-                    if self.jumps.len() > MAX_CHANGES {
-                        self.jumps.remove(0);
-                    }
-                }
-                self.jump_idx = self.jumps.len().saturating_sub(1);
+    /// Vim's `cleanup_jumplist` (#725): drop every entry that a LATER entry shares a line with, so a line
+    /// appears once, at its newest place; then, with the cursor past the newest entry, drop that entry when
+    /// it is on the cursor's line `now` (a phantom jump, nvim #9805). The walk cursor follows its entry.
+    fn clean_jumps(&mut self, b: &[u8], now: usize) {
+        let line = |p: usize| crate::pos::raw::line_of(b, p.min(b.len()));
+        let lines: Vec<usize> = self.jumps.iter().map(|&p| line(p)).collect();
+        let len = self.jumps.len();
+        let mut kept = Vec::with_capacity(len);
+        for (from, &pos) in self.jumps.iter().enumerate() {
+            if self.jump_idx == from {
+                self.jump_idx = kept.len();
             }
-            if self.jump_idx == 0 {
+            if !lines[from + 1..].contains(&lines[from]) {
+                kept.push(pos);
+            }
+        }
+        if self.jump_idx == len {
+            self.jump_idx = kept.len();
+        }
+        self.jumps = kept;
+        if self.jump_idx == self.jumps.len()
+            && self.jumps.last().is_some_and(|&p| line(p) == line(now))
+        {
+            self.jumps.pop();
+            self.jump_idx -= 1;
+        }
+    }
+
+    /// Step the jumplist (`CTRL-O` = `older`, `CTRL-I` = newer) from the current position `now`, returning
+    /// the position to jump to or `None` at an end — nvim's `get_jumplist`. The list is cleaned first
+    /// ([`View::clean_jumps`]). The FIRST `CTRL-O` saves `now` onto the list so a later `CTRL-I` returns to
+    /// it; subsequent steps just walk the cursor.
+    fn nav_jump(&mut self, older: bool, now: usize, b: &[u8]) -> Option<usize> {
+        self.clean_jumps(b, now);
+        let len = self.jumps.len();
+        if older {
+            if self.jump_idx == 0 || len == 0 {
                 return None; // already at the oldest jump
+            }
+            if self.jump_idx == len {
+                // First move back: remember where we are so `CTRL-I` can return, then step onto the list.
+                self.jumps.push(now);
+                if self.jumps.len() > MAX_CHANGES {
+                    self.jumps.remove(0);
+                }
+                self.jump_idx = self.jumps.len() - 1;
+                if self.jump_idx == 0 {
+                    return None;
+                }
             }
             self.jump_idx -= 1;
         } else {
-            if self.jump_idx + 1 >= self.jumps.len() {
+            if self.jump_idx + 1 >= len {
                 return None; // already at (or past) the newest jump
             }
             self.jump_idx += 1;
@@ -440,7 +1245,8 @@ impl View {
     }
 
     /// The regex compile options for a search in this view (magic default; case per config).
-    fn search_options(&self) -> crate::pattern::Options {
+    #[must_use]
+    pub fn search_options(&self) -> crate::pattern::Options {
         crate::pattern::Options {
             magic: crate::pattern::Magic::Magic,
             ignore_case: self.search_case.ignore,
@@ -456,14 +1262,27 @@ impl View {
 
     /// The cursor's byte offset (on a char boundary) — view-local.
     #[must_use]
-    pub fn cursor(&self) -> usize {
-        self.cursor
+    pub fn cursor(&self) -> BytePos {
+        BytePos(self.cursor)
+    }
+
+    /// The Emacs mark's byte offset, or `None` when no mark is set — view-local (see
+    /// [`EditorState::mark`]).
+    #[must_use]
+    pub fn mark(&self) -> Option<BytePos> {
+        self.mark.map(BytePos)
+    }
+
+    /// The one-shot register a `"x` selected for the next command, or `None` for the unnamed one.
+    #[must_use]
+    pub fn pending_register(&self) -> Option<char> {
+        self.pending_register
     }
 
     /// Place the cursor at byte offset `pos` (the frontend uses this to follow a `:s///c` match; the
     /// caller passes an on-boundary offset). View-local; does not touch the document.
-    pub fn set_cursor(&mut self, pos: usize) {
-        self.cursor = pos;
+    pub fn set_cursor(&mut self, pos: BytePos) {
+        self.cursor = pos.0;
     }
 
     /// Select this View's caret gravity (D-050): the Emacs profile constructs `BetweenChar` views so its
@@ -472,18 +1291,133 @@ impl View {
         self.caret = gravity;
     }
 
+    /// This View's caret gravity (D-050).
+    #[must_use]
+    pub fn caret_gravity(&self) -> CaretGravity {
+        self.caret
+    }
+
+    /// This View's option values ([`ViewOptions`]).
+    pub(crate) fn options(&self) -> ViewOptions {
+        ViewOptions {
+            indent: self.indent,
+            text_width: self.text_width,
+            format: self.format.clone(),
+            search_case: self.search_case,
+            caret: self.caret,
+        }
+    }
+
+    /// Replace this View's option values, as a new View takes the Workspace's global ones (#754).
+    pub(crate) fn set_options(&mut self, o: ViewOptions) {
+        self.indent = o.indent;
+        self.text_width = o.text_width;
+        self.format = o.format;
+        self.search_case = o.search_case;
+        self.caret = o.caret;
+    }
+
+    /// The values of every option the core reads while editing (`ic`, `scs`, `sw`, `ts`, `et`, `tw`, and
+    /// the caret gravity), as the `:set`s that would install them. A trace writes them at its start, so replay does not depend on
+    /// the replaying machine's config (RFC-0020 R4). `sw` is the raw value (`0` follows `ts`).
+    #[must_use]
+    pub fn editing_options(&self) -> Vec<EditorOption> {
+        self.options().editing_options()
+    }
+
+    /// Change this View's option values through `f`.
+    pub(crate) fn update_options(&mut self, f: impl FnOnce(&mut ViewOptions)) {
+        let mut o = self.options();
+        f(&mut o);
+        self.set_options(o);
+    }
+
     /// This View's mode — view-local (two Views of one buffer can be in different modes).
     #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
     }
 
-    /// This View's indent width in columns (`editor.tab_width`, the `:set shiftwidth`/`tabstop` knob). A
-    /// read-only config accessor: the frontend reads it to compute `foldmethod=indent` levels (folds stay a
-    /// frontend concern — core exposes the number, never the folds; INV-DOC-VIEW).
+    /// This View's `'tabstop'` in columns (`editor.tab_width`, `:set tabstop`): how wide a `\t` renders. A
+    /// read-only config accessor: the frontend reads it to paint tabs and place the caret, and with
+    /// [`View::shift_width`] to compute `foldmethod=indent` levels (folds stay a frontend concern — core
+    /// exposes the numbers, never the folds; INV-DOC-VIEW).
     #[must_use]
     pub fn tab_width(&self) -> usize {
         self.indent.tab_width
+    }
+
+    /// This View's tab stops: `'tabstop'` and `'vartabstop'` (#1163). Every width that meets a `<Tab>`
+    /// (rendering, cursor columns, indents) is measured with these.
+    #[must_use]
+    pub fn tabs(&self) -> Tabs {
+        self.indent.tabs()
+    }
+
+    /// This View's effective `'shiftwidth'` in columns (`editor.shift_width`, `:set shiftwidth`): one indent
+    /// level. A `shiftwidth` of `0` resolves to the tabstop (Vim's `sw=0`), so this is always `>= 1`.
+    #[must_use]
+    pub fn shift_width(&self) -> usize {
+        self.indent.shift_width()
+    }
+
+    /// Whether `'lisp'` is on: the core indents by the Lisp rules, so the frontend's indenters stand
+    /// aside (#1163).
+    #[must_use]
+    pub fn lisp(&self) -> bool {
+        self.format.lisp
+    }
+
+    /// Whether `'cindent'` is on (#1163).
+    #[must_use]
+    pub fn cindent(&self) -> bool {
+        self.format.cindent
+    }
+
+    /// The C indent of line `row` of `bytes` under this View's options (nvim's `get_c_indent`, #1163),
+    /// the cursor at byte `col` of the line (in Insert mode a `)` there is cut off first). `None` keeps
+    /// the line as it is (inside a C++ raw string).
+    #[must_use]
+    pub fn c_indent(&self, bytes: &[u8], row: usize, col: usize, insert: bool) -> Option<usize> {
+        let lines: Vec<&[u8]> = bytes.split(|&c| c == b'\n').collect();
+        let cino = cindent::CinOptions::parse(&self.format.cinoptions, self.indent.shift_width());
+        let e = self.c_env(cino);
+        cindent::line_indent(&lines, row.min(lines.len() - 1), col, insert, &e)
+    }
+
+    /// Whether `'cinkeys'` re-indents line `row` of `bytes` after `key` (#1163), the cursor at byte `col`
+    /// of the line just after it; `line_is_empty`: only blanks before the key (it allows the `0` keys).
+    #[must_use]
+    pub fn c_key_reindents(
+        &self,
+        bytes: &[u8],
+        row: usize,
+        col: usize,
+        key: CinKey,
+        line_is_empty: bool,
+    ) -> bool {
+        let lines: Vec<&[u8]> = bytes.split(|&c| c == b'\n').collect();
+        let cino = cindent::CinOptions::parse(&self.format.cinoptions, self.indent.shift_width());
+        let e = self.c_env(cino);
+        cindent::key_reindents(
+            &lines,
+            row.min(lines.len() - 1),
+            col,
+            key,
+            line_is_empty,
+            &e,
+        )
+    }
+
+    fn c_env(&self, cino: cindent::CinOptions) -> cindent::CEnv<'_> {
+        cindent::CEnv {
+            ts: self.indent.tabs(),
+            cino,
+            cinwords: &self.format.cinwords,
+            cinscopedecls: &self.format.cinscopedecls,
+            cinkeys: &self.format.cinkeys,
+            comments: &self.format.comments,
+        }
     }
 
     /// This View's scroll position (first visible buffer row). Maintained by the frontend.
@@ -497,28 +1431,150 @@ impl View {
         self.top = top;
     }
 
+    /// `'formatprg'`: the program `gq` filters through (empty: format internally, #618).
+    #[must_use]
+    pub fn formatprg(&self) -> &str {
+        &self.format.prg
+    }
+
+    /// `'equalprg'`: the program `=` filters through (empty: reindent internally, #617).
+    #[must_use]
+    pub fn equalprg(&self) -> &str {
+        &self.format.equalprg
+    }
+
+    /// Whether `cmd` (`o`, `O`, an Insert `<CR>`) on `bytes` opens a line that continues a comment under
+    /// `'formatoptions'` `o`/`r` (#618). A frontend that seeds an opened line's indent from a syntax tree
+    /// leaves such an open to the core.
+    #[must_use]
+    pub fn opens_comment(&self, bytes: &[u8], cmd: &Command) -> bool {
+        planner::open_comment_line_in(self, bytes, cmd).is_some()
+    }
+
+    /// Set the columns of this View's text area (the window width less its gutter), which
+    /// `'wrapmargin'` and a `gq` without `'textwidth'` measure against (frontend layout pass).
+    pub fn set_text_cols(&mut self, cols: usize) {
+        self.text_cols = cols.max(1);
+    }
+
+    /// The width text wraps at (nvim's `comp_textwidth`): `'textwidth'`, else the text area less
+    /// `'wrapmargin'` when that is set, else `0` (no auto-wrap). `force` is `gq`/`gw`, which wraps at one
+    /// column short of the text area (at most 79) when neither is set.
+    pub(crate) fn text_width_for(&self, force: bool) -> usize {
+        let mut tw = self.text_width;
+        if tw == 0 && self.format.wrapmargin != 0 {
+            let cols = i64::try_from(self.text_cols).unwrap_or(i64::MAX);
+            tw = usize::try_from(cols.saturating_sub(self.format.wrapmargin)).unwrap_or(0);
+        }
+        if force && tw == 0 {
+            tw = self.text_cols.saturating_sub(1).min(79);
+        }
+        tw
+    }
+
+    /// This window's own `'scrolloff'`, or `None` when it follows the global value.
+    #[must_use]
+    pub fn scrolloff_local(&self) -> Option<i64> {
+        self.scrolloff
+    }
+
+    /// Set (or, with `None`, clear) this window's own `'scrolloff'` (`:setlocal so`, #1151).
+    pub fn set_scrolloff_local(&mut self, so: Option<i64>) {
+        self.scrolloff = so;
+    }
+
+    /// The first displayed screen column when `'wrap'` is off (#615).
+    #[must_use]
+    pub fn leftcol(&self) -> usize {
+        self.leftcol
+    }
+
+    /// Set the first displayed screen column (the frontend's horizontal scroll, #615).
+    pub fn set_leftcol(&mut self, col: usize) {
+        self.leftcol = col;
+    }
+
+    /// The virtual columns of the top line scrolled out of the window (nvim's `w_skipcol`, #615).
+    #[must_use]
+    pub fn skipcol(&self) -> usize {
+        self.skipcol
+    }
+
+    /// Set the top line's skipped virtual columns (the frontend's screen-row scroll, #615).
+    pub fn set_skipcol(&mut self, col: usize) {
+        self.skipcol = col;
+    }
+
+    /// The wanted column (Vim's `curswant`) as a display column, `usize::MAX` after `$`: read by the
+    /// frontend's screen-line motions (`gj`, `gk`, #615).
+    #[must_use]
+    pub fn curswant(&self) -> usize {
+        self.curswant.get()
+    }
+
+    /// This window's display options (#615, #616).
+    #[must_use]
+    pub fn window_options(&self) -> &crate::WindowOptions {
+        &self.window
+    }
+
+    /// Replace this window's display options.
+    pub fn set_window_options(&mut self, opts: crate::WindowOptions) {
+        self.window = opts;
+    }
+
+    /// The `CTRL-D`/`CTRL-U` amount for a window `height` rows high (Vim's 'scroll'): the value a count last
+    /// set at this height, else half the height (at least 1).
+    #[must_use]
+    pub fn scroll(&self, height: usize) -> usize {
+        match self.scroll {
+            Some((lines, h)) if h == height => lines,
+            _ => (height / 2).max(1),
+        }
+    }
+
+    /// Set Vim's 'scroll' for a window `height` rows high (a count typed before `CTRL-D`/`CTRL-U`).
+    pub fn set_scroll(&mut self, lines: usize, height: usize) {
+        self.scroll = Some((lines, height));
+    }
+
     /// The highlighted byte range `[start, end)` of the current charwise/linewise Visual selection over
     /// `bytes`, or `None` in Normal/Insert and for a blockwise selection (a rectangle is not one range —
     /// use [`View::block_spans`]). See [`EditorState::selection_span`] for the full contract.
     #[must_use]
-    pub fn selection_span(&self, bytes: &[u8]) -> Option<(usize, usize)> {
+    pub fn selection_span(&self, bytes: &[u8]) -> Option<(BytePos, BytePos)> {
         match self.mode.selection()? {
             SelectKind::Blockwise => None,
-            kind => Some(selection_range(
-                bytes,
-                self.anchor?,
-                self.cursor,
-                kind == SelectKind::Linewise,
-            )),
+            kind => {
+                let (s, e) = selection_range(
+                    bytes,
+                    self.anchor?,
+                    self.cursor,
+                    kind == SelectKind::Linewise,
+                );
+                Some((BytePos(s), BytePos(e)))
+            }
         }
     }
 
     /// The per-row highlighted byte ranges of the current BLOCKWISE selection over `bytes`, or `None`
     /// when the selection is not blockwise. See [`EditorState::block_spans`].
     #[must_use]
-    pub fn block_spans(&self, bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
+    pub fn block_spans(&self, bytes: &[u8]) -> Option<Vec<(BytePos, BytePos)>> {
         match self.mode.selection()? {
-            SelectKind::Blockwise => Some(block_rows(bytes, self.anchor?, self.cursor).0),
+            SelectKind::Blockwise => Some(
+                block_geom(
+                    bytes,
+                    self.anchor?,
+                    self.cursor,
+                    self.indent.tabs(),
+                    self.curswant == MAXCOL,
+                )
+                .spans()
+                .into_iter()
+                .map(|(s, e)| (BytePos(s), BytePos(e)))
+                .collect(),
+            ),
             _ => None,
         }
     }
@@ -540,6 +1596,8 @@ enum Action {
     },
     Undo,
     Redo,
+    /// `U`: restore the latest changed line ([`Document::line_undo`]); the cursor comes from the swap.
+    LineUndo,
     /// `g-`/`g+`: step along chronological creation order (`older` = `g-`), across branches.
     UndoChrono {
         older: bool,
@@ -590,8 +1648,11 @@ struct BlockInsert {
     top_left: usize,
     /// Byte offset of the top block row's line start — the stable anchor to walk down from at `<Esc>`.
     top_line_start: usize,
-    /// Char column at which each lower row receives the typed text (left edge for `I`/`c`, right edge+1
-    /// for `A`).
+    /// The top row's length in bytes when Insert began (after a change's delete; nvim's `pre_textlen`):
+    /// what a block change measures the text typed on it against when a `<CR>` ended that row (#1142).
+    top_len: usize,
+    /// Virtual (screen) column at which each lower row receives the typed text (left edge for `I`/`c`,
+    /// right edge+1 for `A`).
     target_col: usize,
     /// Number of block rows below the top row (the rows to replicate onto).
     rows_below: usize,
@@ -605,7 +1666,7 @@ struct BlockInsert {
     /// leaves a block CHANGE with the caret one char left of the top row's typed text (normal Insert-exit),
     /// whereas `I`/`A` snap back to the block's top-left corner. The replicate geometry is identical.
     change: bool,
-    /// The block's inclusive column span (`col_hi - col_lo + 1`, >= 1) — the number of columns `A` appends
+    /// The block's width in cells (`hi - lo + 1`, >= 1) — the number of columns `A` appends
     /// past and `c` deletes per row. Retained (with the row count) into [`BlockGeom`] so dot-repeat can
     /// rebuild an equivalent block at the caret. `I` ignores it (insert at the left edge), but it is stored
     /// uniformly so the geometry round-trips for every kind.
@@ -621,7 +1682,8 @@ struct BlockInsert {
 struct BlockGeom {
     /// Total block rows (>= 1) — how many lines the repeat replicates onto, clamped at end-of-buffer.
     height: usize,
-    /// Inclusive column span (>= 1) — chars `A` appends past / `c` deletes per row (see [`BlockInsert::width`]).
+    /// The block's width in cells (>= 1) — what `A` appends past / `c` deletes per row (see
+    /// [`BlockInsert::width`]).
     width: usize,
     /// `I` (insert at left edge) / `A` (append at right edge) / `c` (delete then insert at left edge).
     kind: BlockInsertKind,
@@ -629,11 +1691,106 @@ struct BlockGeom {
     to_eol: bool,
 }
 
+/// The AMOUNT of text the last Visual-selection operator covered, kept so dot-repeat (`.`) can rebuild an
+/// equivalent selection at the caret (`:help visual-repeat`, #794): the same number of lines; within one
+/// line the same number of screen cells; for a multi-line charwise selection the same end column on the
+/// last line; for a block the same width. Columns are VIRTUAL (screen) columns, as in Vim (#1064): a `<Tab>`
+/// spans to its tabstop and a wide character two cells (see [`vcols_at`](range::vcols_at)).
+#[derive(Clone, Copy, Debug)]
+struct VisualOpGeom {
+    kind: SelectKind,
+    /// Lines spanned (>= 1).
+    lines: usize,
+    /// Charwise one-line: cell count. Charwise multi-line: the end's last cell column. Blockwise: width.
+    cols: usize,
+    /// `$` extended the selection (curswant at MAXCOL): the repeat runs to each line's end.
+    to_eol: bool,
+}
+
+/// Whether `cmd` operates on the live Visual/Select selection — the commands whose dot-repeat (issued in
+/// Normal, with no selection) rebuilds one from [`VisualOpGeom`]. Block `I`/`A`/`c` has its own
+/// [`BlockGeom`] path in the planner.
+fn is_selection_op(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::DeleteSelection
+            | Command::ChangeSelection
+            | Command::ReplaceSelection(_)
+            | Command::ReplaceSelectionChar(_)
+            | Command::CaseSelection(_)
+            | Command::PasteSelection { .. }
+            | Command::IncrementSelection { .. }
+            | Command::VisualOp(_)
+    )
+}
+
+/// Before a selection operator runs: record the live selection's geometry, or — for a dot-repeat, which
+/// arrives in Normal with no selection — rebuild one of the recorded size starting at the caret, so the
+/// operator then plans exactly as if the user had re-selected that text (Vim's `redo_VIsual`).
+fn prepare_selection_op(st: &mut EditorState, cmd: &Command) {
+    if !is_selection_op(cmd) {
+        return;
+    }
+    let b = st.doc.bytes();
+    let cur = st.view.cursor;
+    match (st.view.mode.selection(), st.view.anchor) {
+        (Some(kind), Some(anchor)) => {
+            let (lo, hi) = (anchor.min(cur), anchor.max(cur));
+            let lines = crate::pos::raw::line_of(b, hi) - crate::pos::raw::line_of(b, lo) + 1;
+            let ts = st.view.indent.tabs();
+            let cols = match kind {
+                SelectKind::Charwise if lines == 1 => {
+                    vcols_at(b, hi, ts).1 + 1 - vcols_at(b, lo, ts).0
+                }
+                SelectKind::Charwise => vcols_at(b, hi, ts).1,
+                SelectKind::Linewise => 0,
+                SelectKind::Blockwise => block_geom(b, anchor, cur, ts, false).width(),
+            };
+            st.view.last_visual_op = Some(VisualOpGeom {
+                kind,
+                lines,
+                cols,
+                to_eol: st.view.curswant == range::MAXCOL,
+            });
+        }
+        (None, _) => {
+            let Some(g) = st.view.last_visual_op else {
+                return;
+            };
+            let ts = st.view.indent.tabs();
+            let ls = line_start(b, cur);
+            let start_col = vcols_at(b, cur, ts).0;
+            let end_ls =
+                crate::pos::raw::nth_line_start(b, crate::pos::raw::line_of(b, cur) + g.lines - 1);
+            let end = match g.kind {
+                _ if g.to_eol => line_end(b, end_ls),
+                SelectKind::Charwise if g.lines == 1 => at_vcol(b, ls, start_col + g.cols - 1, ts),
+                SelectKind::Charwise => at_vcol(b, end_ls, g.cols, ts),
+                SelectKind::Linewise => end_ls,
+                SelectKind::Blockwise => at_vcol(b, end_ls, start_col + g.cols - 1, ts),
+            };
+            st.view.mode = Mode::Visual { kind: g.kind };
+            st.view.anchor = Some(cur);
+            st.view.cursor = end;
+            if g.to_eol {
+                st.view.curswant = Want::col(range::MAXCOL);
+            }
+        }
+        (Some(_), None) => {}
+    }
+}
+
 /// How a committed command should route its captured text into the register store. A `Yank` additionally
 /// seeds the yank register `"0` (when unregistered); an `Edit` (delete/change/`x`) never touches `"0`, so
 /// `"0` survives intervening deletes (Vim `:help quote0`).
 enum RegWrite {
     Edit(Register),
+    /// An `Edit` over a motion that always uses `"1` (`d%`, `d}`, `d/pat` — nvim's `use_reg_one`), so even a
+    /// span within one line shifts the numbered ring (#749). [`apply_command`] promotes `Edit` to it.
+    EditRingOne(Register),
+    /// The text a Visual put (`v_p`) replaced: deleted into the unnamed register and the delete rings, never
+    /// into the register being put (`viw"ap` leaves `"a` as it was, #707).
+    Replaced(Register),
     /// A yank: the captured [`Register`] plus the `(start, end)` byte span (half-open) it was taken from,
     /// used to set the `[`/`]` change marks — a yank leaves the buffer unchanged, so the span cannot be
     /// recovered from an [`EditList`] the way an edit's affected range can.
@@ -647,6 +1804,9 @@ enum RegWrite {
     /// when it follows another kill the captured text is PREPENDED onto the current entry (Emacs
     /// `kill-append` with `before=t`), since a backward kill takes text that precedes the prior kill.
     KillPrepend(Register),
+    /// A plain write of new text into the unnamed slot (Emacs `kill-new`, for a pasted text): never
+    /// accumulates onto a previous kill and is not itself a kill.
+    Write(Register),
 }
 
 /// How a committed command updates the Emacs mark (D-027 depth-1). `None` on a plan leaves the mark
@@ -683,7 +1843,48 @@ impl EditorState {
         let mut doc = Document::new(DocumentId(1), initial);
         doc.mark_saved();
         let view = View::fresh(doc.id());
-        EditorState { doc, view }
+        let mut st = EditorState {
+            doc,
+            view,
+            origin: TransactionOrigin::UserInput,
+        };
+        // A caret on a leading `<Tab>` wants the tab's last cell (#1090).
+        st.view.curswant = st.wanted_col();
+        st
+    }
+
+    /// The invariant walker over the document and its view ([`Document::assert_invariants`],
+    /// [`View::assert_invariants`]); panics on the first broken rule (#906).
+    pub fn assert_invariants(&self) {
+        assert_eq!(
+            self.view.doc,
+            self.doc.id(),
+            "the view names another document"
+        );
+        self.doc.assert_invariants();
+        self.view.assert_invariants(self.doc.bytes());
+    }
+
+    /// Apply `txn`, carrying this view's marks, change list and jumplist through it (#686). Every edit
+    /// the editor makes goes through here or [`EditorState::with_tracked`].
+    pub(crate) fn apply_txn(&mut self, txn: Transaction) -> Result<crate::pos::Revision, TxnError> {
+        self.with_tracked(|doc, t| doc.apply_tracked(txn, t))
+    }
+
+    /// Run `f` on the document with this view's long-lived positions handed to it, then take them back.
+    pub(crate) fn with_tracked<R>(
+        &mut self,
+        f: impl FnOnce(&mut Document, &mut [Tracked]) -> R,
+    ) -> R {
+        let mut t = self.view.tracked();
+        let r = f(&mut self.doc, &mut t);
+        self.view.untrack(&t);
+        r
+    }
+
+    /// Make the edits that follow carry `origin` (INV-ORIGIN, #880).
+    pub(crate) fn set_origin(&mut self, origin: TransactionOrigin) {
+        self.origin = origin;
     }
 
     /// Reconstitute an editing context from a Document and a View taken out of a Workspace arena — the
@@ -692,7 +1893,11 @@ impl EditorState {
     /// swaps them back; this keeps the single-window path byte-identical (F-007 step (b)).
     #[must_use]
     pub(crate) fn from_parts(doc: Document, view: View) -> EditorState {
-        EditorState { doc, view }
+        EditorState {
+            doc,
+            view,
+            origin: TransactionOrigin::UserInput,
+        }
     }
 
     /// Split an editing context back into its owned Document and View, to return them to the arena.
@@ -701,37 +1906,33 @@ impl EditorState {
         (self.doc, self.view)
     }
 
+    /// Exchange this context's register store with `store`. The [`crate::workspace::Workspace`] owns the
+    /// one editor-global store (D-057 slice 2, #944) and lends it into the focused view for one command, so a
+    /// View at rest in the arena holds an empty store and a yank reaches every buffer and split.
+    pub(crate) fn swap_registers(&mut self, store: &mut RegisterStore) {
+        std::mem::swap(&mut self.view.registers, store);
+    }
+
     /// Set the indentation config the shift operators (`>>`/`<<`) use. Runtime config loading is deferred;
     /// until it lands this is the seam a loader (or a test) uses to install `editor.tab_width` /
-    /// `editor.indent_style`. No new schema key — both are existing keys (spec/config-schema.yaml).
+    /// `editor.indent_style`. Sets the tabstop AND the shiftwidth to `tab_width` (the common `ts=sw` case);
+    /// `:set shiftwidth`/`:set tabstop` ([`EditorState::set_option`]) set them apart.
     pub fn set_indent(&mut self, tab_width: usize, indent_style: IndentStyle) {
-        self.view.indent.tab_width = tab_width.max(1);
-        self.view.indent.style = indent_style;
+        self.view
+            .update_options(|o| o.set_indent(tab_width, indent_style));
     }
 
     /// Set the search case config (`'ignorecase'` / `'smartcase'`, F-009 #1). The seam a config loader
     /// (or a test) uses until runtime config lands; the default is Vim's factory case-sensitive search.
     pub fn set_search_case(&mut self, ignore_case: bool, smart_case: bool) {
-        self.view.search_case.ignore = ignore_case;
-        self.view.search_case.smart = smart_case;
+        self.view
+            .update_options(|o| o.set_search_case(ignore_case, smart_case));
     }
 
     /// Set one editor option (`:set`) on the focused view, leaving the others untouched. Maps the
     /// runtime `:set` surface onto the existing indent/search-case config (no new schema keys).
     pub fn set_option(&mut self, opt: EditorOption) {
-        match opt {
-            EditorOption::IgnoreCase(v) => self.view.search_case.ignore = v,
-            EditorOption::SmartCase(v) => self.view.search_case.smart = v,
-            EditorOption::ShiftWidth(n) => self.view.indent.tab_width = n.max(1),
-            EditorOption::ExpandTab(v) => {
-                self.view.indent.style = if v {
-                    IndentStyle::Space
-                } else {
-                    IndentStyle::Tab
-                }
-            }
-            EditorOption::TextWidth(n) => self.view.text_width = n,
-        }
+        self.view.update_options(|o| o.set(opt));
     }
 
     /// Execute `:[range]s/pattern/replacement/flags` (F-009 #2). Every substitution across the range is
@@ -742,7 +1943,7 @@ impl EditorState {
     /// expose a group-index map). The cursor lands on the start of the last changed line (Vim).
     ///
     /// # Errors
-    /// [`RegexError`] if the pattern is unrepresentable or malformed, or the buffer is not UTF-8.
+    /// [`RegexError`] if the pattern is unrepresentable or malformed.
     pub fn substitute(
         &mut self,
         range: SubRange,
@@ -750,8 +1951,51 @@ impl EditorState {
         replacement: &str,
         flags: SubFlags,
     ) -> Result<SubOutcome, RegexError> {
+        if pattern == r"\n" && replacement.is_empty() && flags.ignore_case.is_none() {
+            return Ok(self.substitute_join(range));
+        }
         let subs = self.substitute_preview(range, pattern, replacement, flags)?;
         Ok(self.apply_substitutions(&subs))
+    }
+
+    /// `:[range]s/\n//` (with no flag but `g`), which Vim runs as a join (`sub_joining_lines`, nvim
+    /// v0.12.6): the range's lines plus the next one, if there is one, are joined with nothing in between,
+    /// and the cursor lands where the last joined line begins. Joining a single line (the last one) is not
+    /// an error; it reports no replacements on one line.
+    fn substitute_join(&mut self, range: SubRange) -> SubOutcome {
+        let bytes = self.doc.bytes();
+        let lines = line_spans(bytes);
+        let cursor_line = crate::pos::raw::line_of(bytes, self.view.cursor);
+        let (first, last) = resolve_line_range(range, &lines, cursor_line);
+        let joined = last - first + 1 + usize::from(last + 1 < lines.len());
+        if joined <= 1 {
+            // Vim still moves to the range's first line, keeping the column.
+            let col = self.view.cursor - lines[cursor_line.min(lines.len() - 1)].0;
+            let (ls, le) = lines[first];
+            self.view.cursor = (ls + col).min(le);
+            self.settle_offsets();
+            return SubOutcome {
+                replacements: 0,
+                lines: 1,
+            };
+        }
+        let seams = joined - 1;
+        let edits: Vec<Edit> = (first..first + seams)
+            .map(|li| Edit::delete(BytePos(lines[li].1), 1))
+            .collect();
+        let cursor = lines[first + seams].0 - seams;
+        let list = EditList::new(edits).expect("line breaks are disjoint and ordered");
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
+            .with_hint(GroupHint::BreakBefore);
+        self.apply_txn(txn)
+            .expect("join substitute applies cleanly");
+        self.view.last_was_edit = true;
+        self.view.cursor = cursor.min(self.doc.bytes().len());
+        self.settle_offsets();
+        SubOutcome {
+            replacements: seams,
+            lines: 1,
+        }
     }
 
     /// Compute — but do NOT apply — the substitutions `:[range]s/pat/rep/flags` would make (F-009 #2).
@@ -761,7 +2005,7 @@ impl EditorState {
     /// why confirm collects the accepted set and applies it in one pass at the end.
     ///
     /// # Errors
-    /// [`RegexError`] if the pattern is unrepresentable/malformed or the buffer is not UTF-8.
+    /// [`RegexError`] if the pattern is unrepresentable/malformed.
     pub fn substitute_preview(
         &self,
         range: SubRange,
@@ -779,38 +2023,26 @@ impl EditorState {
         let re = crate::pattern::Regex::compile(pattern, opts)?;
 
         let bytes = self.doc.bytes();
-        let hay = std::str::from_utf8(bytes)
-            .map_err(|_| RegexError::Syntax("buffer is not valid UTF-8".into()))?;
-        let lines = line_spans(hay); // (start, end-excluding-newline) per line
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
-        let (first, last) = match range {
-            SubRange::CurrentLine => (cursor_line, cursor_line),
-            SubRange::WholeFile => (0, lines.len().saturating_sub(1)),
-            // 1-based inclusive from the user; clamp into range.
-            SubRange::Lines(a, b) => (
-                a.saturating_sub(1).min(lines.len().saturating_sub(1)),
-                b.saturating_sub(1).min(lines.len().saturating_sub(1)),
-            ),
-        };
+        // A byte that is not UTF-8 is one char to the pattern (#1243).
+        let hay = crate::pattern::Hay::new(bytes);
+        // (start, end-excluding-newline) per line, without the slot after a final newline, so a zero-width
+        // pattern (`^`, `$`, `x*`) never substitutes there (`:%s/^/#/` on "abc\ndef\n" appends no line).
+        let lines = line_spans(hay.as_str());
+        let cursor_line = crate::pos::raw::line_of(bytes, self.view.cursor);
+        // 1-based inclusive from the user, clamped into range and put in order.
+        let (first, last) = resolve_line_range(range, &lines, cursor_line);
 
         let mut out: Vec<Substitution> = Vec::new();
-        for (li, &(ls, le)) in lines.iter().enumerate().take(last + 1).skip(first) {
-            let line = &hay[ls..le];
-            let matches: Vec<crate::pattern::Match> = if flags.global {
-                re.find_all(line)
-            } else {
-                re.find_at(line, 0).into_iter().collect()
-            };
-            for m in matches {
-                let matched = &line[m.start..m.end];
-                out.push(Substitution {
-                    start: ls + m.start,
-                    end: ls + m.end,
-                    replacement: expand_replacement(replacement, matched),
-                    line: li,
-                });
-            }
-        }
+        find_substitutions(
+            &re,
+            &hay,
+            &lines,
+            (first, last),
+            flags.global,
+            replacement,
+            &mut None,
+            &mut out,
+        );
         Ok(out)
     }
 
@@ -822,7 +2054,7 @@ impl EditorState {
     /// the frontend echoes `N matches on M lines`.
     ///
     /// # Errors
-    /// [`RegexError`] if the pattern is unrepresentable/malformed or the buffer is not UTF-8.
+    /// [`RegexError`] if the pattern is unrepresentable/malformed.
     pub fn substitute_count(
         &self,
         range: SubRange,
@@ -858,23 +2090,39 @@ impl EditorState {
             .iter()
             .map(|s| {
                 lines_seen.insert(s.line);
-                Edit::replace(s.start, s.end - s.start, s.replacement.clone())
+                Edit::replace(s.start, s.end.0 - s.start.0, s.replacement.clone())
             })
             .collect();
         let replacements = edits.len();
-        let last_line_idx = subs.iter().map(|s| s.line).max();
+        // Where the last replacement ends once every edit is in: its start moves by the length change of
+        // the edits before it.
+        let last_end = subs.last().map(|last| {
+            let before: isize = subs[..subs.len() - 1]
+                .iter()
+                .map(|s| s.replacement.len() as isize - (s.end.0 - s.start.0) as isize)
+                .sum();
+            (last.start.0 as isize + before) as usize + last.replacement.len()
+        });
         // Disjoint + ordered by construction; `new` re-validates (a bad accepted set is a caller bug).
         let list = EditList::new(edits).expect("substitutions are disjoint and ordered");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
             .with_hint(GroupHint::BreakBefore);
-        self.doc
-            .apply(txn)
+        self.apply_txn(txn)
             .expect("substitute transaction applies cleanly");
         self.view.last_was_edit = true;
-        if let Some(li) = last_line_idx {
+        if let Some(end) = last_end {
+            // Vim: the line the last replacement ends on (a `\r` in it moves the cursor down with the new
+            // line), at its first non-blank (`beginline(BL_WHITE | BL_FIX)`).
             let nb = self.doc.bytes();
-            self.view.cursor = crate::pos::nth_line_start(nb, li).min(nb.len());
+            let end = end.min(nb.len());
+            let line_start = nb[..end]
+                .iter()
+                .rposition(|&c| c == b'\n')
+                .map_or(0, |i| i + 1);
+            self.view.cursor = motion::first_non_blank(nb, line_start);
         }
+        self.settle_offsets();
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
         SubOutcome {
             replacements,
             lines: lines_seen.len(),
@@ -895,7 +2143,7 @@ impl EditorState {
     /// runner, which needs the SAME mark set but replays each marked line through the input engine.
     ///
     /// # Errors
-    /// [`RegexError`] if the `:g` pattern is unrepresentable/malformed, or the buffer is not valid UTF-8.
+    /// [`RegexError`] if the `:g` pattern is unrepresentable/malformed.
     pub fn global_marks(
         &self,
         range: SubRange,
@@ -904,36 +2152,71 @@ impl EditorState {
     ) -> Result<Vec<usize>, RegexError> {
         let opts = self.view.search_options();
         let re = crate::pattern::Regex::compile(pattern, opts)?;
-        let bytes = self.doc.bytes();
-        let hay = std::str::from_utf8(bytes)
-            .map_err(|_| RegexError::Syntax("buffer is not valid UTF-8".into()))?;
+        // A byte that is not UTF-8 is one char to the pattern (#1243); the marks are line indices, the
+        // same in the haystack as in the buffer.
+        let buf = crate::pattern::Hay::new(self.doc.bytes());
+        let hay = buf.as_str();
+        // `line_spans` has no span for the slot after a final newline, so a `:g`/`:v` never marks or acts on
+        // it (visible under a `normal` payload, which would edit it).
         let lines = line_spans(hay);
-        // `line_spans` appends a phantom empty span for the position after a final newline; Vim does not
-        // count that as a line, so exclude it (a `:g`/`:v` must never mark or act on it — visible under a
-        // `normal` payload, which would edit it). An empty or non-`\n`-terminated buffer keeps its span.
-        let count = if hay.ends_with('\n') {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len()
-        };
-        let last_idx = count.saturating_sub(1);
+        let count = lines.len();
         // `:g` with no range is the WHOLE FILE (unlike `:s`, whose default is the current line).
-        let (first, last) = match range {
-            SubRange::CurrentLine | SubRange::WholeFile => (0, last_idx),
-            SubRange::Lines(a, b) => (
-                a.saturating_sub(1).min(last_idx),
-                b.saturating_sub(1).min(last_idx),
-            ),
+        let range = match range {
+            SubRange::CurrentLine => SubRange::WholeFile,
+            r => r,
         };
+        let (first, last) = resolve_line_range(range, &lines, 0);
         if count == 0 {
             return Ok(Vec::new());
         }
-        Ok((first..=last)
-            .filter(|&li| {
-                let (ls, le) = lines[li];
-                re.find_at(&hay[ls..le], 0).is_some() != negate
-            })
-            .collect())
+        // CTRL-C during the marking pass abandons the whole `:g`, as nvim's `ex_global` does: nothing is
+        // marked, so nothing runs.
+        let abandon = |marks: Vec<usize>| {
+            if crate::interrupt::interrupted() {
+                Vec::new()
+            } else {
+                marks
+            }
+        };
+        if !re.multiline() {
+            return Ok(abandon(
+                (first..=last)
+                    .take_while(|_| !crate::interrupt::breakcheck())
+                    .filter(|&li| {
+                        let (ls, le) = lines[li];
+                        re.find_at(&hay[ls..le], BytePos(0)).is_some() != negate
+                    })
+                    .collect(),
+            ));
+        }
+        // A pattern that can match a line break marks the line its match STARTS on (`:g/a\nb/` marks the
+        // `a` line). Searched in the whole buffer, ending in a line break so the last line's `\n` matches;
+        // the leftmost match found from one line answers for every line before it.
+        let owned;
+        let hay: &str = if hay.ends_with('\n') {
+            hay
+        } else {
+            owned = format!("{hay}\n");
+            &owned
+        };
+        let mut next: Option<(usize, Option<usize>)> = None; // (searched from, leftmost whole start)
+        Ok(abandon(
+            (first..=last)
+                .take_while(|_| !crate::interrupt::breakcheck())
+                .filter(|&li| {
+                    let (ls, le) = lines[li];
+                    let ws = match next {
+                        Some((from, ws)) if from <= ls && ws.is_none_or(|w| w >= ls) => ws,
+                        _ => {
+                            let ws = re.find_whole_at(hay, BytePos(ls)).map(|(w, _)| w.0);
+                            next = Some((ls, ws));
+                            ws
+                        }
+                    };
+                    ws.is_some_and(|w| w <= le) != negate
+                })
+                .collect(),
+        ))
     }
 
     pub fn global(
@@ -946,13 +2229,26 @@ impl EditorState {
         // PASS 1: mark the matching (or non-matching) lines against the untouched buffer (shared with the
         // frontend's `:g/pat/normal` runner via [`EditorState::global_marks`]).
         let marked = self.global_marks(range, pattern, negate)?;
+        self.global_run(&marked, cmd)
+    }
+
+    /// PASS 2 of `:g` on an already-marked set of 0-based line indices (ascending, distinct, in the buffer):
+    /// what a recorded `:g` replays, so the pattern that marked them is not needed (RFC-0020).
+    ///
+    /// # Errors
+    /// [`RegexError`] if a `:g/pat/s///` sub-pattern is unrepresentable/malformed.
+    pub(crate) fn global_run(
+        &mut self,
+        marked: &[usize],
+        cmd: &GlobalCmd,
+    ) -> Result<usize, RegexError> {
         if marked.is_empty() {
             return Ok(0);
         }
+        let marked = marked.to_vec();
         // Re-derive the untouched buffer's line spans for pass 2 (marking above did not mutate the buffer).
         let bytes = self.doc.bytes();
-        let hay = std::str::from_utf8(bytes)
-            .map_err(|_| RegexError::Syntax("buffer is not valid UTF-8".into()))?;
+        let hay = bytes;
         let lines = line_spans(hay);
 
         // PASS 2: run the command over the marked lines.
@@ -960,22 +2256,57 @@ impl EditorState {
             GlobalCmd::Delete => {
                 // Delete each marked line including its trailing newline; disjoint + ascending, so one
                 // transaction from the original offsets deletes them all atomically.
-                let edits: Vec<Edit> = marked
+                // Adjacent lines merge into one range, so that deleting an UNTERMINATED last line can also
+                // take the newline ending the line above (Vim leaves no blank line behind: `:g/b/d` on
+                // `a\nb` gives `a`, #709) without overlapping the range before it.
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for &li in &marked {
+                    let (ls, le) = lines[li];
+                    let end = if le < hay.len() { le + 1 } else { le };
+                    match ranges.last_mut() {
+                        Some(r) if r.1 == ls => r.1 = end,
+                        _ => ranges.push((ls, end)),
+                    }
+                }
+                if let Some(r) = ranges.last_mut() {
+                    if r.1 == hay.len() && r.0 > 0 && !hay.ends_with(b"\n") {
+                        r.0 -= 1;
+                    }
+                }
+                let edits: Vec<Edit> = ranges
                     .iter()
-                    .map(|&li| {
-                        let (ls, le) = lines[li];
-                        let end = if le < hay.len() { le + 1 } else { le };
-                        Edit::delete(ls, end - ls)
-                    })
+                    .map(|&(s, e)| Edit::delete(BytePos(s), e - s))
                     .collect();
+                // Vim runs `:d` once per marked line, so each deleted line goes through the unnamed register
+                // and shifts the numbered ring in turn: `""` and `"1` end on the last one (#1100).
+                for &li in &marked {
+                    let (ls, le) = lines[li];
+                    self.view
+                        .registers
+                        .delete(None, Register::linewise(bytes[ls..le].to_vec()));
+                }
                 let list =
                     EditList::new(edits).expect("whole-line deletes are disjoint and ordered");
-                let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
+                let txn = Transaction::new(self.doc.revision(), list, self.origin)
                     .with_hint(GroupHint::BreakBefore);
-                self.doc.apply(txn).expect("global-delete applies cleanly");
+                self.apply_txn(txn).expect("global-delete applies cleanly");
                 self.view.last_was_edit = true;
+                // Like Vim, the cursor lands on the line that followed the last deleted one (the last line if
+                // that was the end), at its first non-blank.
+                let last = marked[marked.len() - 1] + 1 - marked.len();
                 let nb = self.doc.bytes();
-                self.view.cursor = self.view.cursor.min(nb.len());
+                let line_start = crate::pos::raw::nth_line_start(nb, last).min(nb.len());
+                let line_start = if line_start == nb.len() && nb.ends_with(b"\n") {
+                    nb[..nb.len() - 1]
+                        .iter()
+                        .rposition(|&c| c == b'\n')
+                        .map_or(0, |i| i + 1)
+                } else {
+                    line_start
+                };
+                self.view.cursor = motion::first_non_blank(nb, line_start);
+                self.settle_offsets();
+                self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column
                 Ok(marked.len())
             }
             GlobalCmd::Substitute {
@@ -990,23 +2321,21 @@ impl EditorState {
                     smart_case: flags.ignore_case.is_none() && opts.smart_case,
                 };
                 let sre = crate::pattern::Regex::compile(sp, sopts)?;
+                let buf = crate::pattern::Hay::new(bytes);
+                let lines = line_spans(buf.as_str());
                 let mut subs: Vec<Substitution> = Vec::new();
+                let mut consumed = None;
                 for &li in &marked {
-                    let (ls, le) = lines[li];
-                    let line = &hay[ls..le];
-                    let matches: Vec<crate::pattern::Match> = if flags.global {
-                        sre.find_all(line)
-                    } else {
-                        sre.find_at(line, 0).into_iter().collect()
-                    };
-                    for m in matches {
-                        subs.push(Substitution {
-                            start: ls + m.start,
-                            end: ls + m.end,
-                            replacement: expand_replacement(replacement, &line[m.start..m.end]),
-                            line: li,
-                        });
-                    }
+                    find_substitutions(
+                        &sre,
+                        &buf,
+                        &lines,
+                        (li, li),
+                        flags.global,
+                        replacement,
+                        &mut consumed,
+                        &mut subs,
+                    );
                 }
                 Ok(self.apply_substitutions(&subs).lines)
             }
@@ -1017,15 +2346,17 @@ impl EditorState {
     /// like a linewise `dd` over the span. No range = the cursor's line. Returns the number of lines
     /// deleted (0 on an empty buffer). The cursor lands at the start of the line that took their place.
     pub fn delete_lines(&mut self, range: SubRange) -> usize {
+        self.delete_lines_into(range, None)
+    }
+
+    /// `:[range]d {x}` — [`EditorState::delete_lines`] into register `reg` (`None` = the unnamed one).
+    pub fn delete_lines_into(&mut self, range: SubRange, reg: Option<char>) -> usize {
         let bytes = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(bytes) else {
-            return 0;
-        };
-        let lines = line_spans(hay);
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
-        let (first, last) = resolve_line_range(range, &lines, cursor_line);
-        let (fs, _) = lines[first];
-        let (_, le) = lines[last];
+        let hay: &[u8] = bytes;
+        let cursor_line = self.doc.line_of(BytePos(self.view.cursor));
+        let (first, last) = resolve_lines(range, line_count(&self.doc), cursor_line);
+        let (fs, first_end) = line_span(&self.doc, first);
+        let (_, le) = line_span(&self.doc, last);
         // Terminated last line: delete `[fs, le+1)` (the lines plus their trailing newlines). Unterminated
         // last line (deleting through EOF): delete `[fs-1, le)` to absorb the newline BEFORE the span so no
         // dangling blank line remains — except when `first` is line 0 (whole buffer), then `[0, le)`.
@@ -1039,16 +2370,31 @@ impl EditorState {
         if end == start {
             return 0;
         }
-        let list = EditList::new(vec![Edit::delete(start, end - start)])
+        // The deleted lines fill the unnamed register (and shift the numbered ring) linewise, as `dd` does
+        // (`:help :d`); `Register::linewise` terminates an unterminated last line.
+        let lines_text = bytes[fs..le].to_vec();
+        self.view
+            .registers
+            .delete(reg, Register::linewise(lines_text));
+        let list = EditList::new(vec![Edit::delete(BytePos(start), end - start)])
             .expect("a single line-range delete is well-formed");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
-            .with_hint(GroupHint::BreakBefore);
-        self.doc
-            .apply(txn)
+        // Vim moves the cursor to the range's first line (keeping its column) before deleting, so that is
+        // where `u` puts it back (nvim 0.12.6: `4l:3d<CR>u` -> line 3, column 4).
+        let col = self.view.cursor - line_start(bytes, self.view.cursor);
+        let undo_at = snap(bytes, (fs + col).min(first_end));
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
+            .with_hint(GroupHint::BreakBefore)
+            .with_cursor(BytePos(undo_at));
+        self.apply_txn(txn)
             .expect("line-range delete applies cleanly");
         self.view.last_was_edit = true;
+        // On the line that took their place, or the new last line (never the slot after a final newline,
+        // nor past the end of an unterminated last line), at its first non-blank.
         let nb = self.doc.bytes();
-        self.view.cursor = start.min(nb.len());
+        let at = motion::off_phantom_at(nb, start.min(nb.len()));
+        self.view.cursor = motion::first_non_blank(nb, line_start(nb, at));
+        self.settle_offsets();
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
         last - first + 1
     }
 
@@ -1056,19 +2402,21 @@ impl EditorState {
     /// the span (no range = the cursor's line). Returns the number of lines yanked. Non-destructive: the
     /// buffer and cursor are unchanged (Vim moves the cursor to the range's last line; deferred).
     pub fn yank_lines(&mut self, range: SubRange) -> usize {
+        self.yank_lines_into(range, None)
+    }
+
+    /// `:[range]y {x}` — [`EditorState::yank_lines`] into register `reg` (`None` = the unnamed one).
+    pub fn yank_lines_into(&mut self, range: SubRange, reg: Option<char>) -> usize {
         let bytes = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(bytes) else {
-            return 0;
-        };
-        let lines = line_spans(hay);
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
-        let (first, last) = resolve_line_range(range, &lines, cursor_line);
-        let (fs, _) = lines[first];
-        let (_, le) = lines[last];
+        let hay: &[u8] = bytes;
+        let cursor_line = self.doc.line_of(BytePos(self.view.cursor));
+        let (first, last) = resolve_lines(range, line_count(&self.doc), cursor_line);
+        let (fs, _) = line_span(&self.doc, first);
+        let (_, le) = line_span(&self.doc, last);
         let end = if le < hay.len() { le + 1 } else { le };
         // `Register::linewise` normalizes to end with `\n`, so an unterminated last line still yanks clean.
         let text = bytes[fs..end].to_vec();
-        self.view.registers.yank(None, Register::linewise(text));
+        self.view.registers.yank(reg, Register::linewise(text));
         last - first + 1
     }
 
@@ -1080,25 +2428,33 @@ impl EditorState {
     /// NEXT line. The cursor lands on the join seam, exactly where `J` leaves it. Returns the number of
     /// lines that were joined (0 if there was nothing to join).
     pub fn join_lines(&mut self, range: SubRange, no_space: bool) -> usize {
-        let bytes = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(bytes) else {
-            return 0;
-        };
-        let lines = line_spans(hay);
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
-        let (first, last) = resolve_line_range(range, &lines, cursor_line);
+        let cursor_line = self.doc.line_of(BytePos(self.view.cursor));
+        let (first, last) = resolve_lines(range, line_count(&self.doc), cursor_line);
+        let first_start = line_span(&self.doc, first).0;
         // Position the cursor at the range's first line so the reused join starts there; the count is the
         // line span, which `plan_join` clamps to `.max(2)` — so a single-line range joins the current line
         // with the next, matching Vim.
-        self.view.cursor = lines[first].0;
+        self.view.cursor = first_start;
         let count = (last - first + 1) as u32;
         let cmd = if no_space {
             Command::JoinLinesNoSpace(count)
         } else {
             Command::JoinLines(count)
         };
+        let before = self.doc.line_starts().len();
         apply_command(self, &cmd);
-        count.max(2) as usize
+        // Unlike `J` (cursor on the join seam), Vim's `:join` leaves the cursor on the FIRST NON-BLANK of the
+        // joined line (`ex_join` → `beginline(BL_WHITE)`; nvim v0.12.6). The join keeps `first`'s start.
+        let b = self.doc.bytes();
+        self.view.cursor = motion::first_non_blank(b, first_start);
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
+                                                // The lines that took part: one more than the seams removed (0 when nothing joined).
+        let seams = before - self.doc.line_starts().len();
+        if seams == 0 {
+            0
+        } else {
+            seams + 1
+        }
     }
 
     /// `:[range]>` / `:[range]<` — shift the range's lines one indent level right (`left = false`) or left
@@ -1110,17 +2466,14 @@ impl EditorState {
     /// line (Vim's ex-shift behaviour — verified against nvim v0.12.4). No range = the cursor's line. Returns
     /// the number of lines in the range.
     pub fn shift_lines(&mut self, range: SubRange, left: bool, levels: u32) -> usize {
-        let bytes = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(bytes) else {
-            return 0;
-        };
-        let lines = line_spans(hay);
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
-        let (first, last) = resolve_line_range(range, &lines, cursor_line);
+        let cursor_line = self.doc.line_of(BytePos(self.view.cursor));
+        let (first, last) = resolve_lines(range, line_count(&self.doc), cursor_line);
         let count = (last - first + 1) as u32;
+        let want = self.view.curswant.clone();
         // Anchor the cursor at the FIRST line so the reused shift (which reads its start line from the
         // cursor) covers `[first, last]`; every extra level re-shifts the same span from there.
-        self.view.cursor = lines[first].0;
+        let first_start = line_span(&self.doc, first).0;
+        self.view.cursor = first_start;
         let cmd = if left {
             Command::ShiftLeft(count)
         } else {
@@ -1133,100 +2486,152 @@ impl EditorState {
         // leaves it on the FIRST). A shift never adds/removes lines, so `last` still names that line;
         // recompute its start against the POST-shift buffer (indent changed the byte offsets).
         let b = self.doc.bytes();
-        if let Ok(hay) = std::str::from_utf8(b) {
-            let lines = line_spans(hay);
-            if let Some(&(last_ls, _)) = lines.get(last) {
-                self.view.cursor = motion::first_non_blank(b, last_ls);
-            }
+        if last < line_count(&self.doc) {
+            let last_ls = self.doc.nth_line_start(last).0;
+            self.view.cursor = motion::first_non_blank(b, last_ls);
         }
+        // `:>` keeps the wanted column (`beginline(BL_SOL | BL_FIX)` under 'nostartofline', #1104).
+        self.view.curswant = want;
         count as usize
     }
 
     /// `:[range]m {addr}` — move the range's lines to after the destination line, as one undo group.
     /// Returns the number of lines moved, or `None` if the destination lies inside the source (Vim's
-    /// "move lines into themselves") or the buffer is not UTF-8. No range = the cursor's line.
+    /// "move lines into themselves"). No range = the cursor's line.
     pub fn move_lines(&mut self, range: SubRange, dest: LineAddr) -> Option<usize> {
         self.relocate_lines(range, dest, false)
     }
 
     /// `:[range]t {addr}` / `:copy` — COPY the range's lines to after the destination line (the source
-    /// stays), as one undo group. Returns the number of lines copied, or `None` if the buffer is not UTF-8.
+    /// stays), as one undo group. Returns the number of lines copied, or `None` for a relative destination
+    /// off the buffer.
     pub fn copy_lines(&mut self, range: SubRange, dest: LineAddr) -> Option<usize> {
         self.relocate_lines(range, dest, true)
     }
 
-    /// Shared engine for `:m` (move) and `:t`/`:copy` (`copy = true` keeps the source). Rebuilds the line
-    /// list and replaces the whole buffer in one transaction — simple and always correct for these
-    /// non-hot ex commands (a surgical minimal-region edit is a possible later optimisation).
-    fn relocate_lines(&mut self, range: SubRange, dest: LineAddr, copy: bool) -> Option<usize> {
-        let bytes = self.doc.bytes();
-        let hay = std::str::from_utf8(bytes).ok()?;
-        let had_trailing_nl = hay.ends_with('\n');
-        let mut lines: Vec<String> = if hay.is_empty() {
-            Vec::new()
+    /// Where `:m`/`:t` leave the cursor on the line starting at `ls` of `bytes`: the wanted column (Vim
+    /// `ex_copymove` → `beginline(BL_SOL | BL_FIX)`, which with 'nostartofline' keeps `curswant`; nvim
+    /// v0.12.6), on a character of the line.
+    fn relocated_cursor(&self, bytes: &[u8], ls: usize) -> usize {
+        let le = line_end(bytes, ls);
+        let cursor = if self.view.curswant == range::MAXCOL {
+            motion::prev_grapheme(bytes, le).max(ls)
         } else {
-            let mut v: Vec<String> = hay.split('\n').map(str::to_string).collect();
-            if had_trailing_nl {
-                v.pop(); // drop the empty element after the final '\n'
-            }
-            v
+            range::want_col(bytes, ls, self.view.curswant.get(), self.view.indent.tabs())
         };
-        let nlines = lines.len();
-        if nlines == 0 {
+        if cursor >= le && le > ls {
+            motion::prev_grapheme(bytes, le)
+        } else {
+            cursor
+        }
+    }
+
+    /// Shared engine for `:m` (move) and `:t`/`:copy` (`copy = true` keeps the source), as one
+    /// transaction over the lines it moves or copies (#1257): its lines come from the document's line
+    /// index and only the block is copied, so a `:g` that runs it per line does not rescan the buffer.
+    fn relocate_lines(&mut self, range: SubRange, dest: LineAddr, copy: bool) -> Option<usize> {
+        let old = self.doc.bytes();
+        if old.is_empty() {
             return Some(0);
         }
-        let spans = line_spans(hay);
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
-        let (first, last) = resolve_line_range(range, &spans, cursor_line);
-        // `line_spans` counts a phantom empty line after a trailing '\n'; the split/pop `lines` vec does
-        // not, so clamp to the vec.
-        let last = last.min(nlines - 1);
-        let first = first.min(last);
-        // Destination as a 0-based insert index in `0..=nlines`.
-        let ins = match dest {
-            LineAddr::Line(n) => n.min(nlines),
-            LineAddr::Last => nlines,
-            LineAddr::Current => (cursor_line + 1).min(nlines),
-        };
-        // A move whose destination is inside/adjacent to the source is a no-op (Vim errors; we decline).
-        if !copy && ins >= first && ins <= last + 1 {
+        let had_trailing_nl = old.ends_with(b"\n");
+        let nlines = line_count(&self.doc);
+        let cursor_line = self.doc.line_of(BytePos(self.view.cursor));
+        let (first, last) = resolve_lines(range, nlines, cursor_line);
+        // Destination as a 0-based insert index in `0..=nlines`; a relative one off the buffer declines.
+        let ins = dest.insert_index(cursor_line, nlines)?;
+        // A move INTO the block is E134 (declined); a move to just before or just after it changes nothing
+        // but still puts the cursor on the block's last line, as Vim's `do_move` does (`:2m2`, #724).
+        if !copy && ins > first && ins <= last {
             return None;
         }
-        let block: Vec<String> = lines[first..=last].to_vec();
-        let count = block.len();
-        if !copy {
-            lines.drain(first..=last);
+        // The block is `old[s..e]` (its lines with their newlines; an unterminated last line has none),
+        // and `p` is where the destination line ends: the start of the line after it.
+        let s = line_span(&self.doc, first).0;
+        let count = last - first + 1;
+        if !copy && (ins == first || ins == last + 1) {
+            let ls = self.doc.nth_line_start(last).0;
+            self.view.cursor = self.relocated_cursor(old, ls);
+            return Some(0);
         }
+        let e = self.doc.nth_line_start(last + 1).0;
+        let p = self.doc.nth_line_start(ins).0;
         // After a move removes the block, an insert index past the block shifts left by `count`.
         let adj = if copy || ins <= first {
             ins
         } else {
             ins - count
-        }
-        .min(lines.len());
-        for (k, line) in block.into_iter().enumerate() {
-            lines.insert(adj + k, line);
-        }
-        let mut text = lines.join("\n");
-        if had_trailing_nl && !text.is_empty() {
-            text.push('\n');
-        }
-        let new_bytes = text.into_bytes();
-        // Cursor: onto the first relocated line at its new position.
-        let cursor = new_bytes
-            .split_inclusive(|&b| b == b'\n')
-            .take(adj)
-            .map(<[u8]>::len)
-            .sum::<usize>()
-            .min(new_bytes.len());
+        };
 
-        let list = EditList::new(vec![Edit::replace(0, bytes.len(), new_bytes)])
-            .expect("a single whole-buffer replace is well-formed");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
-            .with_hint(GroupHint::BreakBefore);
-        self.doc.apply(txn).expect("line relocate applies cleanly");
+        // A move is the block deleted at its place and inserted at the destination, so the line anchors on
+        // it go along (nvim's `ex_copymove` moves the marks, #1125). Without a final newline the last line
+        // has none: a block holding it is cut with the `\n` before it, and one moved after it goes in after
+        // a `\n`. The one shape that does not split that way (the last line moved onto an empty line just
+        // above it) takes the whole-region rewrite, whose marks keep their lines. A copy is the block
+        // inserted, recorded as the one line edit [`Edit::lines_changed`] finds for it.
+        let mut block = old[s..e].to_vec();
+        let edits = if copy {
+            if !had_trailing_nl {
+                if p == old.len() {
+                    // After the unterminated last line: `\n` + the block without its own.
+                    if e < old.len() {
+                        block.pop();
+                    }
+                    block.insert(0, b'\n');
+                } else if e == old.len() {
+                    block.push(b'\n'); // the unterminated last line copied above: give it its newline
+                }
+            }
+            Some(vec![Edit::lines_changed_by_insert(old, p, block)])
+        } else if had_trailing_nl || (e < old.len() && p < old.len()) {
+            Some(if p < s {
+                vec![
+                    Edit::insert(BytePos(p), block),
+                    Edit::delete(BytePos(s), e - s),
+                ]
+            } else {
+                vec![
+                    Edit::delete(BytePos(s), e - s),
+                    Edit::insert(BytePos(p), block),
+                ]
+            })
+        } else if e < old.len() {
+            // After the unterminated last line: `\n` + the block without its own.
+            block.pop();
+            block.insert(0, b'\n');
+            Some(vec![
+                Edit::delete(BytePos(s), e - s),
+                Edit::insert(BytePos(p), block),
+            ])
+        } else if p + 1 < s {
+            // The unterminated last line moves up: cut it with the `\n` before it.
+            block.push(b'\n');
+            Some(vec![
+                Edit::insert(BytePos(p), block),
+                Edit::delete(BytePos(s - 1), e - s + 1),
+            ])
+        } else {
+            None
+        };
+        let edits = edits.unwrap_or_else(|| {
+            vec![Edit::lines_changed(
+                old,
+                relocated_by_lines(old, first, last, ins, copy),
+            )]
+        });
+        let list = EditList::new(edits).expect("the move's delete and insert are disjoint");
+        // `u` and `CTRL-R` start from where the cursor stood: Vim's `u_save` in `ex_copy`/`do_move` runs
+        // before the cursor moves, so `uh_cursor` is the cursor before the command (#1258).
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
+            .with_hint(GroupHint::BreakBefore)
+            .with_cursor(BytePos(self.view.cursor.min(old.len())));
+        self.apply_txn(txn).expect("line relocate applies cleanly");
         self.view.last_was_edit = true;
-        self.view.cursor = cursor.min(self.doc.bytes().len());
+        // On the block's last line where it now is.
+        let new = self.doc.bytes();
+        let ls = self.doc.nth_line_start(adj + count - 1).0;
+        self.view.cursor = self.relocated_cursor(new, ls).min(new.len());
+        self.settle_offsets();
         Some(count)
     }
 
@@ -1239,7 +2644,7 @@ impl EditorState {
     /// (the bare `:put` default). The cursor lands on the first non-blank of the LAST inserted line
     /// (verified against nvim v0.12.4). `reg` is the register name (`None` = the unnamed register); reading
     /// it reuses the shared [`RegisterStore`], never a new store. Returns the number of lines inserted
-    /// (0 — a no-op leaving the cursor put — if the register is empty or the buffer is not UTF-8).
+    /// (0 — a no-op leaving the cursor put — if the register is empty).
     pub fn put_lines(&mut self, addr: LineAddr, reg: Option<char>) -> usize {
         // Reuse the shared register store: read the named slot's bytes (unnamed when `reg` is None).
         let reg_text = self.view.registers.get(reg).text().to_vec();
@@ -1247,11 +2652,9 @@ impl EditorState {
             return 0;
         }
         let buf = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(buf) else {
-            return 0;
-        };
+        let hay: &[u8] = buf;
         let orig_len = buf.len();
-        let had_trailing_nl = hay.ends_with('\n');
+        let had_trailing_nl = hay.ends_with(b"\n");
         // The lines to insert: split the register text on '\n'. A normalized LINEWISE register ends with a
         // '\n', so drop the empty element it leaves after the final newline. A CHARWISE register with no
         // trailing newline still splits into whole lines — the linewise-forcing rule.
@@ -1275,11 +2678,9 @@ impl EditorState {
         let nlines = buf_lines.len();
         // Destination as a 0-based insert index in `0..=nlines` (Vim `:put N` = "after line N", `:0put` =
         // top; a bare `:put` = after the cursor's line).
-        let cursor_line = crate::pos::line_of(buf, self.view.cursor);
-        let ins = match addr {
-            LineAddr::Line(n) => n.min(nlines),
-            LineAddr::Last => nlines,
-            LineAddr::Current => (cursor_line + 1).min(nlines),
+        let cursor_line = crate::pos::raw::line_of(buf, self.view.cursor);
+        let Some(ins) = addr.insert_index(cursor_line, nlines) else {
+            return 0; // a relative address off the buffer inserts nothing
         };
         let count = ins_lines.len();
         for (k, line) in ins_lines.into_iter().enumerate() {
@@ -1303,15 +2704,17 @@ impl EditorState {
             .take(last_idx)
             .map(<[u8]>::len)
             .sum();
-        let list = EditList::new(vec![Edit::replace(0, orig_len, new_bytes)])
-            .expect("a single whole-buffer replace is well-formed");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
+        let list = EditList::new(vec![Edit::lines_changed(self.doc.bytes(), new_bytes)])
+            .expect("a single edit is well-formed");
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
             .with_hint(GroupHint::BreakBefore);
-        self.doc.apply(txn).expect("line put applies cleanly");
+        self.apply_txn(txn).expect("line put applies cleanly");
         self.view.last_was_edit = true;
         // Vim leaves the cursor on the first non-blank of the last inserted line.
         let nb = self.doc.bytes();
         self.view.cursor = motion::first_non_blank(nb, line_start.min(nb.len()));
+        self.settle_offsets();
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
         count
     }
 
@@ -1324,17 +2727,15 @@ impl EditorState {
     /// The cursor lands on the FIRST non-blank of the FIRST inserted line for a file read (`cursor_on_last =
     /// false`), and of the LAST inserted line for a command read (`cursor_on_last = true`) — a real nvim
     /// v0.12.4 quirk (`:r file` and `:r !cmd` differ), reproduced faithfully. Returns the number of lines
-    /// inserted (0 — a no-op leaving the cursor put — for empty `text` or a non-UTF-8 buffer).
+    /// inserted (0 — a no-op leaving the cursor put — for empty `text`).
     pub fn read_lines(&mut self, addr: LineAddr, text: &[u8], cursor_on_last: bool) -> usize {
         if text.is_empty() {
             return 0;
         }
         let buf = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(buf) else {
-            return 0;
-        };
+        let hay: &[u8] = buf;
         let orig_len = buf.len();
-        let had_trailing_nl = hay.ends_with('\n');
+        let had_trailing_nl = hay.ends_with(b"\n");
         // The lines to insert: split on '\n', dropping the empty element after a final newline so a file that
         // ends in '\n' does not read a spurious blank line (a file with NO final newline keeps its last line).
         let mut ins_lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
@@ -1355,11 +2756,9 @@ impl EditorState {
             v
         };
         let nlines = buf_lines.len();
-        let cursor_line = crate::pos::line_of(buf, self.view.cursor);
-        let ins = match addr {
-            LineAddr::Line(n) => n.min(nlines),
-            LineAddr::Last => nlines,
-            LineAddr::Current => (cursor_line + 1).min(nlines),
+        let cursor_line = crate::pos::raw::line_of(buf, self.view.cursor);
+        let Some(ins) = addr.insert_index(cursor_line, nlines) else {
+            return 0; // a relative address off the buffer inserts nothing
         };
         let count = ins_lines.len();
         for (k, line) in ins_lines.into_iter().enumerate() {
@@ -1382,46 +2781,35 @@ impl EditorState {
             .take(target_idx)
             .map(<[u8]>::len)
             .sum();
-        let list = EditList::new(vec![Edit::replace(0, orig_len, new_bytes)])
-            .expect("a single whole-buffer replace is well-formed");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
+        let list = EditList::new(vec![Edit::lines_changed(self.doc.bytes(), new_bytes)])
+            .expect("a single edit is well-formed");
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
             .with_hint(GroupHint::BreakBefore);
-        self.doc.apply(txn).expect("line read applies cleanly");
+        self.apply_txn(txn).expect("line read applies cleanly");
         self.view.last_was_edit = true;
         let nb = self.doc.bytes();
         self.view.cursor = motion::first_non_blank(nb, line_start.min(nb.len()));
+        self.settle_offsets();
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
         count
     }
 
     /// The text of the lines in `range` (each with a trailing `\n`), as Vim feeds a filter command's stdin
-    /// for `:{range}!{cmd}`. `None` for an empty or non-UTF-8 buffer. No range = the current line.
+    /// for `:{range}!{cmd}`: the buffer's bytes as they are, whatever their encoding. `None` for an empty
+    /// buffer. No range = the current line.
     #[must_use]
-    pub fn range_text(&self, range: SubRange) -> Option<String> {
+    pub fn range_text(&self, range: SubRange) -> Option<Vec<u8>> {
         let bytes = self.doc.bytes();
-        let hay = std::str::from_utf8(bytes).ok()?;
-        if hay.is_empty() {
+        if bytes.is_empty() {
             return None;
         }
-        let had_trailing_nl = hay.ends_with('\n');
-        let nlines = {
-            let mut n = hay.split('\n').count();
-            if had_trailing_nl {
-                n -= 1; // the split's empty tail after the final '\n' is not a line
-            }
-            n
-        };
-        if nlines == 0 {
-            return None;
-        }
-        let spans = line_spans(hay);
-        let cursor_line = crate::pos::line_of(bytes, self.view.cursor);
+        let spans = line_spans(bytes);
+        let cursor_line = crate::pos::raw::line_of(bytes, self.view.cursor);
         let (first, last) = resolve_line_range(range, &spans, cursor_line);
-        let last = last.min(nlines - 1);
-        let first = first.min(last);
-        let mut out = String::new();
+        let mut out = Vec::new();
         for &(s, e) in &spans[first..=last] {
-            out.push_str(&hay[s..e]);
-            out.push('\n');
+            out.extend_from_slice(&bytes[s..e]);
+            out.push(b'\n');
         }
         Some(out)
     }
@@ -1430,14 +2818,13 @@ impl EditorState {
     /// on `\n` with the trailing-newline element dropped, exactly like [`read_lines`]), as one undo group. An
     /// empty `text` deletes the range's lines (Vim: a filter that emits nothing). The cursor lands on the
     /// FIRST non-blank of the first line of the replaced region (verified vs nvim v0.12.4). Returns the number
-    /// of INPUT lines filtered (0 for an empty / non-UTF-8 buffer), matching Vim's "N lines filtered" report.
+    /// of INPUT lines filtered (0 for an empty buffer), matching Vim's "N lines filtered" report. Bytes are
+    /// spliced as they are, so a buffer that is not UTF-8 filters too.
     pub fn filter_lines(&mut self, range: SubRange, text: &[u8]) -> usize {
         let buf = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(buf) else {
-            return 0;
-        };
+        let hay = buf;
         let orig_len = buf.len();
-        let had_trailing_nl = hay.ends_with('\n');
+        let had_trailing_nl = hay.ends_with(b"\n");
         let mut lines: Vec<&[u8]> = if hay.is_empty() {
             Vec::new()
         } else {
@@ -1452,7 +2839,7 @@ impl EditorState {
             return 0;
         }
         let spans = line_spans(hay);
-        let cursor_line = crate::pos::line_of(buf, self.view.cursor);
+        let cursor_line = crate::pos::raw::line_of(buf, self.view.cursor);
         let (first, last) = resolve_line_range(range, &spans, cursor_line);
         let last = last.min(nlines - 1);
         let first = first.min(last);
@@ -1484,148 +2871,289 @@ impl EditorState {
             .take(target_idx)
             .map(<[u8]>::len)
             .sum();
-        let list = EditList::new(vec![Edit::replace(0, orig_len, new_bytes)])
-            .expect("a single whole-buffer replace is well-formed");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
-            .with_hint(GroupHint::BreakBefore);
-        self.doc.apply(txn).expect("line filter applies cleanly");
+        // Undo and redo come back to the start of the range's LAST line (#1165): nvim's `do_filter` saves
+        // the change with the cursor there (`uh_cursor`), having moved it to `line2` to append the output.
+        let last_start = spans[last].0;
+        let list = EditList::new(vec![Edit::lines_changed(self.doc.bytes(), new_bytes)])
+            .expect("a single edit is well-formed");
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
+            .with_hint(GroupHint::BreakBefore)
+            .with_cursor(BytePos(last_start));
+        self.apply_txn(txn).expect("line filter applies cleanly");
         self.view.last_was_edit = true;
         let nb = self.doc.bytes();
         self.view.cursor = motion::first_non_blank(nb, line_start.min(nb.len()));
+        self.settle_offsets();
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
         input_count
     }
 
-    /// `:[range]sort[!] [i][n][r][u] [/pattern/]` — sort the range's lines (whole file when the caller
-    /// passes `WholeFile`) as one undo group. The sort KEY per line is, in order: the text after the first
-    /// `pattern` match (or the matched text itself under `r`), else the whole line; lowercased under `i`
-    /// (`ignore_case`); its first decimal number under `n` (`numeric`). `reverse` (`!`) sorts descending;
-    /// `unique` (`u`) drops runs of equal KEYS after sorting. The sort is stable. Returns lines removed by
-    /// `u`.
-    pub fn sort_lines(&mut self, range: SubRange, opts: &SortOptions) -> usize {
-        let bytes = self.doc.bytes();
-        let Ok(hay) = std::str::from_utf8(bytes) else {
-            return 0;
+    /// `:[range]retab[!] [new_tabstop]` (#609), as nvim's `ex_retab` does it (v0.12.6): every run of white
+    /// space that holds a `<Tab>` (with `bang`, also every run of two or more spaces) is rewritten for the
+    /// same width — measured with the current `'tabstop'` — as tabs and spaces under `new_tabstop`, or as
+    /// spaces only when `'expandtab'` is set. A run is left alone when the rewrite would not make it
+    /// shorter, except under `'expandtab'` or when it holds a tab. The new stops are one width (a
+    /// `'tabstop'`) or a list (a `'vartabstop'`, #1163); `None` keeps the stops in force. Afterwards
+    /// `'vartabstop'` takes the new list when it was in use or the list has more than one stop, else
+    /// `'tabstop'` takes the one width. The changed lines are one undo group, and the cursor stays on
+    /// its line at the wanted column. Returns whether any line changed.
+    pub fn retab(&mut self, range: SubRange, bang: bool, new_tabstop: Option<VarStops>) -> bool {
+        let old = self.view.indent.tabs();
+        let new = match new_tabstop.filter(|v| !v.is_empty()) {
+            Some(v) => Tabs::new(old.tabstop(), v),
+            None => old,
         };
-        let had_trailing_nl = hay.ends_with('\n');
-        let mut lines: Vec<String> = if hay.is_empty() {
+        let expand = self.view.indent.style == IndentStyle::Space;
+        let bytes = self.doc.bytes().to_vec();
+        let hay: &[u8] = &bytes;
+        let spans = line_spans(hay);
+        let set_new = |st: &mut Self| {
+            if let Some(v) = new_tabstop.filter(|v| !v.is_empty()) {
+                if !st.view.indent.vts.is_empty() || v.count() > 1 {
+                    st.view.indent.vts = v;
+                } else {
+                    st.view.indent.tab_width = usize::from(v.stops()[0]);
+                }
+            }
+        };
+        if spans.is_empty() {
+            set_new(self);
+            return false;
+        }
+        let cursor_line = crate::pos::raw::line_of(&bytes, self.view.cursor);
+        // The wanted column the cursor returns to, measured with the tabstop in force now (Vim computes
+        // it when it is needed, so a `:set ts` since the last move counts).
+        if self.view.curswant != range::MAXCOL {
+            self.view.curswant = self.wanted_col();
+        }
+        let (first, last) = resolve_line_range(range, &spans, cursor_line);
+        let last = last.min(spans.len() - 1);
+        let first = first.min(last);
+        let mut out = bytes[..spans[first].0].to_vec();
+        let mut changed = false;
+        for li in first..=last {
+            let (ls, le) = spans[li];
+            let new_line = retab_line(&bytes[ls..le], bang, expand, old, new);
+            changed |= new_line != bytes[ls..le];
+            out.extend_from_slice(&new_line);
+            if li < last {
+                out.extend_from_slice(&bytes[le..spans[li + 1].0]);
+            }
+        }
+        out.extend_from_slice(&bytes[spans[last].1..]);
+        set_new(self);
+        if !changed {
+            return false;
+        }
+        let list = EditList::new(vec![Edit::lines_changed(self.doc.bytes(), out)])
+            .expect("a single edit is well-formed");
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
+            .with_hint(GroupHint::BreakBefore);
+        self.apply_txn(txn).expect("retab applies cleanly");
+        self.view.last_was_edit = true;
+        let nb = self.doc.bytes();
+        let ls = nb
+            .split_inclusive(|&b| b == b'\n')
+            .take(cursor_line)
+            .map(<[u8]>::len)
+            .sum::<usize>()
+            .min(nb.len());
+        self.view.cursor = self.relocated_cursor(nb, ls);
+        self.settle_offsets();
+        true
+    }
+
+    /// `:[range]sort[!] [i][n][r][u] [/pattern/]` — sort the range's lines (whole file when the caller
+    /// passes `WholeFile`) as one undo group, the way nvim's `ex_sort` does (v0.12.6). The sort KEY per
+    /// line is the text after the first `pattern` match (the matched text itself under `r`), or the whole
+    /// line; a line the pattern does not match has an empty key. Text keys compare bytewise, ignoring
+    /// ASCII case under `i`. Under `n` the key is the first decimal number in it (a `-` just before it
+    /// counts, and a number too large saturates); a key with no number sorts before every number. The
+    /// sort is stable; `reverse` (`!`) reverses the sorted order, ties included. `unique` (`u`) then drops
+    /// a line equal to the one kept before it, comparing WHOLE lines (case-folded under `i`), not keys.
+    /// The pattern is matched with the `'ignorecase'` setting (no smartcase). The cursor lands on the
+    /// first non-blank of the range's first line. Returns the lines removed by `u`.
+    ///
+    /// # Errors
+    /// [`RegexError`] if `pattern` does not compile; the buffer is left as it was. A one-line range is a
+    /// no-op that never compiles the pattern (Vim returns before reading the arguments).
+    pub fn sort_lines(&mut self, range: SubRange, opts: &SortOptions) -> Result<usize, RegexError> {
+        let bytes = self.doc.bytes();
+        let hay: &[u8] = bytes;
+        let had_trailing_nl = hay.ends_with(b"\n");
+        let mut lines: Vec<&[u8]> = if hay.is_empty() {
             Vec::new()
         } else {
-            let mut v: Vec<String> = hay.split('\n').map(str::to_string).collect();
+            let mut v: Vec<&[u8]> = hay.split(|&c| c == b'\n').collect();
             if had_trailing_nl {
                 v.pop();
             }
             v
         };
         if lines.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let spans = line_spans(hay);
-        let cursor_line = crate::pos::line_of(hay.as_bytes(), self.view.cursor);
+        let cursor_line = crate::pos::raw::line_of(hay, self.view.cursor);
         let (first, last) = resolve_line_range(range, &spans, cursor_line);
-        // `line_spans` counts a phantom empty line after a trailing '\n'; the split/pop `lines` vec does
-        // not, so clamp the resolved indices to the vec.
         let last = last.min(lines.len() - 1);
         let first = first.min(last);
+        if first == last {
+            return Ok(0);
+        }
 
-        // The comparable key for one line, honoring `/pattern/`, `r`, `i`, and `n`.
-        let compiled = opts.pattern.as_deref().and_then(|p| {
-            crate::pattern::Regex::compile(p, crate::pattern::Options::default()).ok()
-        });
-        let key_of = |line: &str| -> SortKey {
-            // Slice the pattern-selected base: text after the match, or the match itself under `r`; a line
-            // the pattern does not match yields an empty base (Vim floats non-matching lines to the front).
-            let base: &str = match &compiled {
-                Some(re) => match re.find_at(line, 0) {
-                    Some(m) if opts.use_match => &line[m.start..m.end],
-                    Some(m) => &line[m.end..],
-                    None => "",
+        let search = self.view.search_options();
+        let compiled = match opts.pattern.as_deref() {
+            Some(p) => Some(crate::pattern::Regex::compile(
+                p,
+                crate::pattern::Options {
+                    magic: search.magic,
+                    ignore_case: search.ignore_case,
+                    smart_case: false,
                 },
+            )?),
+            None => None,
+        };
+        // The comparable key for one line, honoring `/pattern/`, `r`, `i`, and `n`. A byte that is not
+        // UTF-8 is one char to the pattern (#1243), and text keys compare the line's bytes.
+        let key_of = |line: &[u8]| -> SortKey {
+            let base: &[u8] = match &compiled {
+                Some(re) => {
+                    let lh = crate::pattern::Hay::new(line);
+                    match re
+                        .find_at(lh.as_str(), BytePos(0))
+                        .map(|m| lh.to_buf_match(m))
+                    {
+                        Some(m) if opts.use_match => &line[m.start.0..m.end.0],
+                        Some(m) => &line[m.end.0..],
+                        None => b"",
+                    }
+                }
                 None => line,
             };
-            if opts.numeric {
-                SortKey::Num(first_number(base))
-            } else if opts.ignore_case {
-                SortKey::Text(base.to_lowercase())
-            } else {
-                SortKey::Text(base.to_string())
+            match opts.key {
+                SortKind::Decimal | SortKind::Hex | SortKind::Octal | SortKind::Binary => {
+                    SortKey::Num(first_number(&crate::pattern::spell(base), opts.key))
+                }
+                SortKind::Float => SortKey::Float(first_float(&crate::pattern::spell(base))),
+                SortKind::Locale => SortKey::Locale(crate::pattern::spell(base).into_owned()),
+                SortKind::Text if opts.ignore_case => SortKey::Text(base.to_ascii_lowercase()),
+                SortKind::Text => SortKey::Text(base.to_vec()),
             }
         };
 
-        let mut keyed: Vec<(SortKey, String)> = lines[first..=last]
+        let mut keyed: Vec<(SortKey, &[u8])> = lines[first..=last]
             .iter()
-            .map(|l| (key_of(l), l.clone()))
+            .map(|&l| (key_of(l), l))
             .collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0)); // stable (Vim's sort is stable)
-        if opts.unique {
-            keyed.dedup_by(|a, b| a.0 == b.0);
-        }
+        keyed.sort_by(|a, b| a.0.compare(&b.0)); // stable (Vim breaks ties by line number)
         if opts.reverse {
             keyed.reverse();
         }
-        let seg: Vec<String> = keyed.into_iter().map(|(_, l)| l).collect();
+        let mut seg: Vec<&[u8]> = keyed.into_iter().map(|(_, l)| l).collect();
+        if opts.unique {
+            if opts.ignore_case {
+                seg.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            } else {
+                seg.dedup();
+            }
+        }
         let removed = (last - first + 1) - seg.len();
         lines.splice(first..=last, seg);
 
-        let mut text = lines.join("\n");
-        if had_trailing_nl && !text.is_empty() {
-            text.push('\n');
+        let mut new_bytes = lines.join(&b'\n');
+        if had_trailing_nl && !new_bytes.is_empty() {
+            new_bytes.push(b'\n');
         }
-        let new_bytes = text.into_bytes();
-        let cursor = new_bytes
+        let line_start = new_bytes
             .split_inclusive(|&b| b == b'\n')
             .take(first)
             .map(<[u8]>::len)
             .sum::<usize>()
             .min(new_bytes.len());
-        let list = EditList::new(vec![Edit::replace(0, bytes.len(), new_bytes)])
-            .expect("a single whole-buffer replace is well-formed");
-        let txn = Transaction::new(self.doc.revision(), list, TransactionOrigin::UserInput)
+        let list = EditList::new(vec![Edit::lines_changed(self.doc.bytes(), new_bytes)])
+            .expect("a single edit is well-formed");
+        let txn = Transaction::new(self.doc.revision(), list, self.origin)
             .with_hint(GroupHint::BreakBefore);
-        self.doc.apply(txn).expect("sort applies cleanly");
+        self.apply_txn(txn).expect("sort applies cleanly");
         self.view.last_was_edit = true;
-        self.view.cursor = cursor.min(self.doc.bytes().len());
-        removed
+        let nb = self.doc.bytes();
+        self.view.cursor = motion::first_non_blank(nb, line_start.min(nb.len()));
+        self.settle_offsets();
+        self.view.curswant = self.wanted_col(); // Vim's `beginline` resets the wanted column (#1104)
+        Ok(removed)
     }
 
     /// Apply a set of DISJOINT byte-range replacements as ONE undo group, tagged with the caller-supplied
     /// `origin` — a separate undo unit from user edits (F-005). This is a PROVENANCE-AGNOSTIC batch-edit
     /// primitive: the CORE provides the mechanism, the CALLER states the policy (the LSP frontend passes
     /// [`TransactionOrigin::Lsp`]; a snippet/macro/AI batch would pass its own origin). Each edit is
-    /// `(start, end, replacement)`; out-of-range or overlapping sets are skipped (formatter output is disjoint).
-    /// The cursor is clamped into the new buffer. No-op on an empty/invalid set.
-    pub fn apply_edits(&mut self, edits: &[(usize, usize, String)], origin: TransactionOrigin) {
-        let len = self.doc.bytes().len();
-        let mut valid: Vec<(usize, usize, String)> = edits
+    /// `(start, end, replacement)` in [`BytePos`] (INV-POS-TYPED: a caller holding UTF-16 or char columns,
+    /// as an LSP client does, converts at its side of this boundary). The batch is atomic (#716): if any edit
+    /// is reversed, out of range, splits a UTF-8 character or overlaps another, NOTHING is applied and this
+    /// returns `false`. The cursor is carried through the edits as a byte anchor that follows the text after
+    /// it, so an edit above it moves it with its text. A batch of more than [`MAX_APPLY_EDITS`] edits or
+    /// [`MAX_APPLY_EDIT_BYTES`] of replacement text is refused too, so a trace's `ex_edits` record has the
+    /// same bound live and in replay (RFC-0020 R6).
+    pub fn apply_edits(
+        &mut self,
+        edits: &[(BytePos, BytePos, String)],
+        origin: TransactionOrigin,
+    ) -> bool {
+        let b = self.doc.bytes();
+        let boundary = |p: usize| p == b.len() || (p < b.len() && (b[p] & 0xC0) != 0x80);
+        let text_bytes = edits
             .iter()
-            .filter(|(s, e, _)| s <= e && *e <= len)
-            .cloned()
-            .collect();
-        if valid.is_empty() {
-            return;
+            .map(|(_, _, t)| t.len())
+            .fold(0usize, usize::saturating_add);
+        if edits.is_empty()
+            || edits.len() > MAX_APPLY_EDITS
+            || text_bytes > MAX_APPLY_EDIT_BYTES
+            || !edits
+                .iter()
+                .all(|(s, e, _)| s <= e && e.0 <= b.len() && boundary(s.0) && boundary(e.0))
+        {
+            return false;
         }
-        valid.sort_by_key(|(s, _, _)| *s); // EditList requires ascending, disjoint edits
-        let es: Vec<Edit> = valid
-            .into_iter()
-            .map(|(s, e, t)| Edit::replace(s, e - s, t.into_bytes()))
+        let es: Vec<Edit> = edits
+            .iter()
+            .map(|(s, e, t)| Edit::replace(*s, e.0 - s.0, t.clone().into_bytes()))
             .collect();
         let Ok(list) = EditList::new(es) else {
-            return; // overlapping edits — refuse rather than corrupt the buffer
+            return false; // overlapping edits — refuse rather than corrupt the buffer
         };
+        let cursor =
+            crate::anchor::map_byte(&list, BytePos(self.view.cursor), crate::anchor::Bias::After).0;
         let txn =
             Transaction::new(self.doc.revision(), list, origin).with_hint(GroupHint::BreakBefore);
-        if self.doc.apply(txn).is_ok() {
-            self.view.last_was_edit = true;
-            let clamped = self.view.cursor.min(self.doc.bytes().len());
-            self.set_cursor(clamped);
+        if self.apply_txn(txn).is_err() {
+            return false;
         }
+        self.view.last_was_edit = true;
+        self.set_cursor(BytePos(cursor.min(self.doc.bytes().len())));
+        self.settle_offsets();
+        true
     }
 
-    /// One indent level as bytes: `tab_width` spaces (space style) or a single `\t` (tab style).
-    fn indent_unit(&self) -> Vec<u8> {
-        match self.view.indent.style {
-            IndentStyle::Space => vec![b' '; self.view.indent.tab_width],
-            IndentStyle::Tab => vec![b'\t'],
-        }
+    /// After an edit applied outside [`commit`]: snap the cursor and every stored offset into the new
+    /// buffer (#691). Ex edits bypass `commit`, so without this they leave offsets mid-character.
+    fn settle_offsets(&mut self) {
+        let bytes = self.doc.bytes();
+        self.view.cursor = snap(bytes, self.view.cursor);
+        self.view.snap_offsets(bytes);
+    }
+
+    /// The leading whitespace for an indent of `level` shiftwidths, in the configured style (spaces, or
+    /// tabs at the tabstop plus a spaces remainder) — Vim's `set_indent(level * sw)`.
+    fn indent_for_level(&self, level: usize) -> Vec<u8> {
+        self.view
+            .indent
+            .whitespace(level * self.view.indent.shift_width())
+    }
+
+    /// The effective shiftwidth in columns (see [`View::shift_width`]).
+    fn shift_width(&self) -> usize {
+        self.view.indent.shift_width()
     }
 
     /// The unnamed register's current contents (for tests / a future `:registers`).
@@ -1638,6 +3166,14 @@ impl EditorState {
     #[must_use]
     pub fn registers(&self) -> &RegisterStore {
         &self.view.registers
+    }
+
+    /// The 0-based inclusive line range the operator span of `cmd` covers — a search, `n`/`N`, `*`/`#`, a
+    /// `gn` match or a mark — or `None` when it has no target or is not a span command. Read-only; the
+    /// command's operator is ignored. The `!` filter numbers its `:{range}!` line from this (#800).
+    #[must_use]
+    pub fn span_lines(&self, cmd: &Command) -> Option<(usize, usize)> {
+        planner::span_lines(self, cmd)
     }
 
     /// The one-shot register selected by the most recent `"x` and not yet consumed. The
@@ -1685,7 +3221,7 @@ impl EditorState {
     /// use [`EditorState::block_spans`] to paint that). Charwise includes the character under the active
     /// end; linewise spans whole lines. For the frontend to paint the selection.
     #[must_use]
-    pub fn selection_span(&self) -> Option<(usize, usize)> {
+    pub fn selection_span(&self) -> Option<(BytePos, BytePos)> {
         // Visual and Select paint the same selection (they share the anchor and toggle via CTRL-G).
         self.view.selection_span(self.bytes())
     }
@@ -1694,7 +3230,7 @@ impl EditorState {
     /// the rectangle crosses; short lines contribute an empty range at their end), or `None` when the
     /// selection is not blockwise. For the frontend to paint a column-aligned block.
     #[must_use]
-    pub fn block_spans(&self) -> Option<Vec<(usize, usize)>> {
+    pub fn block_spans(&self) -> Option<Vec<(BytePos, BytePos)>> {
         self.view.block_spans(self.bytes())
     }
 
@@ -1712,28 +3248,28 @@ impl EditorState {
 
     /// The cursor's byte offset (on a char boundary).
     #[must_use]
-    pub fn cursor(&self) -> usize {
-        self.view.cursor
+    pub fn cursor(&self) -> BytePos {
+        BytePos(self.view.cursor)
     }
 
     /// The jumplist positions (oldest → newest) for `:jumps`.
     #[must_use]
-    pub fn jumps_snapshot(&self) -> Vec<usize> {
-        self.view.jumps.clone()
+    pub fn jumps_snapshot(&self) -> Vec<BytePos> {
+        self.view.jumps.iter().copied().map(BytePos).collect()
     }
 
     /// The change-list positions (oldest → newest) for `:changes`.
     #[must_use]
-    pub fn changes_snapshot(&self) -> Vec<usize> {
-        self.view.changes.clone()
+    pub fn changes_snapshot(&self) -> Vec<BytePos> {
+        self.view.changes.iter().copied().map(BytePos).collect()
     }
 
     /// The SET marks for `:marks` — the named marks `a`–`z`, the `.` last-change mark, and the `^`
     /// last-insert mark — as `(name, byte offset)`, in that order (unset marks omitted).
     #[must_use]
-    pub fn marks_snapshot(&self) -> Vec<(char, usize)> {
+    pub fn marks_snapshot(&self) -> Vec<(char, BytePos)> {
         let mut out = Vec::new();
-        for c in 'a'..='z' {
+        for c in ('a'..='z').chain('A'..='Z').chain('0'..='9') {
             if let Some(p) = self.view.named_mark(c) {
                 out.push((c, p));
             }
@@ -1742,7 +3278,7 @@ impl EditorState {
             out.push(('.', p));
         }
         if let Some(p) = self.view.last_insert() {
-            out.push(('^', p));
+            out.push(('^', BytePos(p)));
         }
         out
     }
@@ -1751,8 +3287,8 @@ impl EditorState {
     /// the region (`set-mark-command` and the region ops); one-caret degenerate is `None`. View-local. For
     /// the Emacs parity comparator and a future `:marks`.
     #[must_use]
-    pub fn mark(&self) -> Option<usize> {
-        self.view.mark
+    pub fn mark(&self) -> Option<BytePos> {
+        self.view.mark.map(BytePos)
     }
 
     /// Place the cursor at byte offset `pos` (on a char boundary). View-local; does not touch the document.
@@ -1762,14 +3298,32 @@ impl EditorState {
     /// committed motion would: a subsequent `j`/`k` (`next-line`/`previous-line`) aims at the column the
     /// caret was placed on, not column 0. Without this a teleport (goto, mouse, a fixture's start point)
     /// would leave `curswant` stale at 0 and vertical moves would snap to the line start.
-    pub fn set_cursor(&mut self, pos: usize) {
+    pub fn set_cursor(&mut self, pos: BytePos) {
+        let pos = pos.0;
         let b = self.doc.bytes();
         // Clamp to the buffer and snap to a char boundary: `set_cursor` is a public seam (tests, a
         // future goto/mouse), so an out-of-range or mid-codepoint `pos` must not leave the cursor where
         // a later `col_of`/slice would panic. Vim never overshoots, so this is a no-op on valid input.
         let pos = snap(b, pos.min(b.len()));
         self.view.cursor = pos;
-        self.view.curswant = col_of(b, line_start(b, pos), pos);
+        self.view.curswant = self.wanted_col();
+    }
+
+    /// The wanted column ([`View::curswant`]) the caret sets where it stands now (#1090), pending: it is
+    /// measured when first read ([`Want`], #1231).
+    fn wanted_col(&self) -> Want {
+        let tab_end = match self.view.mode {
+            Mode::Normal => self.view.caret == CaretGravity::OnChar,
+            Mode::Visual { .. } => self.view.anchor.is_none_or(|a| self.view.cursor >= a),
+            _ => false,
+        };
+        Want(WantKind::At {
+            text: self.doc.text_arc(),
+            pos: self.view.cursor,
+            ts: self.view.indent.tabs(),
+            tab_end,
+            col: std::sync::OnceLock::new(),
+        })
     }
 
     /// This View's caret gravity (D-050): `OnChar` (Vim/Neovim) or `BetweenChar` (Emacs profile).
@@ -1801,7 +3355,9 @@ mod range;
 pub(crate) use range::*;
 
 mod search;
-use search::{match_spans, search_bwd, search_fwd, step_char};
+use search::{
+    landing_key, match_spans, search_bwd, search_fwd, search_spans, step_char, walk_count,
+};
 
 mod substitute;
 /// The options a `:sort` carries (parsed by the frontend from `[!][i][n][r][u] [/pattern/]`). Grouped into
@@ -1810,8 +3366,9 @@ mod substitute;
 pub struct SortOptions {
     /// `!` — sort descending.
     pub reverse: bool,
-    /// `n` — sort on each line's first decimal number (in the pattern-selected key).
-    pub numeric: bool,
+    /// How keys compare: as text (the default), in locale order (`l`), or by the first number in them
+    /// (`n` decimal, `x` hex, `o` octal, `b` binary, `f` float).
+    pub key: SortKind,
     /// `u` — drop runs of equal sort KEYS after sorting.
     pub unique: bool,
     /// `i` — compare case-insensitively.
@@ -1823,36 +3380,323 @@ pub struct SortOptions {
     pub use_match: bool,
 }
 
-/// A line's comparable sort key: a number (`n`) or text. All keys in one sort share a variant, so the
-/// derived ordering (which compares `Num` < `Text` across variants) never actually mixes them.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum SortKey {
-    Num(i64),
-    Text(String),
+/// One line of [`EditorState::retab`] (nvim's `ex_retab` loop): columns are measured with the `old` stops,
+/// and a rewritten run is laid out with the `new` ones (`tabstop_fromto`). The line is walked by cluster with the cells
+/// the renderer paints ([`range::cluster_cells`]: `<ff>` for a byte that is not UTF-8 is 4, `^A` 2), so a
+/// line that is not UTF-8 is retabbed too (#1252).
+fn retab_line(line: &[u8], bang: bool, expand: bool, old_ts: Tabs, new_ts: Tabs) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len());
+    let (mut vcol, mut start_vcol, mut start) = (0usize, 0usize, 0usize);
+    let (mut got_tab, mut num_spaces) = (false, 0usize);
+    let mut copied = 0usize;
+    let mut col = 0usize;
+    loop {
+        let c = line.get(col).copied();
+        if matches!(c, Some(b' ' | b'\t')) {
+            if !got_tab && num_spaces == 0 {
+                start_vcol = vcol;
+                start = col;
+            }
+            if c == Some(b' ') {
+                num_spaces += 1;
+            } else {
+                got_tab = true;
+            }
+        } else {
+            if got_tab || (bang && num_spaces > 1) {
+                let len = vcol - start_vcol;
+                let (mut tabs, mut spaces) = (0, len);
+                if !expand {
+                    (tabs, spaces) = new_ts.fromto(start_vcol, vcol);
+                }
+                if expand || got_tab || tabs + spaces < len {
+                    out.extend_from_slice(&line[copied..start]);
+                    out.extend(std::iter::repeat_n(b'\t', tabs));
+                    out.extend(std::iter::repeat_n(b' ', spaces));
+                    copied = col;
+                }
+            }
+            got_tab = false;
+            num_spaces = 0;
+        }
+        if c.is_none() {
+            break;
+        }
+        let (next, w) = range::cluster_cells(line, col, line.len(), vcol, old_ts);
+        vcol += w;
+        col = next;
+    }
+    out.extend_from_slice(&line[copied..]);
+    out
 }
 
-/// The first decimal number in `s` (with an optional leading `-`), for `:sort n`. Lines without a number
-/// sort as `0` (Vim keeps them before the numbered lines, which a stable sort preserves).
-fn first_number(s: &str) -> i64 {
-    let b = s.as_bytes();
-    for i in 0..b.len() {
-        if b[i].is_ascii_digit() {
-            let start = if i > 0 && b[i - 1] == b'-' { i - 1 } else { i };
-            let mut j = i;
-            while j < b.len() && b[j].is_ascii_digit() {
-                j += 1;
-            }
-            return s[start..j].parse::<i64>().unwrap_or(0);
+/// How `:sort` compares its keys (`:help :sort`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum SortKind {
+    /// Byte order (case-folded under `i`).
+    #[default]
+    Text,
+    /// `l` — the locale's collation order. ruse does not read the system locale: letters compare
+    /// ignoring case first, and a lowercase letter goes before its uppercase form, which is the order the
+    /// common UTF-8 locales (`en_US.UTF-8`) give ASCII text.
+    Locale,
+    /// `n` — the first decimal number.
+    Decimal,
+    /// `x` — the first hexadecimal number (an optional `0x`/`0X` prefix).
+    Hex,
+    /// `o` — the first octal number.
+    Octal,
+    /// `b` — the first binary number (an optional `0b`/`0B` prefix).
+    Binary,
+    /// `f` — the first floating-point number, read as C's `strtod` does.
+    Float,
+}
+
+/// A line's comparable sort key. All keys in one sort share a variant. `Num(None)` (no number in the key)
+/// orders before every number, as in Vim.
+#[derive(Clone, PartialEq)]
+enum SortKey {
+    Num(Option<i64>),
+    Float(f64),
+    Text(Vec<u8>),
+    Locale(String),
+}
+
+impl SortKey {
+    fn compare(&self, other: &SortKey) -> std::cmp::Ordering {
+        match (self, other) {
+            (SortKey::Num(a), SortKey::Num(b)) => a.cmp(b),
+            // nvim compares with `==`/`>`, which a NaN defeats; a total order keeps the sort well-defined.
+            (SortKey::Float(a), SortKey::Float(b)) => a.total_cmp(b),
+            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Locale(a), SortKey::Locale(b)) => locale_cmp(a, b),
+            _ => std::cmp::Ordering::Equal,
         }
     }
-    0
 }
 
-pub(crate) use substitute::{expand_replacement, line_spans, resolve_line_range};
+/// The `:sort l` order (see [`SortKind::Locale`]): case-insensitive first, then lowercase before
+/// uppercase, then bytewise.
+fn locale_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let fold = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<String>();
+    fold(a).cmp(&fold(b)).then_with(|| {
+        let case = |s: &str| s.chars().map(char::is_uppercase).collect::<Vec<_>>();
+        case(a).cmp(&case(b)).then_with(|| a.cmp(b))
+    })
+}
+
+/// The first number in `s` for `:sort n`/`x`/`o`/`b` (nvim's `ex_sort` + `vim_str2nr`): skip to the
+/// first digit of the base (for `x` any hex digit, for `b` a `0` or `1`), take a `-` just before it, then
+/// read the number, after an optional `0x`/`0b` prefix for `x`/`b`. `None` when `s` has no such digit. A
+/// number past the `i64` range saturates to its bound.
+fn first_number(s: &str, kind: SortKind) -> Option<i64> {
+    let b = s.as_bytes();
+    let starts = |c: &u8| match kind {
+        SortKind::Hex => c.is_ascii_hexdigit(),
+        SortKind::Binary => matches!(c, b'0' | b'1'),
+        _ => c.is_ascii_digit(),
+    };
+    let i = b.iter().position(starts)?;
+    let negative = i > 0 && b[i - 1] == b'-';
+    let (radix, prefix) = match kind {
+        SortKind::Hex => (16, b'x'),
+        SortKind::Octal => (8, 0),
+        SortKind::Binary => (2, b'b'),
+        _ => (10, 0),
+    };
+    let digit = |c: u8| char::from(c).to_digit(radix);
+    let mut at = i;
+    if prefix != 0
+        && b[at] == b'0'
+        && b.get(at + 1).map(u8::to_ascii_lowercase) == Some(prefix)
+        && b.get(at + 2).is_some_and(|&c| digit(c).is_some())
+    {
+        at += 2;
+    }
+    let magnitude = b[at..].iter().map_while(|&c| digit(c)).fold(0u64, |n, d| {
+        n.saturating_mul(u64::from(radix))
+            .saturating_add(u64::from(d))
+    });
+    Some(if negative {
+        0i64.checked_sub_unsigned(magnitude).unwrap_or(i64::MIN)
+    } else {
+        i64::try_from(magnitude).unwrap_or(i64::MAX)
+    })
+}
+
+/// The number at the start of `s` for `:sort f` (nvim's `ex_sort`): blanks and one `+` are skipped, an
+/// empty rest sorts before every number (`-DBL_MAX`), and otherwise the value is what C's `strtod` reads
+/// (0 when nothing parses).
+fn first_float(s: &str) -> f64 {
+    let s = s.trim_start_matches([' ', '\t']);
+    let s = s
+        .strip_prefix('+')
+        .map_or(s, |r| r.trim_start_matches([' ', '\t']));
+    if s.is_empty() {
+        return -f64::MAX;
+    }
+    strtod_prefix(s)
+}
+
+/// The value of the longest prefix of `s` that C's `strtod` accepts (after leading whitespace): an
+/// optional sign, then `inf`/`infinity`, `nan`, a hex number (`0x1.8p3`) or a decimal one (`1.5e-3`).
+fn strtod_prefix(s: &str) -> f64 {
+    let s = s.trim_start();
+    let b = s.as_bytes();
+    let (sign, mut i) = match b.first() {
+        Some(b'-') => (-1.0, 1),
+        Some(b'+') => (1.0, 1),
+        _ => (1.0, 0),
+    };
+    let rest = &s[i..];
+    let starts_ci = |w: &str| rest.len() >= w.len() && rest[..w.len()].eq_ignore_ascii_case(w);
+    if starts_ci("inf") {
+        return sign * f64::INFINITY;
+    }
+    if starts_ci("nan") {
+        return f64::NAN;
+    }
+    let digits_from = |i: &mut usize, hex: bool| {
+        let start = *i;
+        while b.get(*i).is_some_and(|c| {
+            if hex {
+                c.is_ascii_hexdigit()
+            } else {
+                c.is_ascii_digit()
+            }
+        }) {
+            *i += 1;
+        }
+        *i - start
+    };
+    // Hex: `0x` hexdigits [`.` hexdigits] [`p` exponent].
+    if b.get(i) == Some(&b'0') && matches!(b.get(i + 1), Some(b'x' | b'X')) {
+        let mut j = i + 2;
+        let mut mantissa = 0f64;
+        let int_start = j;
+        let int_len = digits_from(&mut j, true);
+        for &c in &b[int_start..int_start + int_len] {
+            mantissa = mantissa * 16.0 + f64::from(char::from(c).to_digit(16).unwrap_or(0));
+        }
+        let mut frac_len = 0;
+        if b.get(j) == Some(&b'.') {
+            let mut k = j + 1;
+            let fs = k;
+            frac_len = digits_from(&mut k, true);
+            let mut scale = 1.0 / 16.0;
+            for &c in &b[fs..fs + frac_len] {
+                mantissa += f64::from(char::from(c).to_digit(16).unwrap_or(0)) * scale;
+                scale /= 16.0;
+            }
+            if int_len + frac_len > 0 {
+                j = k;
+            }
+        }
+        if int_len + frac_len == 0 {
+            // Only the `0` parses.
+            return sign * 0.0;
+        }
+        let mut exp = 0i32;
+        if matches!(b.get(j), Some(b'p' | b'P')) {
+            let mut k = j + 1;
+            let neg = match b.get(k) {
+                Some(b'-') => {
+                    k += 1;
+                    true
+                }
+                Some(b'+') => {
+                    k += 1;
+                    false
+                }
+                _ => false,
+            };
+            let es = k;
+            if digits_from(&mut k, false) > 0 {
+                let e: i32 = s[es..k].parse().unwrap_or(i32::MAX);
+                exp = if neg { -e } else { e };
+            }
+        }
+        return sign * mantissa * 2f64.powi(exp);
+    }
+    // Decimal: digits [`.` digits] [`e` exponent], with at least one digit.
+    let start = i;
+    let int_len = digits_from(&mut i, false);
+    let mut frac_len = 0;
+    if b.get(i) == Some(&b'.') {
+        let mut k = i + 1;
+        frac_len = digits_from(&mut k, false);
+        if int_len + frac_len > 0 {
+            i = k;
+        }
+    }
+    if int_len + frac_len == 0 {
+        return 0.0;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let mut k = i + 1;
+        if matches!(b.get(k), Some(b'-' | b'+')) {
+            k += 1;
+        }
+        if digits_from(&mut k, false) > 0 {
+            i = k;
+        }
+    }
+    sign * s[start..i].parse::<f64>().unwrap_or(0.0)
+}
+
+pub(crate) use substitute::{
+    find_substitutions, line_count, line_span, line_spans, resolve_line_range, resolve_lines,
+};
+
+/// The text `:m` (or `:t`, with `copy`) makes of the non-empty `old`, by the line model: its lines with
+/// `first..=last` (0-based, in range) moved or copied to before line `ins` (`0..=lines`), the final
+/// newline kept as it was. [`EditorState::relocate_lines`] edits only the block; this is the rewrite
+/// for the one shape it cannot split, and the reference its tests hold it to.
+fn relocated_by_lines(old: &[u8], first: usize, last: usize, ins: usize, copy: bool) -> Vec<u8> {
+    let had_trailing_nl = old.ends_with(b"\n");
+    let mut lines: Vec<&[u8]> = old.split(|&c| c == b'\n').collect();
+    if had_trailing_nl {
+        lines.pop(); // drop the empty element after the final '\n'
+    }
+    let block: Vec<&[u8]> = lines[first..=last].to_vec();
+    let count = block.len();
+    if !copy {
+        lines.drain(first..=last);
+    }
+    let adj = if copy || ins <= first {
+        ins
+    } else {
+        ins - count
+    }
+    .min(lines.len());
+    lines.splice(adj..adj, block);
+    let mut new = lines.join(&b'\n');
+    if had_trailing_nl && !new.is_empty() {
+        new.push(b'\n');
+    }
+    new
+}
 pub use substitute::{GlobalCmd, LineAddr, SubFlags, SubOutcome, SubRange, Substitution};
 
+mod ex_cmd;
+#[cfg(test)]
+pub(crate) use ex_cmd::samples as ex_cmd_samples;
+pub use ex_cmd::{
+    ExCmd, ExOutcome, GroupKind, MAX_APPLY_EDITS, MAX_APPLY_EDIT_BYTES, MAX_SHIFT_LEVELS,
+};
+
+mod format;
+pub use format::OptionValueError;
+mod indent;
+mod lisp;
+pub use lisp::DEFAULT_LISPWORDS;
+mod cindent;
+pub(crate) use cindent::check_linecomment as c_line_comment;
+pub use cindent::{CinKey, CinOptions, DEFAULT_CINKEYS, DEFAULT_CINSCOPEDECLS};
+pub(crate) use lisp::line_comment as lisp_line_comment;
 mod planner;
 pub use planner::plan;
+pub(crate) use planner::word_search;
 
 /// Apply a plan to the state, returning the effects the frontend must perform.
 /// The `(start, end)` byte span (half-open, POST-edit coordinates) the `[`/`]` change marks bracket for an
@@ -1864,10 +3708,111 @@ fn edit_bracket(list: &EditList) -> Option<(usize, usize)> {
     let edits = list.edits();
     let first = edits.first()?;
     let last = edits.last()?;
-    let start = first.pos.0;
+    // Lines put below an unterminated last line arrive as `"\n" + lines` at its end: `[` is the first put
+    // line's start, not the old line's end (`yyjp`[`, #1088).
+    let start =
+        if edits.len() == 1 && first.del == 0 && first.ins.len() > 1 && first.ins[0] == b'\n' {
+            first.pos.0 + 1
+        } else {
+            first.pos.0
+        };
     let delta_before_last: isize = edits[..edits.len() - 1].iter().map(Edit::delta).sum();
     let post_last_start = (last.pos.0 as isize + delta_before_last).max(0) as usize;
     Some((start, post_last_start + last.ins.len()))
+}
+
+/// Where a change begins for `u`/`C-r` (Vim's `uh_cursor`, #1063): the cursor at the moment Vim saves the
+/// first undo entry, which an operator has already moved to the start of its span. Inferred from the mode
+/// the change was made in and its first edit, since the plan does not carry the operator span.
+fn change_start(
+    b: &[u8],
+    mode: Mode,
+    cursor: usize,
+    anchor: Option<usize>,
+    edits: &EditList,
+) -> usize {
+    let Some(first) = edits.edits().first() else {
+        return cursor;
+    };
+    let pos = first.pos.0;
+    match (mode.selection(), anchor) {
+        // A selection operator starts at the selection's start; a linewise one at column 0 of its top line
+        // unless the cursor is the top end (nvim 0.12.6: `jlVj>u` -> col 0, `jjlVk>u` -> col 1).
+        (Some(SelectKind::Linewise), Some(a)) if a < cursor => line_start(b, a),
+        (Some(SelectKind::Linewise), _) => cursor,
+        (Some(SelectKind::Charwise), Some(a)) => a.min(cursor),
+        (Some(SelectKind::Blockwise), Some(a)) => {
+            let (top, bottom) = (a.min(cursor), a.max(cursor));
+            let col =
+                col_of(b, line_start(b, top), top).min(col_of(b, line_start(b, bottom), bottom));
+            at_col(b, line_start(b, top), col)
+        }
+        (Some(_), None) => pos.min(cursor),
+        // A text-entry session starts where the caret was when its first change landed.
+        _ if is_text_entry(mode) => cursor,
+        _ => {
+            let at_line_start = pos == 0 || b[pos - 1] == b'\n';
+            let end = pos + first.del;
+            // Deleting whole lines: `dd`/`dj` keep the cursor's column, so only the line can move up.
+            let whole_lines = first.del > 0
+                && ((at_line_start && (b[end - 1] == b'\n' || end == b.len()))
+                    || (b.get(pos) == Some(&b'\n') && end == b.len()));
+            if first.del > 0 && !whole_lines && pos < cursor {
+                // A charwise operator over a backward span (`db`, `d0`, `X`): its start.
+                pos
+            } else {
+                // A linewise operator reaching up (`dk`, `>k`): its first line, at the cursor's column.
+                let top = if whole_lines && !at_line_start {
+                    pos + 1
+                } else {
+                    pos
+                };
+                if top < line_start(b, cursor) {
+                    at_col(
+                        b,
+                        line_start(b, top),
+                        col_of(b, line_start(b, cursor), cursor),
+                    )
+                } else {
+                    cursor
+                }
+            }
+        }
+    }
+}
+
+/// The byte offset for an undo placement: the column on its line (clamped, and pulled off the newline in
+/// Normal mode as Vim's `check_cursor` does), or the sticky column when Vim would `beginline`.
+/// Run one undo/redo step `f` with the view's marks tracked through it. Like nvim's `u_undoredo`, a step
+/// first records the cursor `from` on the jumplist (`setpcmark`), so the entry follows the step's own line
+/// changes; a step that finds nothing to re-apply records nothing (#1168).
+fn undo_step(
+    st: &mut EditorState,
+    from: usize,
+    f: impl FnOnce(&mut Document, &mut [Tracked]) -> Option<crate::undo_cursor::UndoCursor>,
+) -> Option<crate::undo_cursor::UndoCursor> {
+    let saved = (st.view.jumps.clone(), st.view.jump_idx);
+    st.view.push_jump(from);
+    let placed = st.with_tracked(f);
+    if placed.is_none() {
+        (st.view.jumps, st.view.jump_idx) = saved;
+    }
+    placed
+}
+
+fn undo_target(st: &EditorState, placed: crate::undo_cursor::UndoCursor, mode: Mode) -> usize {
+    let b = st.doc.bytes();
+    let ls = crate::pos::raw::nth_line_start(b, placed.line);
+    let le = line_end(b, ls);
+    let at = match placed.col {
+        Some(col) => snap(b, (ls + col).min(le)),
+        None => range::want_col(b, ls, st.view.curswant.get(), st.view.indent.tabs()),
+    };
+    if at == le && ls < le && mode == Mode::Normal && st.view.caret == CaretGravity::OnChar {
+        prev_grapheme(b, le)
+    } else {
+        at
+    }
 }
 
 /// Whether `mode` is one of the text-entry sessions (Insert / Replace / VirtualReplace) — used to decide how
@@ -1897,19 +3842,49 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
     let entry_cursor = st.view.cursor;
     let entry_anchor = st.view.anchor;
     let entry_mode = st.view.mode;
+    // Every command outside a text-entry session is a new change for `U`; inside one only the first change
+    // is (and the first after an undo break, which the transaction's `BreakBefore` hint carries).
+    let new_command = !is_text_entry(entry_mode);
+    // Whether the buffer ended in a newline before this command: only then is a cursor left at the end
+    // the phantom slot (see the clamp below). `x` on the one char of an unterminated last line leaves that
+    // line empty, which the byte model spells the same as a final newline.
+    let entry_terminated = st.doc.bytes().last() == Some(&b'\n');
     // The `[`/`]` change-mark span for a Normal-mode edit — read off the plan's edits (post-edit coords)
     // before they are moved into a Transaction. A yank has no edits; its span rides in `RegWrite::Yank`.
     let mut edit_span: Option<(usize, usize)> = None;
     // `g;`/`g,` resolve their destination here (they step `change_idx`, which the pure planner cannot do).
     let mut nav_target: Option<usize> = None;
+    // The lines an undo/redo leaves `[`, `]` and `.` on (#1168).
+    let mut undo_marks: Option<crate::undo_cursor::ChangeMarks> = None;
+    // Effects the commit itself adds (a failed `g;`/`CTRL-O`), after the plan's own.
+    let mut extra: Vec<Effect> = Vec::new();
+    // The undo group before the command: an edit that leaves a different one began a new undo step.
+    let entry_group = st.doc.history().current_group();
+    // Leaving a selection remembers it (anchor, active end, kind) for `gv` and `'<`/`'>` — the depth-1
+    // slice of D-027's selection history — BEFORE the operator's edit, so the edit carries it as nvim's
+    // `mark_adjust` carries `b_visual` (#686).
+    if plan.mode.selection().is_none() {
+        if let (Some(kind), Some(a)) = (entry_selection, entry_anchor) {
+            st.view.last_visual = Some((a, entry_cursor, kind));
+            st.view.visual_one_end = None;
+        }
+    }
     match plan.action {
         Action::Txn { edits, hint } => {
             edit_span = edit_bracket(&edits);
-            let txn = Transaction::new(st.doc.revision(), edits, TransactionOrigin::UserInput)
-                .with_hint(hint);
+            st.doc.prime_line_undo(entry_cursor, new_command);
+            let start = change_start(
+                st.doc.bytes(),
+                entry_mode,
+                entry_cursor,
+                entry_anchor,
+                &edits,
+            );
+            let txn = Transaction::new(st.doc.revision(), edits, st.origin)
+                .with_hint(hint)
+                .with_cursor(BytePos(start));
             // The plan built the edits from the current buffer, so apply cannot be stale or out of range.
-            st.doc
-                .apply(txn)
+            st.apply_txn(txn)
                 .expect("planned transaction applies cleanly");
         }
         Action::ReplaceTxn {
@@ -1919,10 +3894,18 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
             pop,
         } => {
             edit_span = edit_bracket(&edits);
-            let txn = Transaction::new(st.doc.revision(), edits, TransactionOrigin::UserInput)
-                .with_hint(hint);
-            st.doc
-                .apply(txn)
+            st.doc.prime_line_undo(entry_cursor, new_command);
+            let start = change_start(
+                st.doc.bytes(),
+                entry_mode,
+                entry_cursor,
+                entry_anchor,
+                &edits,
+            );
+            let txn = Transaction::new(st.doc.revision(), edits, st.origin)
+                .with_hint(hint)
+                .with_cursor(BytePos(start));
+            st.apply_txn(txn)
                 .expect("planned transaction applies cleanly");
             if pop {
                 st.view.replace_stack.pop();
@@ -1932,19 +3915,52 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
             }
         }
         Action::Undo => {
-            st.doc.undo();
+            let placed = undo_step(st, entry_cursor, |d, t| {
+                d.undo_tracked(BytePos(entry_cursor), t)
+            });
+            nav_target = placed.map(|p| undo_target(st, p, plan.mode));
+            undo_marks = placed.map(|p| p.marks);
         }
         Action::Redo => {
-            st.doc.redo();
+            let placed = undo_step(st, entry_cursor, |d, t| {
+                d.redo_tracked(BytePos(entry_cursor), t)
+            });
+            nav_target = placed.map(|p| undo_target(st, p, plan.mode));
+            undo_marks = placed.map(|p| p.marks);
         }
         Action::UndoChrono { older } => {
-            st.doc.undo_chronological(older);
+            let placed = undo_step(st, entry_cursor, |d, t| {
+                d.chronological_tracked(older, BytePos(entry_cursor), t)
+            });
+            nav_target = placed.map(|p| undo_target(st, p, plan.mode));
+            undo_marks = placed.map(|p| p.marks);
+        }
+        Action::LineUndo => {
+            let origin = st.origin;
+            nav_target = st
+                .with_tracked(|d, t| d.line_undo_tracked(BytePos(entry_cursor), origin, t))
+                .map(|p| p.0);
         }
         Action::JumpChange { older } => {
             nav_target = st.view.nav_change(older);
+            if nav_target.is_none() {
+                // nvim's `nv_pcmark`: each end of the change list has its own error.
+                let msg = if st.view.changes.is_empty() {
+                    "E664: Changelist is empty"
+                } else if older {
+                    "E662: At start of changelist"
+                } else {
+                    "E663: At end of changelist"
+                };
+                extra.push(Effect::Status(msg.to_string()));
+                extra.push(Effect::Beep);
+            }
         }
         Action::JumpList { older } => {
-            nav_target = st.view.nav_jump(older, entry_cursor);
+            nav_target = st.view.nav_jump(older, entry_cursor, st.doc.bytes());
+            if nav_target.is_none() {
+                extra.push(Effect::Beep);
+            }
         }
         Action::SetNamedMark { ch } => {
             st.view.set_named_mark(ch, st.view.cursor);
@@ -1956,10 +3972,18 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
         } => {
             if !edits.is_empty() {
                 edit_span = edit_bracket(&edits);
-                let txn = Transaction::new(st.doc.revision(), edits, TransactionOrigin::UserInput)
-                    .with_hint(hint);
-                st.doc
-                    .apply(txn)
+                st.doc.prime_line_undo(entry_cursor, new_command);
+                let start = change_start(
+                    st.doc.bytes(),
+                    entry_mode,
+                    entry_cursor,
+                    entry_anchor,
+                    &edits,
+                );
+                let txn = Transaction::new(st.doc.revision(), edits, st.origin)
+                    .with_hint(hint)
+                    .with_cursor(BytePos(start));
+                st.apply_txn(txn)
                     .expect("planned transaction applies cleanly");
             }
             // Retain this block's geometry so a later `.` (dot-repeat) can rebuild an equivalent block at
@@ -2003,7 +4027,21 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
     // Vim change list: an edit records where it happened (the cursor it left behind) as the newest entry,
     // which is also the `` `. `` mark. Motions/undo/g;/g, don't push. Snapped below with the other offsets.
     if plan.is_edit {
-        st.view.push_change(st.view.cursor);
+        let new_step = st.doc.history().current_group() != entry_group;
+        st.view
+            .push_change(st.doc.bytes(), st.view.cursor, new_step);
+    }
+    // Undo and redo put `[`/`]` at column 0 of the first and last line they re-applied, and `.` (the newest
+    // change-list entry, without starting a new one) at column 0 of the top line of the last entry they
+    // re-applied: nvim's `u_undoredo` and `changed_lines` (#1168).
+    if let Some(m) = undo_marks {
+        let b = st.doc.bytes();
+        st.view.change_start = Some(crate::pos::raw::nth_line_start(b, m.start_line));
+        st.view.change_end = Some(crate::pos::raw::nth_line_start(b, m.end_line));
+        if let Some(line) = m.last_change_line {
+            let pos = crate::pos::raw::nth_line_start(b, line);
+            st.view.push_change(b, pos, false);
+        }
     }
     // Vim `[`/`]` change marks: bound the last changed OR yanked text. A text-entry session (Insert/Replace)
     // is ONE change bracketed from where it began to the caret at exit (so `ihello<Esc>` brackets the whole
@@ -2038,44 +4076,7 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
             });
         }
     }
-    let len = st.doc.bytes().len();
-    for c in st.view.changes.iter_mut() {
-        *c = snap(st.doc.bytes(), (*c).min(len));
-    }
-    // Named marks (`m{a-z}`) snap into range too, so an edit that shrank the buffer under a mark can never
-    // make a later `` `{a-z} `` jump out of bounds.
-    for m in st.view.named_marks.iter_mut().flatten() {
-        *m = snap(st.doc.bytes(), (*m).min(len));
-    }
-    // The last-insert position (`gi`) snaps the same way.
-    if let Some(li) = st.view.last_insert {
-        st.view.last_insert = Some(snap(st.doc.bytes(), li.min(len)));
-    }
-    // The last-visual store (behind `gv` and the `<`/`>` marks) snaps both ends into range so an edit that
-    // shrank the buffer under a remembered selection can never make a later `gv`/`` `< ``/`` `> `` slice out
-    // of bounds. (Vim keeps the raw columns; snapping only clamps out-of-buffer offsets, never in-range ones.)
-    if let Some((a, e, kind)) = st.view.last_visual {
-        st.view.last_visual = Some((
-            snap(st.doc.bytes(), a.min(len)),
-            snap(st.doc.bytes(), e.min(len)),
-            kind,
-        ));
-    }
-    // The `[`/`]` change marks (and an in-flight Insert-session start) snap into range too.
-    for p in [
-        &mut st.view.change_start,
-        &mut st.view.change_end,
-        &mut st.view.insert_start,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        *p = snap(st.doc.bytes(), (*p).min(len));
-    }
-    // Jumplist entries snap into range too (a buffer-resizing edit under a jump keeps it valid).
-    for j in st.view.jumps.iter_mut() {
-        *j = snap(st.doc.bytes(), (*j).min(len));
-    }
+    st.view.snap_offsets(st.doc.bytes());
     // The `<BS>`-restore history lives only while a replace session is active; drop it on any exit.
     if !matches!(st.view.mode, Mode::Replace | Mode::VirtualReplace) {
         st.view.replace_stack.clear();
@@ -2096,8 +4097,30 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
         let le = line_end(b, st.view.cursor);
         let ls = line_start(b, st.view.cursor);
         if st.view.cursor == le && ls < le {
-            st.view.cursor = prev_boundary(b, le);
+            st.view.cursor = motion::prev_grapheme(b, le);
         }
+        // An edit can join the text around the cursor into one cluster: deleting a byte that is not UTF-8
+        // from between a base and a combining mark (#1232). The cursor goes to the cluster's start, as
+        // nvim's `mb_adjust_cursor` puts it on a char's head.
+        let cur = st.view.cursor;
+        if cur < b.len() && b[cur] != b'\n' {
+            let head = motion::prev_grapheme(b, motion::next_grapheme(b, cur));
+            if head < cur {
+                st.view.cursor = head;
+            }
+        }
+    }
+    // The phantom slot after the final newline is not a line (#677): an on-char caret outside text entry
+    // never rests there, whatever put it there (a motion running off the end, a linewise delete of the last
+    // line, undo). Exempt where the byte model cannot tell that slot from a real empty last line: leaving
+    // Insert (the caret is on the line just typed into, as after `o` on an unterminated last line), and a
+    // buffer that was unterminated before the command (`x` emptying its last line).
+    if st.view.caret == CaretGravity::OnChar
+        && !is_text_entry(st.view.mode)
+        && !leaving_entry
+        && entry_terminated
+    {
+        st.view.cursor = motion::off_phantom_at(st.doc.bytes(), st.view.cursor);
     }
     // A yank/delete/change writes its captured span into the pending register (or unnamed when none),
     // mirroring the unnamed slot on a named write; append (`"A`) is handled inside the store. An Emacs kill
@@ -2107,6 +4130,12 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
     st.view.last_was_kill = false;
     match plan.set_register {
         Some(RegWrite::Edit(reg)) => st.view.registers.delete(st.view.pending_register, reg),
+        Some(RegWrite::EditRingOne(reg)) => {
+            st.view
+                .registers
+                .delete_ring(st.view.pending_register, reg, true);
+        }
+        Some(RegWrite::Replaced(reg)) => st.view.registers.delete(None, reg),
         Some(RegWrite::Yank(reg, _)) => st.view.registers.yank(st.view.pending_register, reg),
         Some(RegWrite::KillAppend(reg)) => {
             if was_kill {
@@ -2124,6 +4153,7 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
             }
             st.view.last_was_kill = true;
         }
+        Some(RegWrite::Write(reg)) => st.view.registers.write(st.view.pending_register, reg),
         None => {}
     }
     // Maintain the selection anchor: set it when entering a selection mode (Visual/Select; the fixed end
@@ -2131,15 +4161,8 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
     // toggle, since both are selection modes — and clear it on any exit to Normal/Insert.
     match (was_selection, st.view.mode.selection().is_some()) {
         (false, true) => st.view.anchor = Some(entry_cursor),
-        (_, false) => {
-            // Leaving a selection: remember it (anchor, active end, kind) for `gv` BEFORE dropping the
-            // anchor — the depth-1 slice of D-027's `` `< ``/`` `> `` history. Only fires on an actual exit
-            // (entry_selection is None when we were already in Normal), so a plain Normal command is inert.
-            if let (Some(kind), Some(a)) = (entry_selection, entry_anchor) {
-                st.view.last_visual = Some((a, entry_cursor, kind));
-            }
-            st.view.anchor = None;
-        }
+        // Leaving a selection (remembered for `gv` above, before the edit) drops the anchor.
+        (_, false) => st.view.anchor = None,
         (true, true) => {}
     }
     // A text object in a selection mode overrides the anchor to span the object (both ends move at once).
@@ -2166,7 +4189,9 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
     // above) consumes it. Cleared here AFTER the register write so a stray `"x` before a non-register
     // command is simply forgotten, and a later plain edit never leaks into the named slot.
     st.view.pending_register = None;
-    plan.effects
+    let mut effects = plan.effects;
+    effects.extend(extra);
+    effects
 }
 
 /// Whether `cmd` is a Vim JUMP — a command that sets the `''`/jumplist "before" mark (search, `G`/`gg`, `%`,
@@ -2175,7 +4200,17 @@ pub fn commit(st: &mut EditorState, plan: Plan) -> Vec<Effect> {
 fn is_jump(cmd: &Command) -> bool {
     use crate::motion::Motion as M;
     match cmd {
-        Command::SearchNext(_) | Command::SearchPrev(_) | Command::SearchWordUnder { .. } => true,
+        Command::SearchNext(_)
+        | Command::SearchPrev(_)
+        // A `/`/`?` search is a jump too, so `''` returns from it (#1088).
+        | Command::Search {
+            op: crate::SearchOp::Move,
+            ..
+        }
+        | Command::SearchWordUnder {
+            op: crate::SearchOp::Move,
+            ..
+        } => true,
         // `gd`/`gD` (and the `GotoFirstMatch` they resolve to) are jumps — `CTRL-O` returns.
         Command::GotoDeclaration { .. } | Command::GotoFirstMatch(_) => true,
         Command::GotoLastChange
@@ -2198,6 +4233,10 @@ fn is_jump(cmd: &Command) -> bool {
                 | M::ParagraphBack
                 | M::SentenceFwd
                 | M::SentenceBack
+                | M::SectionFwd
+                | M::SectionBack
+                | M::SectionEndFwd
+                | M::SectionEndBack
         ),
         _ => false,
     }
@@ -2205,11 +4244,126 @@ fn is_jump(cmd: &Command) -> bool {
 
 /// Convenience: plan then commit one command, then maintain the sticky desired column (curswant).
 pub fn apply_command(st: &mut EditorState, cmd: &Command) -> Vec<Effect> {
+    // `%` follows the View's `'lisp'` rules while the command runs (#1163).
+    let _lisp = crate::findmatch::lisp_scope(st.view.format.lisp);
+    // A resolved Ex edit (RFC-0020) runs the same `EditorState` method the live Ex command runs; it has no
+    // plan of its own.
+    if let Command::Ex(ex) = cmd {
+        st.apply_ex(ex);
+        return Vec::new();
+    }
     // A jump records the position it LEAVES onto the jumplist (Vim), so `CTRL-O` can return there.
     let jump_from = is_jump(cmd).then_some(st.view.cursor);
-    let p = plan(st, cmd);
-    let effects = commit(st, p);
-    if let Some(from) = jump_from {
+    prepare_selection_op(st, cmd);
+    let (entry_mode, entry_cursor, entry_rev) = (st.view.mode, st.view.cursor, st.doc.revision());
+    let entry_was_edit = st.view.last_was_edit;
+    // The buffer as the command found it (a refcount, not a copy): the entry column and line below are
+    // measured from it only when needed, since finding them walks the line from its start (#1231).
+    let entry_text = st.doc.text_arc();
+    let entry_col = || {
+        col_of(
+            &entry_text,
+            line_start(&entry_text, entry_cursor),
+            entry_cursor,
+        )
+    };
+    // The smartindent state a line opened by this command arms (read from the buffer before the edit).
+    let opened_si = opened_si_state(st, cmd);
+    // An open that continues a comment leader counts as an untouched autoindent (nvim sets `did_ai`).
+    let opened = planner::open_comment_line(st, cmd);
+    let opened_leader = opened.as_ref().is_some_and(|o| o.1);
+    let opened_end_comment = planner::open_end_comment(st, cmd);
+    // The indent `^ CTRL-D` deletes, for the next `<CR>`.
+    let deleted_indent = if matches!(cmd, Command::InsertDeleteIndentRestore) {
+        let b = st.doc.bytes();
+        let ls = line_start(b, st.view.cursor);
+        // The `^` is deleted first, by the `DeleteBack` before this command; the indent is the line's.
+        indent::indent_cols(&b[ls..line_end(b, ls)], st.view.indent.tabs()).0
+    } else {
+        0
+    };
+    let mut p = plan(st, cmd);
+    // `'nomodifiable'` (#619): a command that would change the text or step the undo history does
+    // nothing but say E21 (nvim checks `MODIFIABLE` before each change), so no register, mark or mode
+    // change happens either.
+    if !st.doc.is_modifiable()
+        && matches!(
+            p.action,
+            Action::Txn { .. }
+                | Action::ReplaceTxn { .. }
+                | Action::Undo
+                | Action::Redo
+                | Action::LineUndo
+                | Action::UndoChrono { .. }
+        )
+    {
+        return vec![Effect::Status(crate::document::E21.to_string())];
+    }
+    // A linewise change (`cc`, `S`, `Vc`) leaves its line with the kept indent and nothing typed: the
+    // same autoindent cleanup an opened line gets applies (nvim's `op_change` sets `did_ai`).
+    let linewise_change = entry_mode != Mode::Insert
+        && p.mode == Mode::Insert
+        && matches!(&p.set_register, Some(RegWrite::Edit(r) | RegWrite::EditRingOne(r)) if r.is_linewise());
+    if uses_reg_one(cmd) {
+        if let Some(RegWrite::Edit(reg)) = p.set_register.take() {
+            p.set_register = Some(RegWrite::EditRingOne(reg));
+        }
+    }
+    // A refused register still ran the operator in nvim (`op_delete` fails inside `do_pending_operator`,
+    // which has already set the wanted column), so it is not a failure that keeps the column (#1171).
+    let refused = refuse_unwritable_register(st, cmd, &p);
+    let was_refused = refused.is_some();
+    if let Some(refused) = refused {
+        p = refused;
+    }
+    let mut effects = commit(st, p);
+    // `'lisp'` under `'autoindent'`: the line an open or a linewise change leaves takes the Lisp indent
+    // (nvim's `open_line` and `op_change` run `fixthisline(get_lisp_indent)`, #1163).
+    if st.view.format.lisp
+        && st.view.indent.autoindent
+        && st.view.mode == Mode::Insert
+        && !opened_leader
+        && st.view.caret == CaretGravity::OnChar
+        && (linewise_change
+            || (matches!(
+                cmd,
+                Command::OpenBelow | Command::OpenAbove | Command::InsertNewline
+            ) && st.doc.revision() != entry_rev))
+    {
+        let b = st.doc.bytes();
+        let row = crate::pos::raw::line_of(b, st.view.cursor);
+        let cols = lisp::line_indent(b, row, st.view.indent.tabs(), &st.view.format.lispwords);
+        let fix = planner::plan_set_indents(st, row, row, &[Some(cols)], GroupHint::Continue);
+        effects.extend(commit(st, fix));
+    }
+    let failed = !was_refused
+        && st.view.cursor == entry_cursor
+        && st.doc.revision() == entry_rev
+        && st.view.mode == entry_mode;
+    let kept_col = failed && keeps_curswant_on_failure(st, cmd, effects.contains(&Effect::Beep));
+    track_insert_start(st, cmd, entry_mode, entry_cursor, entry_rev, &entry_col);
+    // Opening a line drops the line `U` would restore (nvim's `open_line`). After `o`/`O` the first typed
+    // change still saves the new line; after an Insert `<CR>` the rest of the insert saves nothing.
+    match cmd {
+        Command::OpenBelow
+        | Command::OpenAbove
+        | Command::OpenLineIndent {
+            kind: OpenKind::Below | OpenKind::Above,
+            ..
+        } => st.doc.clear_line_undo(false),
+        Command::InsertNewline
+        | Command::OpenLineIndent {
+            kind: OpenKind::Split,
+            ..
+        } if st.doc.revision() != entry_rev => st.doc.clear_line_undo(true),
+        _ => {}
+    }
+    // `CTRL-G U` + `<Left>`/`<Right>` moves without starting a new undo group.
+    if matches!(cmd, Command::InsertCaretStep { .. }) {
+        st.view.last_was_edit = entry_was_edit;
+    }
+    // A failed jump (a search that matches nowhere) records nothing.
+    if let Some(from) = jump_from.filter(|_| !effects.contains(&Effect::Beep)) {
         st.view.push_jump(from);
     }
     // Maintain the auto-indent-pending flag (read by `EnterNormal` for `<Esc>` autoindent cleanup): a
@@ -2217,41 +4371,327 @@ pub fn apply_command(st: &mut EditorState, cmd: &Command) -> Vec<Effect> {
     // never leaks to a later line. Done here (not in the pure planner) because it depends on the Command.
     match cmd {
         Command::OpenLineIndent { level, .. } => st.view.auto_indent_pending = *level > 0,
-        Command::InsertChar(c) if *c != ' ' && *c != '\t' => st.view.auto_indent_pending = false,
-        Command::EnterNormal
+        Command::OpenBelow | Command::OpenAbove | Command::InsertNewline => {
+            st.view.auto_indent_pending =
+                st.view.mode == Mode::Insert && (opened_leader || only_indent_before_caret(st));
+        }
+        _ if linewise_change => st.view.auto_indent_pending = only_indent_before_caret(st),
+        // A caret key off the line ends it (nvim's `start_arrow`).
+        _ if left_line(&entry_text, entry_cursor, st.doc.bytes(), st.view.cursor) => {
+            st.view.auto_indent_pending = false;
+        }
+        // Typing anything keeps the indent (nvim clears `did_ai` on a typed blank too).
+        Command::InsertChar(_)
+        | Command::InsertTab
+        | Command::InsertPaste(_)
+        | Command::InsertRegister(_)
+        | Command::InsertEval(_)
+        | Command::EnterNormal
         | Command::EnterInsert
         | Command::EnterInsertAfter
         | Command::InsertLineStart
         | Command::InsertColumnZero
-        | Command::AppendLineEnd
-        | Command::OpenBelow
-        | Command::OpenAbove => st.view.auto_indent_pending = false,
+        | Command::AppendLineEnd => st.view.auto_indent_pending = false,
         _ => {}
     }
-    update_curswant(st, cmd);
+    st.view.si_state = opened_si;
+    match cmd {
+        Command::InsertDeleteIndentRestore => st.view.old_indent = deleted_indent,
+        Command::InsertNewline if st.view.mode == Mode::Insert => st.view.old_indent = 0,
+        _ => {}
+    }
+    st.view.end_comment = if opened_leader {
+        opened_end_comment
+    } else {
+        None
+    };
+    if !st.view.auto_indent_pending {
+        st.view.end_comment = None;
+    }
+    st.view.typed_space = match cmd {
+        Command::InsertChar(' ') => true,
+        Command::InsertChar(_) | Command::DeleteBack | Command::SetIndentCols { .. } => {
+            st.view.typed_space
+        }
+        _ => false,
+    };
+    update_curswant(st, cmd, entry_mode, kept_col);
     effects
+}
+
+/// Whether `cmd`, which FAILED (nothing moved, changed or switched mode; `beeped` when it beeped), leaves
+/// the wanted column alone (#1171). nvim recomputes `w_curswant` lazily, only when a command sets
+/// `w_set_curswant`; a failing command keeps the old column unless its handler sets that flag before (or
+/// regardless of) the check that fails. These handlers bail out first and so keep it: `h`/`l` (`nv_left`,
+/// `nv_right`), `f`/`t`/`;`/`,` (`nv_csearch`), `%` (`nv_percent`), `[(`/`])`/`[{`/`]}`/`[m`/`]M`
+/// (`nv_bracket_block`), CTRL-O/CTRL-I/`g;`/`g,` at an end of their list (`nv_pcmark`), `CTRL-A`/`CTRL-X`
+/// without a number (`op_addsub`), `J`/`gJ` (`nv_join`), `r` past the line's end (`nv_replace`) and `~` on
+/// an empty line (`n_swapchar`); an operator over one of those motions is cancelled with it (`dfz`).
+/// Everything else that fails resets the column to the cursor's, as nvim's handlers do: `/`/`?`/`n`/`N`/
+/// `*`/`#` (`normal_search`), word, sentence, paragraph and section motions, text objects (`nv_object`),
+/// mark jumps (`nv_mark_move_to`), undo and redo, and an operator that ran but failed (`"/dd`).
+fn keeps_curswant_on_failure(st: &EditorState, cmd: &Command, beeped: bool) -> bool {
+    let keeps = |m: &Motion| {
+        matches!(
+            m,
+            // `j`/`k` (`nv_down`/`nv_up`) and `{count}dd` past the end (`nv_lineop`) fail in `cursor_down`/
+            // `cursor_up` before anything sets the column (#1176).
+            Motion::Up
+                | Motion::Down
+                | Motion::Line
+                | Motion::Left
+                | Motion::Right
+                | Motion::WrapLeft
+                | Motion::WrapRight
+                | Motion::FindChar { .. }
+                | Motion::MatchBracket
+                | Motion::GotoPercent
+                | Motion::UnmatchedParenBack
+                | Motion::UnmatchedParenFwd
+                | Motion::UnmatchedBraceBack
+                | Motion::UnmatchedBraceFwd
+                | Motion::MethodStartFwd
+                | Motion::MethodStartBack
+                | Motion::MethodEndFwd
+                | Motion::MethodEndBack
+        )
+    };
+    match cmd {
+        Command::Move(_, m)
+        | Command::Delete(_, m)
+        | Command::Change(_, m)
+        | Command::Yank(_, m) => beeped && keeps(m),
+        Command::OpForced { motion, .. }
+        | Command::CaseMotion { motion, .. }
+        | Command::ShiftMotion { motion, .. }
+        | Command::Reindent { motion, .. }
+        | Command::Format { motion, .. }
+        | Command::Comment { motion, .. } => beeped && keeps(motion),
+        Command::GotoOlderJump
+        | Command::GotoNewerJump
+        | Command::GotoOlderChange
+        | Command::GotoNewerChange
+        // `{count}>>` on the last line (`nv_lineop`'s `cursor_down`).
+        | Command::ShiftRight(_)
+        | Command::ShiftLeft(_) => beeped,
+        // These always edit when they succeed.
+        Command::IncrementNumber(_)
+        | Command::JoinLines(_)
+        | Command::JoinLinesNoSpace(_)
+        | Command::ReplaceChar(..) => true,
+        Command::ToggleCase(_) => {
+            let b = st.doc.bytes();
+            line_start(b, st.view.cursor) == line_end(b, st.view.cursor)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the cursor left its line: `line_start(after, cur) != line_start(before, entry)`. On an unchanged
+/// buffer that is a `\n` between the two positions, which costs the distance moved, not the line (#1231).
+fn left_line(before: &[u8], entry: usize, after: &[u8], cur: usize) -> bool {
+    // `before` is held for the whole command, so an equal data pointer is the same, unchanged buffer.
+    if std::ptr::eq(before.as_ptr(), after.as_ptr()) && before.len() == after.len() {
+        let (lo, hi) = (
+            entry.min(cur).min(after.len()),
+            entry.max(cur).min(after.len()),
+        );
+        after[lo..hi].contains(&b'\n')
+    } else {
+        line_start(after, cur) != line_start(before, entry)
+    }
+}
+
+/// Whether the caret sits after nothing but a non-empty indent on its line (an autoindent's leftover).
+fn only_indent_before_caret(st: &EditorState) -> bool {
+    let b = st.doc.bytes();
+    let cur = st.view.cursor;
+    let ls = line_start(b, cur);
+    cur > ls && b[ls..cur].iter().all(|&c| c == b' ' || c == b'\t')
+}
+
+/// The `'smartindent'` rules a line opened by `cmd` arms (#617): computed from the line it opens from,
+/// before the edit. Every other command disarms them (nvim clears them on the first typed key).
+fn opened_si_state(st: &EditorState, cmd: &Command) -> indent::SiState {
+    let si = st.view.indent.smartindent && st.view.caret == CaretGravity::OnChar;
+    let b = st.doc.bytes();
+    let cur = st.view.cursor;
+    let ls = || line_start(b, cur); // only an open needs the line (#1231)
+    match cmd {
+        Command::OpenBelow | Command::OpenAbove if si => {
+            let below = matches!(cmd, Command::OpenBelow);
+            let words = &st.view.format.cinwords;
+            st.view
+                .indent
+                .open_indent(b, ls(), line_end(b, cur), below, words)
+                .1
+        }
+        Command::InsertNewline if si && st.view.mode == Mode::Insert => {
+            st.view
+                .indent
+                .open_indent(b, ls(), cur, true, &st.view.format.cinwords)
+                .1
+        }
+        _ => indent::SiState::default(),
+    }
+}
+
+/// Whether `cmd` deletes or changes over a motion that always fills `"1` (nvim's `use_reg_one`: `%`, `(`,
+/// `)`, `{`, `}`, `` ` ``, `/`, `?`, `n`, `N`, `*`, `#`), even within one line (#749).
+fn uses_reg_one(cmd: &Command) -> bool {
+    use crate::command::{MarkOp, SearchOp};
+    let search_op = |op: &SearchOp| matches!(op, SearchOp::Delete | SearchOp::Change);
+    match cmd {
+        Command::Delete(_, m) | Command::Change(_, m) => matches!(
+            m,
+            Motion::MatchBracket
+                | Motion::ParagraphFwd
+                | Motion::ParagraphBack
+                | Motion::SentenceFwd
+                | Motion::SentenceBack
+        ),
+        Command::OpToMark { op, .. } => matches!(op, MarkOp::Delete | MarkOp::Change),
+        Command::Search { op, .. } | Command::SearchWordUnder { op, .. } => search_op(op),
+        _ => false,
+    }
+}
+
+/// A yank, delete or change naming a register it cannot write (`"/dd`, `":yy`, `"%cw` — the read-only
+/// registers, #1022) fails as nvim's `op_delete`/`op_yank` do: nothing is captured or deleted, the cursor
+/// goes to the start of the text the operator covered, a selection ends, and a change still enters Insert
+/// there. `None` when the plan writes no register or may write the one named.
+fn refuse_unwritable_register(st: &EditorState, cmd: &Command, p: &Plan) -> Option<Plan> {
+    let (start, linewise, op) = match p.set_register.as_ref()? {
+        RegWrite::Yank(reg, (s, _)) => (*s, reg.is_linewise(), planner::RefusedOp::Yank),
+        RegWrite::Edit(reg) | RegWrite::EditRingOne(reg) => (
+            match &p.action {
+                Action::Txn { edits, .. } => edits.edits().first().map_or(p.cursor, |e| e.pos.0),
+                _ => p.cursor,
+            },
+            reg.is_linewise(),
+            if p.mode == Mode::Insert {
+                planner::RefusedOp::Change
+            } else {
+                planner::RefusedOp::Delete
+            },
+        ),
+        RegWrite::Replaced(_)
+        | RegWrite::KillAppend(_)
+        | RegWrite::KillPrepend(_)
+        | RegWrite::Write(_) => return None,
+    };
+    if RegisterStore::is_writable(st.view.pending_register) {
+        return None;
+    }
+    let mode = if p.mode == Mode::Insert {
+        Mode::Insert
+    } else {
+        Mode::Normal
+    };
+    // A linewise range starts on its first line (#1174); the edit's start can be the newline before it.
+    let start = linewise
+        .then(|| planner::refused_linewise_cursor(st, cmd, op))
+        .flatten()
+        .unwrap_or(start);
+    Some(Plan {
+        action: Action::Nop,
+        cursor: start.min(st.doc.bytes().len()),
+        mode,
+        is_edit: false,
+        effects: vec![Effect::Beep, Effect::RegisterRefused],
+        set_register: None,
+        set_anchor: None,
+        set_mark: None,
+    })
+}
+
+/// Maintain Vim's `Insstart` column ([`View::insert_col`]) after a command: set at Insert entry; inside
+/// Insert a caret jump arms a restart and the next edit moves it to where that edit began (Vim's
+/// `stop_arrow`). `CTRL-G U` steps stay inside the run.
+fn track_insert_start(
+    st: &mut EditorState,
+    cmd: &Command,
+    entry_mode: Mode,
+    entry_cursor: usize,
+    entry_rev: crate::Revision,
+    entry_col: &dyn Fn() -> usize,
+) {
+    if !is_text_entry(st.view.mode) {
+        st.view.insert_jumped = false;
+        st.view.insstart = None;
+        st.view.insstart_line = None;
+        return;
+    }
+    if !is_text_entry(entry_mode) {
+        let b = st.doc.bytes();
+        st.view.insert_col = col_of(b, line_start(b, st.view.cursor), st.view.cursor);
+        st.view.insstart = Some(st.view.cursor);
+        let ls = line_start(b, st.view.cursor);
+        st.view.insstart_line = Some((
+            crate::pos::raw::line_of(b, st.view.cursor),
+            range::line_cells(b, ls, st.view.indent.tabs()),
+        ));
+        st.view.insert_jumped = false;
+    } else if st.doc.revision() != entry_rev {
+        if std::mem::take(&mut st.view.insert_jumped) {
+            st.view.insert_col = entry_col();
+        }
+        // A delete back past the start (`<BS>`, `CTRL-W`, `CTRL-U` with 'backspace' "start") lowers it.
+        let cur = st.view.cursor;
+        st.view.insstart = Some(st.view.insstart.map_or(cur, |s| s.min(cur)));
+    } else if st.view.cursor != entry_cursor && !matches!(cmd, Command::InsertCaretStep { .. }) {
+        st.view.insert_jumped = true;
+    }
 }
 
 /// Maintain [`EditorState::curswant`] after a command (Vim's curswant rule): a vertical move KEEPS the
 /// wanted column (ride it through short lines); `$`/`<End>`/`A` (append) set it to [`MAXCOL`] so subsequent
-/// `j`/`k` — and an Insert caret — stay at the line's end; every other command recomputes it from the
-/// cursor's new char column.
+/// `j`/`k` — and an Insert caret — stay at the line's end; a failed command whose nvim handler never sets
+/// the column keeps it (`kept_col`, [`keeps_curswant_on_failure`]); every other command recomputes it from
+/// the cursor's new char column.
 ///
 /// Insert-mode append column (Vim `i_CTRL-O` at EOL): while `curswant == MAXCOL` in Insert, the caret rests
-/// at the line's END (the append position), and a one-shot `CTRL-O` command that is not itself a column-
-/// setting move (e.g. `dd`) PRESERVES that append intent rather than recomputing it — so `A<C-o>ddX` appends
-/// `X` at the end of the line dd left behind, and `i<C-o>$X` appends at end. Called from [`apply_command`],
-/// the single plan+commit driver, so `cmd` is always in scope.
-fn update_curswant(st: &mut EditorState, cmd: &Command) {
+/// past the line's last char (the append position): a one-shot `CTRL-O` command that leaves the cursor at
+/// the line's end PRESERVES that append intent (e.g. `dd`, so `A<C-o>ddX` appends `X` at the end of the line
+/// `dd` left behind, and `i<C-o>$X` appends at end), and a cursor resting ON the last char steps past it
+/// (nvim's `restart_edit` rule in `edit()`); one landing mid-line (`` A<C-o>`a ``) stays there. Only a
+/// command run FROM Insert keeps the intent: `$cb` or `$gi` (Normal to Insert) put the caret where the
+/// command did (#702). Called from [`apply_command`], the single plan+commit driver, so `cmd` is always in
+/// scope.
+fn update_curswant(st: &mut EditorState, cmd: &Command, entry_mode: Mode, kept_col: bool) {
     let insert = matches!(st.view.mode, Mode::Insert);
+    let from_insert = insert && matches!(entry_mode, Mode::Insert);
+    // Whether the cursor rests on the line's last char or past it.
+    let at_line_end = |st: &EditorState| {
+        let b = st.doc.bytes();
+        let cur = st.view.cursor; // told by the bytes, not the line (#1231)
+        motion::at_nul(b, cur) || motion::at_nul(b, motion::next_grapheme(b, cur))
+    };
     match cmd {
+        // A failed command whose nvim handler never sets `w_set_curswant` (`keeps_curswant_on_failure`).
+        _ if kept_col => {}
         Command::Move(_, Motion::Up)
         | Command::Move(_, Motion::Down)
+        // `gg`/`G`/`{count}%` move to the wanted column without changing it (`'nostartofline'`).
+        | Command::Move(_, Motion::GotoLine | Motion::LastLine | Motion::GotoPercent)
         | Command::MoveUp
-        | Command::MoveDown => {} // keep the sticky column
+        | Command::MoveDown
+        // An undo break moves nothing: `i_<Down><Down>` (a break before each move) keeps the column.
+        | Command::BreakUndo
+        // Starting (or switching) Visual moves nothing: `$v` keeps the end-of-line column, so `$V>` shifts
+        // with the cursor at the line's end (nvim's `n_start_visual_mode` leaves `w_curswant` alone, #1176).
+        | Command::EnterVisual { .. }
+        // A `"x` prefix (or the register a failed `p` spends) moves nothing either (nvim 0.12.6:
+        // `/a<CR>:1t$<CR>"add` keeps the search's column).
+        | Command::SetRegister(_) => {} // keep the sticky column
         // `$`/`<End>` and `A` (append) want the line's end.
         Command::Move(_, Motion::LineEnd) | Command::MoveLineEnd | Command::AppendLineEnd => {
-            st.view.curswant = MAXCOL
+            st.view.curswant = Want::col(MAXCOL)
+        }
+        // `{count}|` wants the column it names, not the start of the char it lands on (nvim's `nv_pipe`):
+        // `5|` onto a tab or an `<ff>` that covers column 5 keeps 5 for a following `j`/`k`.
+        Command::Move(n, Motion::Column) => {
+            st.view.curswant = Want::col((*n).max(1) as usize - 1);
         }
         // Commands that establish a definite column: horizontal moves, the Insert-native keys, and every
         // insert-ENTRY except `A` (which is the append/MAXCOL case above) reset the wanted column — they
@@ -2274,21 +4714,18 @@ fn update_curswant(st: &mut EditorState, cmd: &Command) {
         // A `/`/`?` search is a definite motion/edit: it establishes the match column (and, for `c?`,
         // the deletion point where Insert begins). It must never preserve a stale `$`/`A` append intent
         // — `$c?pat` inserts at the match, not at the line end.
-        | Command::Search { .. } => {
-            let b = st.doc.bytes();
-            st.view.curswant = col_of(b, line_start(b, st.view.cursor), st.view.cursor);
-        }
-        // Everything else (edits like `dd`/`x`, mode changes): in Insert with an append intent (a one-shot
-        // `CTRL-O` command run while `curswant == MAXCOL`), PRESERVE MAXCOL; otherwise recompute the column.
+        | Command::Search { .. } => st.view.curswant = st.wanted_col(),
+        // Everything else (edits like `dd`/`x`, mode changes): a one-shot `CTRL-O` command run while
+        // `curswant == MAXCOL` that leaves the cursor at the line's end PRESERVES MAXCOL; otherwise recompute
+        // the column.
         _ => {
-            if !(insert && st.view.curswant == MAXCOL) {
-                let b = st.doc.bytes();
-                st.view.curswant = col_of(b, line_start(b, st.view.cursor), st.view.cursor);
+            if !(from_insert && st.view.curswant == MAXCOL && at_line_end(st)) {
+                st.view.curswant = st.wanted_col();
             }
         }
     }
-    // In Insert, a MAXCOL wanted column parks the caret at the append position (end of line).
-    if insert && st.view.curswant == MAXCOL {
+    // In Insert, a MAXCOL wanted column parks a caret on the last char at the append position (end of line).
+    if insert && st.view.curswant == MAXCOL && at_line_end(st) {
         let b = st.doc.bytes();
         st.view.cursor = line_end(b, st.view.cursor);
     }

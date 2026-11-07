@@ -4,6 +4,9 @@
 //! state); they reach these helpers through `mod.rs`'s `pub(crate) use substitute::{…}` re-export.
 //! The public types stay `pub` and remain reachable at the crate root via `crate::lib`'s re-export.
 
+use crate::pattern::{Match, Regex};
+use crate::pos::BytePos;
+
 /// The pure decision for one command.
 #[must_use]
 /// The line range a `:s` acts on. `Lines` is 1-based inclusive (as the user types `:N,Ms`).
@@ -28,6 +31,28 @@ pub enum LineAddr {
     Last,
     /// `:m .` — after the current (cursor) line.
     Current,
+    /// `:m +N` / `:m .-N` — after the line `N` lines below (negative: above) the cursor's line.
+    CurrentOffset(isize),
+    /// `:m $-N` — after the line `N` lines above the last one.
+    LastOffset(isize),
+}
+
+impl LineAddr {
+    /// The 0-based insert index in `0..=nlines` for a buffer of `nlines` lines with the cursor on 0-based
+    /// line `cursor_line`. A relative address that lands outside the buffer is `None` (Vim E16); an
+    /// absolute `Line` past the end clamps to the end.
+    #[must_use]
+    pub fn insert_index(self, cursor_line: usize, nlines: usize) -> Option<usize> {
+        let offset =
+            |base: usize, d: isize| base.checked_add_signed(d).filter(|&ins| ins <= nlines);
+        match self {
+            LineAddr::Line(n) => Some(n.min(nlines)),
+            LineAddr::Last => Some(nlines),
+            LineAddr::Current => Some((cursor_line + 1).min(nlines)),
+            LineAddr::CurrentOffset(d) => offset(cursor_line + 1, d),
+            LineAddr::LastOffset(d) => offset(nlines, d),
+        }
+    }
 }
 
 /// The `:s///` flags this MVP honors (F-009 #2). `c` (confirm) is an interactive frontend loop, not a
@@ -48,9 +73,9 @@ pub struct SubFlags {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Substitution {
     /// Byte offset of the reported match start (the `\zs`-adjusted start).
-    pub start: usize,
+    pub start: BytePos,
     /// Byte offset of the reported match end.
-    pub end: usize,
+    pub end: BytePos,
     /// The replacement bytes to write over `[start, end)`.
     pub replacement: Vec<u8>,
     /// 0-based line index the match sits on (for the "M lines" echo + cursor placement).
@@ -62,7 +87,9 @@ pub struct Substitution {
 pub struct SubOutcome {
     /// Total matches replaced.
     pub replacements: usize,
-    /// Distinct lines that had at least one replacement.
+    /// Distinct lines that had at least one replacement. A multi-line match counts once, on the line it
+    /// starts on. `lines > 0` with no replacements is a `:s/\n//` join on the last line: nothing to join,
+    /// and not an error (Vim).
     pub lines: usize,
 }
 
@@ -91,26 +118,207 @@ pub(crate) fn resolve_line_range(
     lines: &[(usize, usize)],
     cursor_line: usize,
 ) -> (usize, usize) {
-    let last = lines.len().saturating_sub(1);
+    resolve_lines(range, lines.len(), cursor_line)
+}
+
+/// [`resolve_line_range`] over a buffer of `nlines` lines ([`line_count`]), for the line commands that
+/// need only the ends of the range and not every line's span (#1257).
+pub(crate) fn resolve_lines(range: SubRange, nlines: usize, cursor_line: usize) -> (usize, usize) {
+    let last = nlines.saturating_sub(1);
     match range {
         SubRange::CurrentLine => (cursor_line.min(last), cursor_line.min(last)),
         SubRange::WholeFile => (0, last),
-        SubRange::Lines(a, b) => (a.saturating_sub(1).min(last), b.saturating_sub(1).min(last)),
+        // A reversed range is taken in order (#733), as the Ex parser already swaps `:3,1d`; an API
+        // caller passing one must not underflow.
+        SubRange::Lines(a, b) => {
+            let (a, b) = (a.min(b), a.max(b));
+            (a.saturating_sub(1).min(last), b.saturating_sub(1).min(last))
+        }
     }
 }
 
-/// The byte span `(start, end)` of every line (`end` excludes the `\n`). Always at least one line.
-pub(crate) fn line_spans(hay: &str) -> Vec<(usize, usize)> {
+/// The byte span `(start, end)` of every line (`end` excludes the `\n`). Always at least one line. The
+/// empty slot after a final newline is not a line in Vim's model (#677), so a terminated buffer has no span
+/// for it: `:%d` counts two lines in `a\nb\n`, `:%j` stops at the last real line, and a zero-width pattern
+/// never substitutes there. An empty buffer is one empty line.
+pub(crate) fn line_spans<B: AsRef<[u8]> + ?Sized>(hay: &B) -> Vec<(usize, usize)> {
+    let hay = hay.as_ref();
     let mut out = Vec::new();
     let mut start = 0;
-    for (i, b) in hay.bytes().enumerate() {
+    for (i, &b) in hay.iter().enumerate() {
         if b == b'\n' {
             out.push((start, i));
             start = i + 1;
         }
     }
-    out.push((start, hay.len())); // the final line (unterminated, or empty after a trailing newline)
+    if start < hay.len() || out.is_empty() {
+        out.push((start, hay.len())); // an unterminated final line, or the empty buffer's one line
+    }
     out
+}
+
+/// The number of lines [`line_spans`] finds in `doc` (at least one), from its line index (#1257).
+pub(crate) fn line_count(doc: &crate::Document) -> usize {
+    doc.line_starts().len() - usize::from(doc.bytes().last() == Some(&b'\n'))
+}
+
+/// The span [`line_spans`] gives the 0-based line `i` of `doc` (`i` below [`line_count`]), from its
+/// line index.
+pub(crate) fn line_span(doc: &crate::Document, i: usize) -> (usize, usize) {
+    let (starts, len) = (doc.line_starts(), doc.len());
+    let s = starts.get(i).copied().unwrap_or(len);
+    (s, starts.get(i + 1).map_or(len, |&next| next - 1))
+}
+
+/// Find the substitutions `:s` makes on the lines `first..=last` (0-based, inclusive) of `hay`, appending
+/// them to `out` in document order. `lines` is [`line_spans`] of `hay`. `consumed` carries, across calls,
+/// the end of the last match that ran past its own line: a line that match joined away is skipped, as Vim
+/// deletes it (`:g/a/s/a\nb/X/` marks lines first, then substitutes on the ones still there).
+///
+/// A pattern that cannot match a line break is matched one line at a time. A [`Regex::multiline`] pattern
+/// is matched against the whole buffer from each line, the way nvim's `do_sub` does (v0.12.6): a match
+/// belongs to the line its whole match starts on; after a match that ends on a later line the search goes
+/// on in that line (even without `g`, Vim's `do_again`) while it is in the range, and stops once it is
+/// past the range. The last line's line break matches `\n` whether or not the buffer ends in one, and
+/// the replacement goes in BEFORE it, so the buffer keeps its final newline (`:%s/\n/,/` on `a\nb\n`
+/// gives `a,b,\n`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_substitutions(
+    re: &Regex,
+    buf: &crate::pattern::Hay<'_>,
+    lines: &[(usize, usize)],
+    (first, last): (usize, usize),
+    global: bool,
+    replacement: &str,
+    consumed: &mut Option<usize>,
+    out: &mut Vec<Substitution>,
+) {
+    // The search runs on the haystack (`lines` are its lines, `consumed` its offset); each substitution is
+    // pushed in buffer offsets, a byte that is not UTF-8 written back as itself (#1243).
+    let hay = buf.as_str();
+    let mut push = |start: usize, end: usize, replacement: Vec<u8>, line: usize| {
+        let replacement = match std::str::from_utf8(&replacement) {
+            Ok(text) => crate::pattern::unspell(text).into_owned(),
+            Err(_) => replacement,
+        };
+        out.push(Substitution {
+            start: BytePos(buf.to_buf(start)),
+            end: BytePos(buf.to_buf(end)),
+            replacement,
+            line,
+        });
+    };
+    if !re.multiline() {
+        for (li, &(ls, le)) in lines.iter().enumerate().take(last + 1).skip(first) {
+            // CTRL-C stops the scan; the matches found so far are still substituted, as in nvim.
+            if crate::interrupt::breakcheck() {
+                return;
+            }
+            let line = &hay[ls..le];
+            let matches: Vec<Match> = if global {
+                re.find_all(line)
+            } else {
+                re.find_at(line, BytePos(0)).into_iter().collect()
+            };
+            for m in matches {
+                push(
+                    ls + m.start.0,
+                    ls + m.end.0,
+                    expand_replacement(replacement, &line[m.start.0..m.end.0]),
+                    li,
+                );
+            }
+        }
+        return;
+    }
+    // Search a haystack that always ends in a line break, so the last line's `\n` can match. Positions are
+    // the buffer's own; an edit never reaches past the buffer (see the clamp below).
+    let owned;
+    let hay: &str = if hay.ends_with('\n') {
+        hay
+    } else {
+        owned = format!("{hay}\n");
+        &owned
+    };
+    let n = hay.len();
+    // The line holding byte `pos`; `lines.len()` for the end of the haystack (past the last line).
+    let line_of = |pos: usize| {
+        if pos >= n {
+            lines.len()
+        } else {
+            lines.partition_point(|&(s, _)| s <= pos) - 1
+        }
+    };
+    let mut global = global;
+    let mut li = first;
+    while li <= last {
+        if crate::interrupt::breakcheck() {
+            return;
+        }
+        let (ls, le) = lines[li];
+        if consumed.is_some_and(|e| ls <= e) {
+            li += 1; // joined into the line above by an earlier match
+            continue;
+        }
+        let Some((BytePos(ws), mut m)) = re.find_whole_at(hay, BytePos(ls)) else {
+            return; // no match anywhere below
+        };
+        if ws > le {
+            li = line_of(ws); // the leftmost match starts on a later line: no line before it matches
+            continue;
+        }
+        let group = li;
+        let mut cur = li;
+        let mut col = ls;
+        let mut prev_end: Option<usize> = None;
+        loop {
+            if m.start.0 >= n {
+                return; // `\n\zs` at the end of the last line: past the buffer
+            }
+            if m.start.0 > lines[cur].1 {
+                cur = line_of(m.start.0); // a `\zs` after a line break reports a later line
+            }
+            let mut do_again = false;
+            let mut stop = false;
+            if prev_end == Some(col) && m.start.0 == m.end.0 && m.end.0 == col {
+                // An empty match right where the previous one ended does not count (Vim).
+                if col >= lines[cur].1 {
+                    stop = true;
+                } else {
+                    col += hay[col..].chars().next().map_or(1, char::len_utf8);
+                }
+            } else {
+                col = m.end.0;
+                prev_end = Some(col);
+                // A match through the last line break replaces up to it; the break stays.
+                stop = m.end.0 >= n;
+                push(
+                    m.start.0,
+                    m.end.0.min(n - 1).max(m.start.0),
+                    expand_replacement(replacement, &hay[m.start.0..m.end.0]),
+                    group,
+                );
+                let end_line = line_of(m.end.0);
+                if end_line > cur {
+                    cur = end_line;
+                    *consumed = Some(m.end.0);
+                    if cur <= last {
+                        do_again = true;
+                    } else {
+                        global = false;
+                    }
+                }
+            }
+            if stop || cur > last || !(global || do_again) {
+                break;
+            }
+            match re.find_whole_at(hay, BytePos(col)) {
+                Some((BytePos(ws), next)) if ws <= lines[cur].1 => m = next,
+                _ => break,
+            }
+        }
+        li = cur + 1;
+    }
 }
 
 /// The active case transform for the replacement expander: uppercase or lowercase.
@@ -140,25 +348,31 @@ impl CaseState {
         let mut buf = [0u8; 4];
         for ch in s.chars() {
             match self.pending.take().or(self.region) {
-                Some(Case::Upper) => {
-                    for u in ch.to_uppercase() {
-                        out.extend_from_slice(u.encode_utf8(&mut buf).as_bytes());
-                    }
-                }
-                Some(Case::Lower) => {
-                    for l in ch.to_lowercase() {
-                        out.extend_from_slice(l.encode_utf8(&mut buf).as_bytes());
-                    }
-                }
+                // nvim's `do_upper` / `do_lower`: `mb_toupper` / `mb_tolower`, one character to one
+                // (`\U` on `ß` gives `ẞ`, not `SS`).
+                Some(Case::Upper) => out.extend_from_slice(
+                    crate::casemap::vim_toupper(ch)
+                        .encode_utf8(&mut buf)
+                        .as_bytes(),
+                ),
+                Some(Case::Lower) => out.extend_from_slice(
+                    crate::casemap::vim_tolower(ch)
+                        .encode_utf8(&mut buf)
+                        .as_bytes(),
+                ),
                 None => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
             }
         }
     }
 }
 
-/// Expand a `:s` replacement: `&` / `\0` → the whole matched text; `\n` `\t` `\r` `\\` `\&` escapes; and
-/// the case modifiers `\u` `\l` (next char) / `\U` `\L` (region) / `\e` `\E` (end region), applied to the
-/// emitted text (including `&`/`\0` insertions) as a small state machine — see [`CaseState`].
+/// Expand a `:s` replacement: `&` / `\0` → the whole matched text; `\t` `\\` `\&` escapes; and the case
+/// modifiers `\u` `\l` (next char) / `\U` `\L` (region) / `\e` `\E` (end region), applied to the emitted text
+/// (including `&`/`\0` insertions) as a small state machine — see [`CaseState`].
+///
+/// Line breaks follow Vim (`:help sub-replace-special`, nvim v0.12.6): `\r` and a literal carriage return
+/// (typed with `CTRL-V <CR>`) split the line, `\<CR>` inserts a literal carriage return, and `\n` inserts
+/// a NUL byte. A carriage return or line break inside the MATCHED text is copied as it is.
 ///
 /// Capture backreferences `\1`-`\9` are DEFERRED: `\(…\)` compiles to a real regex group, but the
 /// `pattern::Match` type surfaces only the reported `start`/`end` span, not per-group spans, and the
@@ -174,9 +388,10 @@ pub(crate) fn expand_replacement(replacement: &str, matched: &str) -> Vec<u8> {
             '&' => st.emit(matched, &mut out),
             '\\' => match chars.next() {
                 Some('0') => st.emit(matched, &mut out),
-                Some('n') => st.emit("\n", &mut out),
+                Some('n') => st.emit("\0", &mut out),
                 Some('t') => st.emit("\t", &mut out),
-                Some('r') => st.emit("\r", &mut out),
+                Some('r') => st.emit("\n", &mut out),
+                Some('\r') => st.emit("\r", &mut out),
                 Some('&') => st.emit("&", &mut out),
                 Some('\\') => st.emit("\\", &mut out),
                 Some('u') => st.pending = Some(Case::Upper),
@@ -190,6 +405,7 @@ pub(crate) fn expand_replacement(replacement: &str, matched: &str) -> Vec<u8> {
                 }
                 None => st.emit("\\", &mut out),
             },
+            '\r' => st.emit("\n", &mut out),
             _ => {
                 let mut buf = [0u8; 4];
                 st.emit(c.encode_utf8(&mut buf), &mut out);

@@ -4,8 +4,8 @@ Where to go, by what you need:
 
 | Need | Go to |
 | --- | --- |
-| A question / "how do I…" / help | **GitHub Discussions** (Q&A) |
-| An early idea or "should we…" | **GitHub Discussions** (Ideas) |
+| A question / "how do I…" / help | [**GitHub Discussions** (Q&A)](https://github.com/hawk90/ruse/discussions/categories/q-a) |
+| An early idea or "should we…" | [**GitHub Discussions** (Ideas)](https://github.com/hawk90/ruse/discussions/categories/ideas) |
 | A reproducible bug | Open a **Bug report** issue (use the form) |
 | A scoped feature you want to build | Open a **Feature** issue → see [contributing](docs/contributing/README.md) |
 | An architecture / public-contract change | Propose an **RFC** ([docs/rfc/](docs/rfc/README.md)) |
@@ -15,5 +15,5 @@ Orientation: read [`spec/CONTEXT.md`](spec/CONTEXT.md) (compact) then the releva
 decision / RFC. Contribution process: [CONTRIBUTING.md](CONTRIBUTING.md) and
 [docs/contributing/](docs/contributing/README.md).
 
-> This is a spec-first project in its design phase — the code (`crates/`) is a compiling skeleton. Most
-> "how do I use ruse" questions don't apply yet; design questions and contributions do.
+> ruse is an early, unreleased editor: `cargo run -p ruse-tui` builds a working Vim-style TUI, and feature state is in
+> [`spec/PRD.yaml`](spec/PRD.yaml). Usage questions, design questions and contributions are all welcome.

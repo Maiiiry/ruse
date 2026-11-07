@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use crate::edit::EditList;
-use crate::pos::Revision;
+use crate::pos::{BytePos, Revision};
 use crate::transaction::{GroupHint, TransactionOrigin};
 
 /// Monotonic creation-order key over undo nodes — the chronological index key, and the identity behind
@@ -41,6 +41,32 @@ struct UndoNode {
     inverse: Option<EditList>,
     origin: Option<TransactionOrigin>,
     result_revision: Revision,
+    /// The child `C-r` redoes into: the one most recently left or entered (Vim's `uh_alt_next` order puts
+    /// the branch just visited first), else the newest. Set whenever `current` crosses the parent/child edge.
+    redo_child: Option<UndoNodeId>,
+    /// Vim's `uh_cursor`: where the cursor stood when this change began, as a byte offset into the
+    /// PARENT's text. Read off the first node of a group when `u`/`C-r` place the cursor.
+    cursor: usize,
+}
+
+/// What one `u`/`C-r`/`g-`/`g+` step re-applies, and what the cursor placement needs to know about it.
+pub struct UndoStep {
+    /// The edit lists to apply, in order.
+    pub edits: Vec<EditList>,
+    /// The undo group each of `edits` belongs to — a step can cross several (`g-`/`g+`), and the marks a
+    /// group saved are restored after its last list (Vim's `uh_namedm`, #686).
+    pub groups: Vec<u64>,
+    /// The node current after each of `edits` is applied, and the origin of the node whose edits it is —
+    /// what the change log names a navigation step by (RFC-0023 §1).
+    pub nodes: Vec<(MonotonicSeq, Option<TransactionOrigin>)>,
+    /// `edits[tail..]` belong to the LAST group the step crossed — the one Vim's `u_undoredo` places the
+    /// cursor from (each group it crosses overrides the previous placement).
+    pub tail: usize,
+    /// Whether that last group was re-applied forwards (redo) rather than undone.
+    pub forward: bool,
+    /// The last group's `uh_cursor`: a byte offset into the text from BEFORE the group's change, which
+    /// is the text after an undo and the text before a redo.
+    pub cursor: BytePos,
 }
 
 /// The in-memory undo history for one document.
@@ -53,6 +79,9 @@ pub struct UndoHistory {
     /// True right after an undo/redo, so the next fresh edit starts a new group (a change after an undo is
     /// a new logical unit, matching Vim), never coalescing into the group we just navigated away from.
     last_was_nav: bool,
+    /// An undo sync since the last change (Vim's `u_sync`, [`UndoHistory::sync`]): the next change starts a
+    /// new group even with a [`GroupHint::Continue`] hint. An explicit [`GroupHint::JoinPrev`] still joins.
+    synced: bool,
 }
 
 impl Default for UndoHistory {
@@ -74,6 +103,8 @@ impl UndoHistory {
             inverse: None,
             origin: None,
             result_revision: base_revision,
+            redo_child: None,
+            cursor: 0,
         };
         UndoHistory {
             nodes: vec![root],
@@ -82,7 +113,22 @@ impl UndoHistory {
             next_seq: 1,
             next_group: 1,
             last_was_nav: false,
+            synced: false,
         }
+    }
+
+    /// Close the current group (Vim's `u_sync`): the next change starts a new undo step unless it asks to
+    /// join ([`GroupHint::JoinPrev`]). The frontend syncs before each typed command outside text entry, so
+    /// `xx` is two steps while an Insert session stays one; a save syncs too (#766).
+    pub fn sync(&mut self) {
+        self.synced = true;
+    }
+
+    /// Whether the history is synced ([`UndoHistory::sync`]) since its last change, so another sync would
+    /// change nothing. The frontend records a sync in the trace only when it is not (RFC-0020).
+    #[must_use]
+    pub fn is_synced(&self) -> bool {
+        self.synced
     }
 
     /// Decide the group id for a new change appended to `current`, per persistence §6.
@@ -95,7 +141,9 @@ impl UndoHistory {
             // prior change was undone (nav) or we are at the root there is nothing to join → a new group.
             GroupHint::JoinPrev if mergeable => cur.group,
             // Continue coalesces only within a same-origin session.
-            GroupHint::Continue if mergeable && cur.origin == Some(origin) => cur.group,
+            GroupHint::Continue if mergeable && !self.synced && cur.origin == Some(origin) => {
+                cur.group
+            }
             _ => self.fresh_group(),
         }
     }
@@ -108,7 +156,7 @@ impl UndoHistory {
 
     /// Record a freshly-applied transaction as a new child of `current`, and move `current` onto it. If
     /// `current` already had children (we had undone), this adds another branch — earlier children are
-    /// retained (INV-UNDO: no lost history).
+    /// retained (INV-UNDO: no lost history). `cursor` is where the change began, in the text before it.
     pub fn record(
         &mut self,
         forward: EditList,
@@ -116,7 +164,14 @@ impl UndoHistory {
         origin: TransactionOrigin,
         hint: GroupHint,
         result_revision: Revision,
+        cursor: BytePos,
     ) -> UndoNodeId {
+        let cursor = cursor.0;
+        // Stability §1: an undo node's parent must exist.
+        debug_assert!(
+            self.current.0 < self.nodes.len(),
+            "the new node's parent exists"
+        );
         let group = self.group_for(origin, hint);
         let id = UndoNodeId(self.nodes.len());
         let seq = MonotonicSeq(self.next_seq);
@@ -130,11 +185,16 @@ impl UndoHistory {
             inverse: Some(inverse),
             origin: Some(origin),
             result_revision,
+            redo_child: None,
+            cursor,
         });
-        self.nodes[self.current.0].children.push(id);
+        let parent = &mut self.nodes[self.current.0];
+        parent.children.push(id);
+        parent.redo_child = Some(id);
         self.current = id;
         self.chronological.push(id);
         self.last_was_nav = false;
+        self.synced = false;
         id
     }
 
@@ -152,13 +212,14 @@ impl UndoHistory {
 
     /// Undo the whole current group: the inverse edits of every node from `current` back through the
     /// contiguous same-group chain, in application order (current first). Moves `current` to the node
-    /// below the group. Empty if already at the root.
-    pub fn undo(&mut self) -> Vec<EditList> {
+    /// below the group. `None` if already at the root.
+    pub fn undo(&mut self) -> Option<UndoStep> {
+        self.nodes[self.current.0].parent?;
         let mut out = Vec::new();
-        if self.nodes[self.current.0].parent.is_none() {
-            return out;
-        }
+        let mut groups = Vec::new();
+        let mut nodes = Vec::new();
         let group = self.nodes[self.current.0].group;
+        let mut cursor = 0;
         loop {
             let node = &self.nodes[self.current.0];
             let Some(parent) = node.parent else { break };
@@ -170,20 +231,39 @@ impl UndoHistory {
                     .clone()
                     .expect("non-root node carries an inverse"),
             );
+            groups.push(group);
+            nodes.push((self.nodes[parent.0].seq, node.origin));
+            cursor = node.cursor;
+            let child = self.current;
+            self.nodes[parent.0].redo_child = Some(child);
             self.current = parent;
         }
         self.last_was_nav = true;
-        out
+        Some(UndoStep {
+            edits: out,
+            groups,
+            nodes,
+            tail: 0,
+            forward: false,
+            cursor: BytePos(cursor),
+        })
     }
 
-    /// Redo the whole next group along the newest branch: the forward edits of the group's node chain, in
-    /// application order. Moves `current` to the group's tip. Empty if there is nothing to redo.
-    pub fn redo(&mut self) -> Vec<EditList> {
+    /// The child `C-r` moves into from `n`: the branch last visited, else the newest (#750).
+    fn redo_target(&self, n: UndoNodeId) -> Option<UndoNodeId> {
+        let node = &self.nodes[n.0];
+        node.redo_child.or_else(|| node.children.last().copied())
+    }
+
+    /// Redo the whole next group along the branch last visited (Vim: after `g-` into an older branch and
+    /// `u`, `C-r` goes back down that branch, #750), else the newest: the forward edits of the group's
+    /// node chain, in application order. Moves `current` to the group's tip. `None` if nothing to redo.
+    pub fn redo(&mut self) -> Option<UndoStep> {
         let mut out = Vec::new();
-        let Some(&first) = self.nodes[self.current.0].children.last() else {
-            return out;
-        };
+        let first = self.redo_target(self.current)?;
         let group = self.nodes[first.0].group;
+        let mut groups = Vec::new();
+        let mut nodes = Vec::new();
         let mut node = first;
         loop {
             out.push(
@@ -192,23 +272,32 @@ impl UndoHistory {
                     .clone()
                     .expect("non-root node carries a forward"),
             );
+            groups.push(group);
+            nodes.push((self.nodes[node.0].seq, self.nodes[node.0].origin));
             self.current = node;
-            match self.nodes[node.0].children.last() {
-                Some(&child) if self.nodes[child.0].group == group => node = child,
+            match self.redo_target(node) {
+                Some(child) if self.nodes[child.0].group == group => node = child,
                 _ => break,
             }
         }
         self.last_was_nav = true;
-        out
+        Some(UndoStep {
+            edits: out,
+            groups,
+            nodes,
+            tail: 0,
+            forward: true,
+            cursor: BytePos(self.nodes[first.0].cursor),
+        })
     }
 
     /// Move `current` to any node, returning the edits that transform the buffer from the current
     /// state into `target`'s: the inverses from `current` up to the lowest common ancestor, then the
     /// forwards from the LCA down to `target`. This is what lets `g-`/`g+` cross into a branch the
-    /// parent/child walk of `undo`/`redo` cannot reach. Empty when already at `target`.
-    fn navigate_to(&mut self, target: UndoNodeId) -> Vec<EditList> {
+    /// parent/child walk of `undo`/`redo` cannot reach. `None` when already at `target`.
+    fn navigate_to(&mut self, target: UndoNodeId) -> Option<UndoStep> {
         if target == self.current {
-            return Vec::new();
+            return None;
         }
         let current_ancestry: HashSet<UndoNodeId> =
             self.ancestry(self.current).into_iter().collect();
@@ -227,21 +316,51 @@ impl UndoHistory {
             }
         };
         let mut out = Vec::new();
+        let mut groups = Vec::new();
+        let mut nodes = Vec::new();
+        // The last group crossed: the tail of the forwards when the walk ends going down, else the tail of
+        // the inverses. `tail` indexes its first list, `cursor` is its first node's `uh_cursor`.
+        let mut tail = 0;
+        let mut cursor = 0;
         // Inverses from current up to (not including) the LCA.
         let mut c = self.current;
+        let mut group = None;
         while c != lca {
+            let node = &self.nodes[c.0];
+            if group != Some(node.group) {
+                group = Some(node.group);
+                tail = out.len();
+            }
+            cursor = node.cursor;
+            groups.push(node.group);
             out.push(
                 self.nodes[c.0]
                     .inverse
                     .clone()
                     .expect("non-root node carries an inverse"),
             );
-            c = self.nodes[c.0]
+            let parent = self.nodes[c.0]
                 .parent
                 .expect("a node above the LCA has a parent");
+            nodes.push((self.nodes[parent.0].seq, self.nodes[c.0].origin));
+            self.nodes[parent.0].redo_child = Some(c);
+            c = parent;
         }
         // Forwards from just below the LCA down to the target (down is target-first, so reverse).
+        let forward = !down.is_empty();
+        let mut group = None;
         for &n in down.iter().rev() {
+            if let Some(p) = self.nodes[n.0].parent {
+                self.nodes[p.0].redo_child = Some(n);
+            }
+            let node = &self.nodes[n.0];
+            if group != Some(node.group) {
+                group = Some(node.group);
+                tail = out.len();
+                cursor = node.cursor;
+            }
+            groups.push(node.group);
+            nodes.push((node.seq, node.origin));
             out.push(
                 self.nodes[n.0]
                     .forward
@@ -251,7 +370,14 @@ impl UndoHistory {
         }
         self.current = target;
         self.last_was_nav = true;
-        out
+        Some(UndoStep {
+            edits: out,
+            groups,
+            nodes,
+            tail,
+            forward,
+            cursor: BytePos(cursor),
+        })
     }
 
     /// `current` and every ancestor up to the root, nearest first.
@@ -284,21 +410,16 @@ impl UndoHistory {
     /// `g-` (`older = true`) / `g+` (`older = false`): step one logical change along CHRONOLOGICAL
     /// creation order — across branches, unlike `undo`/`redo` which follow the tree — and return the
     /// edits to reach that state. One step crosses a whole group (e.g. an insert session), matching
-    /// Vim's undo-block granularity. Empty at either end of history.
-    pub fn to_chronological(&mut self, older: bool) -> Vec<EditList> {
+    /// Vim's undo-block granularity. `None` at either end of history.
+    pub fn to_chronological(&mut self, older: bool) -> Option<UndoStep> {
         let tips = self.group_tips();
-        let Some(pos) = tips.iter().position(|&id| id == self.current) else {
-            return Vec::new();
-        };
+        let pos = tips.iter().position(|&id| id == self.current)?;
         let target = if older {
             pos.checked_sub(1)
         } else {
             (pos + 1 < tips.len()).then_some(pos + 1)
         };
-        match target {
-            Some(tp) => self.navigate_to(tips[tp]),
-            None => Vec::new(),
-        }
+        self.navigate_to(tips[target?])
     }
 
     /// The `seq` of the current node — the identity dirty-tracking compares against `saved_node`.
@@ -326,6 +447,73 @@ impl UndoHistory {
         self.nodes.len()
     }
 
+    /// Check the tree's structure and panic on the first broken rule (#906, stability §1 "an undo node's
+    /// parent does not exist"): one root, every other node's parent exists, was created before it and
+    /// lists it as a child, `seq` and the chronological index follow creation order, a node's redo
+    /// target is one of its children, and every non-root node carries its forward and inverse edits.
+    /// `O(nodes)`; for property and fuzz tests.
+    pub fn assert_invariants(&self) {
+        let n = self.nodes.len();
+        assert!(self.current.0 < n, "current node {} of {n}", self.current.0);
+        assert!(self.nodes[0].parent.is_none(), "the root has a parent");
+        assert_eq!(
+            self.chronological.len(),
+            n,
+            "the chronological index misses a node"
+        );
+        for (i, (&id, node)) in self.chronological.iter().zip(&self.nodes).enumerate() {
+            assert_eq!(id.0, i, "chronological order is creation order");
+            assert!(
+                node.group < self.next_group,
+                "node {i} has an unissued group"
+            );
+            if i == 0 {
+                continue;
+            }
+            let p = node.parent.expect("a non-root node has a parent");
+            assert!(p.0 < i, "node {i}'s parent {} is not older than it", p.0);
+            assert!(
+                self.nodes[p.0].children.contains(&UndoNodeId(i)),
+                "node {i} is missing from its parent's children"
+            );
+            assert!(
+                node.seq > self.nodes[i - 1].seq,
+                "seq does not increase at node {i}"
+            );
+            assert!(node.seq.0 < self.next_seq, "node {i} has an unissued seq");
+            assert!(
+                node.forward.is_some() && node.inverse.is_some(),
+                "node {i} lost its edits"
+            );
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            for c in &node.children {
+                assert_eq!(
+                    self.nodes.get(c.0).and_then(|c| c.parent),
+                    Some(UndoNodeId(i)),
+                    "child {} of node {i} names another parent",
+                    c.0
+                );
+            }
+            if let Some(r) = node.redo_child {
+                assert!(
+                    node.children.contains(&r),
+                    "node {i} redoes into a stranger"
+                );
+            }
+        }
+    }
+
+    /// Whether `g` is a group id this history has handed out.
+    pub(crate) fn issued_group(&self, g: u64) -> bool {
+        g < self.next_group
+    }
+
+    /// Whether `seq` names a node of this history.
+    pub(crate) fn has_seq(&self, seq: MonotonicSeq) -> bool {
+        self.nodes.iter().any(|n| n.seq == seq)
+    }
+
     /// Nodes in creation (`seq`) order as `(seq, origin, group)` — the chronological index the `g-`/`g+`
     /// traversal is built on. Present here so a test can assert branched-away states are retained.
     #[must_use]
@@ -350,7 +538,14 @@ mod tests {
 
     /// Record a change with an explicit origin/hint; edit CONTENT is irrelevant to grouping.
     fn record(h: &mut UndoHistory, origin: TransactionOrigin, hint: GroupHint) -> u64 {
-        h.record(empty_edits(), empty_edits(), origin, hint, Revision::ZERO);
+        h.record(
+            empty_edits(),
+            empty_edits(),
+            origin,
+            hint,
+            Revision::ZERO,
+            BytePos(0),
+        );
         h.current_group()
     }
 
@@ -378,6 +573,7 @@ mod tests {
             TransactionOrigin::UserInput,
             GroupHint::BreakBefore,
             Revision::ZERO,
+            BytePos(0),
         );
         let a_seq = h.current_seq();
         h.undo();
@@ -387,6 +583,7 @@ mod tests {
             TransactionOrigin::UserInput,
             GroupHint::BreakBefore,
             Revision::ZERO,
+            BytePos(0),
         );
         let b_seq = h.current_seq();
         // g- lands on A (the branched-away state), g+ returns to B.
@@ -399,6 +596,31 @@ mod tests {
         h.to_chronological(false);
         assert_eq!(h.current_seq(), b_seq, "g+ returns to the newest state");
         // g+ at the tip is a no-op (empty), not a panic.
-        assert!(h.to_chronological(false).is_empty());
+        assert!(h.to_chronological(false).is_none());
+    }
+
+    #[test]
+    fn redo_follows_the_branch_last_visited() {
+        // #750: root -> A, undo, root -> B; g- to A, undo to root: C-r goes back to A, not to the newest B.
+        let mut h = UndoHistory::new(Revision::ZERO);
+        record(&mut h, TransactionOrigin::UserInput, GroupHint::BreakBefore);
+        let a_seq = h.current_seq();
+        h.undo();
+        record(&mut h, TransactionOrigin::UserInput, GroupHint::BreakBefore);
+        let b_seq = h.current_seq();
+        h.to_chronological(true);
+        h.undo();
+        h.redo();
+        assert_eq!(
+            h.current_seq(),
+            a_seq,
+            "redo re-enters the branch just left"
+        );
+        h.undo();
+        h.to_chronological(false); // root -> A by creation order
+        h.to_chronological(false); // A -> B
+        h.undo();
+        h.redo();
+        assert_eq!(h.current_seq(), b_seq, "and B once B was the one visited");
     }
 }

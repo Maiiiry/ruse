@@ -23,9 +23,9 @@ pub struct Edit {
 
 impl Edit {
     /// Pure insertion of `bytes` at `pos` (no deletion).
-    pub fn insert(pos: usize, bytes: impl Into<Vec<u8>>) -> Edit {
+    pub fn insert(pos: BytePos, bytes: impl Into<Vec<u8>>) -> Edit {
         Edit {
-            pos: BytePos(pos),
+            pos,
             del: 0,
             ins: bytes.into(),
         }
@@ -33,21 +33,98 @@ impl Edit {
 
     /// Pure deletion of `del` bytes at `pos` (no insertion).
     #[must_use]
-    pub fn delete(pos: usize, del: usize) -> Edit {
+    pub fn delete(pos: BytePos, del: usize) -> Edit {
         Edit {
-            pos: BytePos(pos),
+            pos,
             del,
             ins: Vec::new(),
         }
     }
 
     /// Replace `del` bytes at `pos` with `bytes`.
-    pub fn replace(pos: usize, del: usize, bytes: impl Into<Vec<u8>>) -> Edit {
+    pub fn replace(pos: BytePos, del: usize, bytes: impl Into<Vec<u8>>) -> Edit {
         Edit {
-            pos: BytePos(pos),
+            pos,
             del,
             ins: bytes.into(),
         }
+    }
+
+    /// The one edit that turns `old` into `new`, leaving the whole lines they share at the start and the
+    /// end in place (#735). A line command (`:m`, `:t`, `:put`, `:r`, `:{range}!`, `:sort`) that rebuilds
+    /// the buffer then records only the lines it touched: an undo entry holds those, and anchors on the
+    /// untouched lines (marks, `:g` line marks) do not collapse. Both ends stop at a line boundary.
+    #[must_use]
+    pub fn lines_changed(old: &[u8], new: Vec<u8>) -> Edit {
+        let common = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        // The shared head, cut back to just after its last newline.
+        let head = old[..common]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let room = (old.len() - head).min(new.len() - head);
+        let same_tail = old[head..]
+            .iter()
+            .rev()
+            .zip(new[head..].iter().rev())
+            .take(room)
+            .take_while(|(a, b)| a == b)
+            .count();
+        // The shared tail, cut forward to the start of a line: just after a newline that both sides keep
+        // in front of it, or at the head.
+        let mut tail = same_tail;
+        while tail > 0 {
+            let (at, nat) = (old.len() - tail, new.len() - tail);
+            if (at == head || old[at - 1] == b'\n') && (nat == head || new[nat - 1] == b'\n') {
+                break;
+            }
+            tail -= 1;
+        }
+        let ins = new[head..new.len() - tail].to_vec();
+        Edit::replace(BytePos(head), old.len() - tail - head, ins)
+    }
+
+    /// [`Edit::lines_changed`] for the `new` that is `old` with `text` inserted at `at`, found without
+    /// building `new`: what both sides share is known up to the insertion, so only the bytes around it
+    /// are compared (#1257, a `:t` per line of a `:g`).
+    #[must_use]
+    pub(crate) fn lines_changed_by_insert(old: &[u8], at: usize, text: Vec<u8>) -> Edit {
+        let (olen, l) = (old.len(), text.len());
+        let nlen = olen + l;
+        let new_at = |i: usize| -> u8 {
+            if i < at {
+                old[i]
+            } else if i < at + l {
+                text[i - at]
+            } else {
+                old[i - l]
+            }
+        };
+        // Everything before `at` is shared; the shared head may run on into the inserted text.
+        let mut common = at;
+        while common < olen && old[common] == new_at(common) {
+            common += 1;
+        }
+        let head = old[..common]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let room = olen - head; // `new` is the longer side
+                                // Everything after `at` is shared at the end; the shared tail may run on back before it.
+        let mut same_tail = (olen - at).min(room);
+        while same_tail < room && old[olen - same_tail - 1] == new_at(nlen - same_tail - 1) {
+            same_tail += 1;
+        }
+        let mut tail = same_tail;
+        while tail > 0 {
+            let (o, n) = (olen - tail, nlen - tail);
+            if (o == head || old[o - 1] == b'\n') && (n == head || new_at(n - 1) == b'\n') {
+                break;
+            }
+            tail -= 1;
+        }
+        let ins: Vec<u8> = (head..nlen - tail).map(new_at).collect();
+        Edit::replace(BytePos(head), olen - tail - head, ins)
     }
 
     /// Signed length change this edit makes to the document: `ins.len() - del`.
@@ -58,8 +135,8 @@ impl Edit {
 
     /// End of the affected interval, `pos + del`.
     #[must_use]
-    pub fn end(&self) -> usize {
-        self.pos.0 + self.del
+    pub fn end(&self) -> BytePos {
+        BytePos(self.pos.0 + self.del)
     }
 }
 
@@ -94,7 +171,7 @@ impl EditList {
         edits.sort_by_key(|e| e.pos.0);
         for w in edits.windows(2) {
             let (a, b) = (&w[0], &w[1]);
-            if b.pos.0 == a.pos.0 || b.pos.0 < a.end() {
+            if b.pos.0 == a.pos.0 || b.pos.0 < a.end().0 {
                 return Err(EditError::Overlap {
                     first_pos: a.pos.0,
                     second_pos: b.pos.0,
@@ -113,7 +190,7 @@ impl EditList {
         debug_assert!(
             edits
                 .windows(2)
-                .all(|w| w[1].pos.0 >= w[0].end() && w[1].pos.0 != w[0].pos.0),
+                .all(|w| w[1].pos.0 >= w[0].end().0 && w[1].pos.0 != w[0].pos.0),
             "from_sorted given overlapping or unsorted edits"
         );
         EditList { edits }
@@ -135,7 +212,7 @@ impl EditList {
     /// reported *before* any mutation (atomicity, F-001).
     pub fn check_bounds(&self, len: usize) -> Result<(), EditError> {
         for e in &self.edits {
-            if e.pos.0 > len || e.end() > len {
+            if e.pos.0 > len || e.end().0 > len {
                 return Err(EditError::OutOfRange {
                     pos: e.pos.0,
                     del: e.del,
@@ -155,7 +232,7 @@ impl EditList {
         for e in &self.edits {
             out.extend_from_slice(&buf[cur..e.pos.0]);
             out.extend_from_slice(&e.ins);
-            cur = e.end();
+            cur = e.end().0;
         }
         out.extend_from_slice(&buf[cur..]);
         out
@@ -172,7 +249,7 @@ impl EditList {
         let mut delta: isize = 0;
         for e in &self.edits {
             let new_pos = (e.pos.0 as isize + delta) as usize;
-            let removed = buf[e.pos.0..e.end()].to_vec();
+            let removed = buf[e.pos.0..e.end().0].to_vec();
             delta += e.delta();
             // Forward edits that *touch* (the next starts exactly where the previous ends) invert to the
             // same position — e.g. `delete[a,b)` then `insert@b`. Merging them into one edit keeps the
@@ -198,16 +275,49 @@ impl EditList {
 mod tests {
     use super::*;
 
+    /// #735: a rebuilt buffer becomes one edit over the lines that changed, cut at line boundaries.
+    #[test]
+    fn lines_changed_keeps_the_shared_lines_in_place() {
+        let check = |old: &str, new: &str, pos: usize, del: usize, ins: &str| {
+            let e = Edit::lines_changed(old.as_bytes(), new.as_bytes().to_vec());
+            assert_eq!(
+                (e.pos.0, e.del, e.ins.as_slice()),
+                (pos, del, ins.as_bytes())
+            );
+            let list = EditList::new(vec![e]).unwrap();
+            assert_eq!(
+                list.apply_to(old.as_bytes()),
+                new.as_bytes(),
+                "{old:?} -> {new:?}"
+            );
+        };
+        // `:put` after line 2: only an insertion at the start of line 3.
+        check("a\nb\nc\n", "a\nb\nx\nc\n", 4, 0, "x\n");
+        // `:m0` of line 3: lines 1-3 change, nothing after them.
+        check("a\nb\nc\nd\n", "c\na\nb\nd\n", 0, 6, "c\na\nb\n");
+        // A shared prefix inside a line is not kept: the edit starts at that line's start.
+        check("ab\nac\n", "ac\nab\n", 0, 6, "ac\nab\n");
+        // Identical buffers: an empty edit.
+        check("a\nb\n", "a\nb\n", 4, 0, "");
+        // Appending to a buffer without a final newline, and emptying a buffer.
+        check("a\nb", "a\nb\nc", 2, 1, "b\nc");
+        check("a\nb\n", "", 0, 4, "");
+        check("", "a\n", 0, 0, "a\n");
+    }
+
     #[test]
     fn overlapping_edits_are_rejected() {
         // deleting [2,5) and inserting at 3 (inside the deleted span) is not disjoint.
-        let err = EditList::new(vec![Edit::delete(2, 3), Edit::insert(3, b"x".to_vec())]);
+        let err = EditList::new(vec![
+            Edit::delete(BytePos(2), 3),
+            Edit::insert(BytePos(3), b"x".to_vec()),
+        ]);
         assert!(matches!(err, Err(EditError::Overlap { .. })));
         // two inserts at the same gap are ambiguous → rejected.
         assert!(matches!(
             EditList::new(vec![
-                Edit::insert(4, b"a".to_vec()),
-                Edit::insert(4, b"b".to_vec())
+                Edit::insert(BytePos(4), b"a".to_vec()),
+                Edit::insert(BytePos(4), b"b".to_vec())
             ]),
             Err(EditError::Overlap { .. })
         ));
@@ -216,7 +326,11 @@ mod tests {
     #[test]
     fn adjacent_edits_are_disjoint() {
         // delete [2,4) then insert at 4 (touching at a point, not overlapping) is allowed.
-        let list = EditList::new(vec![Edit::insert(4, b"x".to_vec()), Edit::delete(2, 2)]).unwrap();
+        let list = EditList::new(vec![
+            Edit::insert(BytePos(4), b"x".to_vec()),
+            Edit::delete(BytePos(2), 2),
+        ])
+        .unwrap();
         assert_eq!(list.edits().len(), 2);
         assert_eq!(list.edits()[0].pos.0, 2); // sorted ascending
     }
@@ -226,8 +340,8 @@ mod tests {
         let buf = b"hello world".to_vec();
         // replace "hello" with "HI", delete " world" tail's "world" -> two disjoint edits.
         let fwd = EditList::new(vec![
-            Edit::replace(0, 5, b"HI".to_vec()),
-            Edit::delete(6, 5),
+            Edit::replace(BytePos(0), 5, b"HI".to_vec()),
+            Edit::delete(BytePos(6), 5),
         ])
         .unwrap();
         fwd.check_bounds(buf.len()).unwrap();
@@ -241,7 +355,7 @@ mod tests {
 
     #[test]
     fn out_of_range_is_reported_before_apply() {
-        let list = EditList::new(vec![Edit::delete(3, 10)]).unwrap();
+        let list = EditList::new(vec![Edit::delete(BytePos(3), 10)]).unwrap();
         assert_eq!(
             list.check_bounds(5),
             Err(EditError::OutOfRange {

@@ -8,21 +8,32 @@
 //! and every lookup is a binary search over the cached starts. Idle frames (cursor motion, scroll) reuse
 //! the cache and pay only the O(log n) lookup.
 
-use ruse_core::Revision;
+use ruse_core::{DocumentId, Revision};
 
+/// Keyed on `(buffer, revision)`: a revision is counted per document, so two buffers (and, before #687,
+/// a reloaded one) share revision numbers; the buffer id tells them apart.
 #[derive(Default)]
 pub struct LineIndex {
-    rev: Option<Revision>,
+    rev: Option<(DocumentId, Revision)>,
     /// Byte offset of every line start; `starts[0]` is always 0. Length = line count.
     starts: Vec<usize>,
     /// The buffer length, so `nth_line_start` past the last line clamps to the end (as the viewport math
     /// expects) rather than to the last line's start.
     len: usize,
+    /// How many times the index was rebuilt (the #1182 regression test counts them).
+    builds: u64,
 }
 
 impl LineIndex {
-    /// Rebuild the index for `bytes` at `rev` if the revision changed; a no-op on an unchanged revision.
+    /// [`LineIndex::refresh_for`] for a single-buffer caller (benches, tests).
     pub fn refresh(&mut self, rev: Revision, bytes: &[u8]) {
+        self.refresh_for(DocumentId(0), rev, bytes);
+    }
+
+    /// Rebuild the index for buffer `doc`'s `bytes` at `rev` unless it already holds that buffer at
+    /// that revision.
+    pub fn refresh_for(&mut self, doc: DocumentId, rev: Revision, bytes: &[u8]) {
+        let rev = (doc, rev);
         if self.rev == Some(rev) {
             return;
         }
@@ -35,6 +46,13 @@ impl LineIndex {
         }
         self.len = bytes.len();
         self.rev = Some(rev);
+        self.builds += 1;
+    }
+
+    /// How many times [`LineIndex::refresh_for`] rebuilt the index.
+    #[must_use]
+    pub fn builds(&self) -> u64 {
+        self.builds
     }
 
     /// The 0-based row of `byte` (the line containing it) — O(log n).
@@ -53,6 +71,35 @@ impl LineIndex {
     }
 }
 
+/// One [`LineIndex`] per buffer that a window shows besides the focused one (#1182): each is rebuilt only
+/// when its own buffer's revision moves, so a split on another large buffer costs no newline scan per
+/// frame.
+#[derive(Default)]
+pub struct PaneIndexes {
+    map: std::collections::HashMap<DocumentId, LineIndex>,
+}
+
+impl PaneIndexes {
+    /// Bring `doc`'s index to `rev` (a no-op when it already is).
+    pub fn refresh(&mut self, doc: DocumentId, rev: Revision, bytes: &[u8]) {
+        self.map
+            .entry(doc)
+            .or_default()
+            .refresh_for(doc, rev, bytes);
+    }
+
+    /// `doc`'s index at revision `rev`, if [`PaneIndexes::refresh`] built that one.
+    #[must_use]
+    pub fn get(&self, doc: DocumentId, rev: Revision) -> Option<&LineIndex> {
+        self.map.get(&doc).filter(|ix| ix.rev == Some((doc, rev)))
+    }
+
+    /// Drop the indexes of the buffers no longer shown.
+    pub fn retain(&mut self, mut shown: impl FnMut(DocumentId) -> bool) {
+        self.map.retain(|d, _| shown(*d));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,7 +115,7 @@ mod tests {
         for byte in 0..=bytes.len() {
             assert_eq!(
                 idx.line_of(byte),
-                pos::line_of(bytes, byte),
+                pos::line_of(bytes, ruse_core::BytePos(byte)),
                 "line_of @ {byte}"
             );
         }
@@ -76,9 +123,54 @@ mod tests {
         for line in 0..=lines + 2 {
             assert_eq!(
                 idx.nth_line_start(line),
-                pos::nth_line_start(bytes, line),
+                pos::nth_line_start(bytes, line).0,
                 "nth_line_start @ {line}"
             );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(crate::test_cases(256))]
+
+        /// A shadow consumer (#906): the index, refreshed by `(buffer, revision)` only, equals the `pos`
+        /// scan of the current text after any run of edits, undos and redos — the revision key is never
+        /// reused for other text.
+        #[test]
+        fn the_index_follows_any_edit_undo_redo_sequence(
+            init in proptest::collection::vec(
+                proptest::sample::select(b"ab\n".to_vec()), 0..16),
+            ops in proptest::collection::vec(
+                (0u8..4, proptest::prelude::any::<usize>(), 0usize..4,
+                 proptest::collection::vec(proptest::sample::select(b"x\n".to_vec()), 0..3)),
+                0..30),
+        ) {
+            use ruse_core::{Document, Edit, EditList, Transaction, TransactionOrigin};
+            let mut doc = Document::new(DocumentId(1), init);
+            let mut idx = LineIndex::default();
+            for (kind, p, d, ins) in ops {
+                match kind {
+                    0 => { doc.undo(); }
+                    1 => { doc.redo(); }
+                    _ => {
+                        let len = doc.len();
+                        let p = p % (len + 1);
+                        let list = EditList::new(vec![Edit::replace(ruse_core::BytePos(p), d.min(len - p), ins)])
+                            .expect("one edit");
+                        doc.sync_undo();
+                        doc.apply(Transaction::new(doc.revision(), list, TransactionOrigin::UserInput))
+                            .expect("in range");
+                    }
+                }
+                let bytes = doc.bytes();
+                idx.refresh_for(doc.id(), doc.revision(), bytes);
+                for b in 0..=bytes.len() {
+                    proptest::prop_assert_eq!(idx.line_of(b), pos::line_of(bytes, ruse_core::BytePos(b)));
+                }
+                let lines = bytes.iter().filter(|&&b| b == b'\n').count();
+                for l in 0..=lines + 1 {
+                    proptest::prop_assert_eq!(idx.nth_line_start(l), pos::nth_line_start(bytes, l).0);
+                }
+            }
         }
     }
 

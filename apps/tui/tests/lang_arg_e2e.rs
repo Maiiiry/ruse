@@ -33,11 +33,16 @@ fn enter() -> KeyEvent {
 fn step(engine: &mut InputEngine, st: &mut EditorState, key: KeyEvent) -> Feed {
     let out = engine.feed(key, st.mode());
     match &out {
-        Feed::Cmd(cmd) => {
+        Feed::Cmd(cmd) | Feed::KeepJumps(cmd) => {
             apply_command(st, cmd);
         }
         Feed::Replay(cmds) => {
             for c in cmds {
+                apply_command(st, c);
+            }
+        }
+        Feed::Repeat(r) => {
+            for c in &r.expand() {
                 apply_command(st, c);
             }
         }
@@ -47,9 +52,17 @@ fn step(engine: &mut InputEngine, st: &mut EditorState, key: KeyEvent) -> Feed {
             _ => {}
         },
         Feed::CmdlineInsertUnder { .. }
+        | Feed::CmdlineInsertLine
+        | Feed::CmdlineInsertRegister(_)
+        | Feed::CmdlineComplete(_)
+        | Feed::EmacsAction(_)
         | Feed::FilterMotion { .. }
+        | Feed::FilterSpan(_)
+        | Feed::CountCmdline { .. }
+        | Feed::ScreenMotion { .. }
         | Feed::Pending
-        | Feed::Ignored => {}
+        | Feed::Ignored
+        | Feed::Beep { .. } => {}
     }
     out
 }

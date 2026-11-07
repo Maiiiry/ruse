@@ -22,7 +22,13 @@
 pub mod caps;
 pub mod clipboard;
 pub mod folds;
+// #920: the crate-internal parsers' entry points for the `fuzz/` targets, built only by `cargo fuzz`.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz_entry;
 pub mod graphics;
+// #895: a terminal-free session over the real key path, for tests (`Headless`).
+pub mod headless;
 pub mod highlight;
 pub mod input;
 pub mod keys;
@@ -30,9 +36,14 @@ pub mod line_index;
 pub mod org;
 pub mod persist;
 pub mod screen;
+// nvim's scroll commands over screen rows (#615).
+pub(crate) mod scroll;
 pub mod shell;
 
 pub(crate) mod app;
+// CTRL-C during a long command: the terminal side of `ruse_core::interrupt` (#682, #898).
+pub(crate) mod breakcheck;
+pub(crate) mod config;
 pub(crate) mod health;
 pub(crate) mod indent;
 pub(crate) mod log;
@@ -45,10 +56,13 @@ pub(crate) mod recover;
 // F-017 remote runtime (slice 1): client↔agent transport foundation — a versioned, capability-negotiated
 // framed protocol over a `ruse agent` subprocess (local pipe today; SSH later). Structurally mirrors `lsp/`.
 pub mod remote;
+// SIGTERM / SIGHUP: journal unsaved work, restore the terminal, exit with the signal's status (#857).
+pub(crate) mod signals;
 #[cfg(unix)]
 pub(crate) mod term_buffer;
+// Public for the PTY harness, which reads the editor's own screen through it (#1222).
 #[cfg(unix)]
-pub(crate) mod term_grid;
+pub mod term_grid;
 pub(crate) mod terminal;
 // Workspace trust (INV-TRUST-1, D-058): gates language-server spawning until the user trusts the workspace.
 pub(crate) mod trust;
@@ -56,3 +70,20 @@ pub(crate) mod ui;
 pub(crate) mod viewport;
 
 pub use app::cli::run;
+
+/// `n` proptest cases, scaled by `RUSE_PROPTEST_SCALE` for the scheduled deep tier (#920), with the reject
+/// budget scaled alike so a filtering test does not abort a long run.
+#[cfg(test)]
+pub(crate) fn test_cases(n: u32) -> proptest::prelude::ProptestConfig {
+    let scale = std::env::var("RUSE_PROPTEST_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let base = proptest::prelude::ProptestConfig::default();
+    proptest::prelude::ProptestConfig {
+        cases: n.saturating_mul(scale),
+        max_global_rejects: base.max_global_rejects.saturating_mul(scale),
+        ..base
+    }
+}

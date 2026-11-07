@@ -17,7 +17,7 @@ source and the loop multiplexing that renders it. The feature is intentionally s
  ┌──────────┐  master fd  ┌───────────────┐  Vec<u8>   ┌──────────────────────────┐
  │  $SHELL  │◀───write────│  read()→Sender │──mpsc────▶│ terminals: DocumentId →  │
  │  (child) │────output──▶│                │           │   Terminal (drain →      │
- └──────────┘             └───────────────┘            │   AnsiStrip → scrollback)│
+ └──────────┘             └───────────────┘            │   vte → Grid)            │
                                                         └──────────────────────────┘
 ```
 
@@ -27,16 +27,15 @@ source and the loop multiplexing that renders it. The feature is intentionally s
   disconnects on EOF (child exit). `Drop` hangs up (`SIGHUP`), reaps (`waitpid`), and joins the reader.
   `Pty` is a trait so a future Windows ConPTY impl (slice 3) slots in without touching the session.
 - **Terminal state** (`apps/tui/src/term_buffer.rs`): a session-side `Terminal` owns the PTY, the receiver,
-  and a **bounded, sanitized** scrollback. `drain()` pulls pending output through `AnsiStrip` and appends it.
+  and a VT `Grid` with a **bounded** scrollback. `drain()` feeds pending output to the `vte` parser, which drives the grid.
 - **Loop multiplex** (`apps/tui/src/app/session.rs`): gated so the common case is unchanged. With **no**
-  terminal, the loop keeps the pure blocking `event::read()` (no spin). With a terminal live, it `drain`s each
+  terminal and no live language server, the loop keeps the pure blocking `event::read()` (no spin). With a terminal live, it `drain`s each
   frame and uses `event::poll(TERM_TICK_MS ≈ 33ms)` — a key is handled if ready, otherwise the loop re-renders
-  the freshly drained output. Only the terminal-active path polls.
+  the freshly drained output. An LSP-only session polls too, more slowly (`LSP_TICK_MS`).
 
 ## VT grid model (slice 2)
 
-Slice 1 shipped a line-mode stand-in (`AnsiStrip` → sanitized text). Slice 2 replaces it with a real **VT
-screen grid** (`apps/tui/src/term_grid.rs`): a `rows × cols` matrix of styled cells with a cursor, implementing
+Terminal output lands in a **VT screen grid** (`apps/tui/src/term_grid.rs`): a `rows × cols` matrix of styled cells with a cursor, implementing
 `vte::Perform` so `Terminal::drain` feeds raw PTY bytes straight into the `vte` parser. Coverage: printable +
 wrap + CR/LF/BS/TAB; cursor `CUP`/`CUU`/`CUD`/`CUF`/`CUB`/`CHA`/`VPA` + save/restore; `SGR` (16 + bright
 colors, truecolor, bold/underline/italic/reverse); erase `ED`/`EL`; **alt-screen** (`?1049h/l` — stash/restore
@@ -55,7 +54,9 @@ switch); `i`/`a`/`A` resume Terminal.
 
 **Slice 2b (partly landed):** scroll regions (`DECSTBM`) + insert/delete line (`IL`/`DL`) + insert/delete/erase
 char (`ICH`/`DCH`/`ECH`) are in, so region-scrolling apps (less, vim, git log, tmux) render correctly. Still
-deferred: the scrollback **paging UI**, mouse reporting, bracketed paste into the child, sixel.
+deferred: the scrollback **paging UI**, mouse reporting, sixel. A bracketed paste in Terminal or
+Terminal-Normal mode goes to the child (#600): ESC and C1 controls are dropped, and it is wrapped in
+`CSI 200 ~`/`CSI 201 ~` only when the child enabled mode 2004 (tracked by the grid).
 
 ## Determinism boundary (F-022)
 
@@ -70,7 +71,7 @@ editor edits only — a terminal buffer's placeholder document stays empty.
   `term_grid::Grid` model + the `vte` parser (`DEP-TERM-PARSER`) + `paint_grid`; resize via `TIOCSWINSZ`.
   Unlocks full-screen TUIs (vim/htop).
 - **Slice 2b (partly landed):** scroll regions + IL/DL/ICH/DCH/ECH in `term_grid.rs`; remaining = scrollback
-  paging UI, mouse, bracketed paste.
+  paging UI, mouse.
 - **Slice 3:** Windows ConPTY behind the `Pty` trait; grid re-emission without byte round-trip assumptions.
 - **Slice 4:** fold the reader into the `C-SCHEDULER` deterministic executor (`docs/design/scheduler.md`),
   honoring INV-SCHED-1 / INV-ASYNC-ORDER.

@@ -2,26 +2,28 @@
 //! registry + core and reports, per fixture, whether ruse's observable state matches the pinned Emacs
 //! oracle (tools/parity/emacs_oracle.py).
 //!
-//! CONTRACT (spec/parity/upstreams.yaml): a divergence is a FINDING, not a test failure — identical to the
-//! Neovim comparator (apps/tui/tests/parity_compare.rs). ruse's Emacs profile is early and legitimately
-//! differs from Emacs on several commands (e.g. Emacs `beginning-of-buffer` PUSHES the mark and `yank` SETS
-//! it; ruse does neither yet). The value of this harness is the verified/divergent TALLY, not a green/red
-//! assertion per command. So this test hard-asserts ONLY that the harness ran (the corpus loaded, every
-//! fixture drove without panicking, every op name resolved). Whether ruse == Emacs is printed, never
-//! asserted. The oracle's own non-corruption gate (`emacs_oracle.py --selftest`) is the only hard gate.
+//! RATCHET (#883), identical to the Neovim comparator (apps/tui/tests/parity_compare.rs): a divergence is
+//! allowed only when the fixture is named in the committed `tests/parity/emacs/known-divergences.txt`. The
+//! test fails on any other divergent fixture (a regression, an unresolved op name, or an unmatched new
+//! fixture) and on a listed fixture that now verifies, so the list can only shrink. See
+//! `parity_ratchet/mod.rs`. The oracle's own non-corruption gate is `emacs_oracle.py --selftest`.
 //!
 //! HOW IT BRIDGES THE TWO EDITORS: a fixture's `ops` are Emacs command NAMES. The oracle ran them in Emacs
 //! via `call-interactively`; here the SAME names resolve through `emacs_command_by_name` — the very registry
 //! that M-x uses (F-012, #148) — into ruse `Command`s applied to the core. One fixture, one vocabulary, both
-//! editors. Point/mark are 0-based CHARACTER offsets in the corpus; the seed is ASCII so char == byte and
-//! ruse's byte offsets compare directly (see the oracle's scope note).
+//! editors. Point/mark are 0-based CHARACTER offsets in the corpus; ruse addresses bytes, so a fixture's
+//! point is converted to a byte offset going in and ruse's point/mark back to characters coming out (the
+//! case-conversion fixtures of #912 are multibyte).
 //!
 //! The corpus is `tests/parity/emacs/fixtures/corpus.yaml` — JSON-in-YAML (a subset of YAML 1.2), captured
 //! by `tools/parity/emacs_oracle.py`. Run with `-- --nocapture` to see the tally.
 
 use ruse_core::{apply_command, CaretGravity, EditorState};
+use ruse_tui::headless::Headless;
 use ruse_tui::input::emacs_command_by_name;
 use serde_json::Value;
+
+mod parity_ratchet;
 
 /// Drive ruse: home the cursor to the fixture's start, then resolve each Emacs command name through the M-x
 /// registry and apply it to the core. Mirrors the M-x execution path in `input::feed_cmdline`. Returns the
@@ -31,17 +33,29 @@ fn drive_ruse(text: &str, ops: &[String], point: usize) -> (EditorState, Vec<Str
     // The Emacs profile rests point BETWEEN characters (D-050 / RFC-0015), the same gravity the frontend
     // installs for `RUSE_PROFILE=emacs`; without it every Emacs edit would be Vim-clamped one column short.
     st.set_caret_gravity(CaretGravity::BetweenChar);
-    st.set_cursor(point); // char offset == byte offset for the ASCII seed corpus
+    st.set_cursor(ruse_core::BytePos(char_to_byte(text, point)));
     let mut unknown = Vec::new();
     for op in ops {
-        match emacs_command_by_name(op) {
-            Some(cmd) => {
-                apply_command(&mut st, &cmd);
+        match by_name(op) {
+            Some((cmd, n)) => {
+                for _ in 0..n {
+                    apply_command(&mut st, &cmd);
+                }
             }
             None => unknown.push(op.clone()),
         }
     }
     (st, unknown)
+}
+
+/// The byte offset of the `n`th character of `text` (its length past the end).
+fn char_to_byte(text: &str, n: usize) -> usize {
+    text.char_indices().nth(n).map_or(text.len(), |(b, _)| b)
+}
+
+/// The number of characters before byte offset `b` of `text`.
+fn byte_to_char(text: &str, b: usize) -> i64 {
+    text.get(..b).map_or(b, |s| s.chars().count()) as i64
 }
 
 fn ruse_text(st: &EditorState) -> Vec<String> {
@@ -133,8 +147,9 @@ fn parity_ruse_vs_emacs_oracle() {
 
         // ruse observables.
         let r_text = ruse_text(&st);
-        let r_point = st.cursor() as i64;
-        let r_mark = st.mark().map(|m| m as i64);
+        let joined = r_text.join("\n");
+        let r_point = byte_to_char(&joined, st.cursor().0);
+        let r_mark = st.mark().map(|m| byte_to_char(&joined, m.0));
         let r_kill = ruse_kill(&st);
 
         // oracle observables.
@@ -178,10 +193,7 @@ fn parity_ruse_vs_emacs_oracle() {
         divergent_names.len()
     );
     if !divergent_names.is_empty() {
-        println!(
-            "divergent (findings, not failures): {}",
-            divergent_names.join(", ")
-        );
+        println!("divergent: {}", divergent_names.join(", "));
     }
     if !all_unknown.is_empty() {
         println!(
@@ -190,10 +202,210 @@ fn parity_ruse_vs_emacs_oracle() {
         );
     }
 
-    // The ONLY hard assertion: the harness ran end to end. Divergence is data, not a failure.
-    assert_eq!(
-        verified + divergent_names.len(),
-        total,
-        "every fixture must have been compared"
+    let names: Vec<&str> = fixtures
+        .iter()
+        .map(|fx| fx["name"].as_str().expect("name"))
+        .collect();
+    parity_ratchet::enforce(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/parity/emacs/known-divergences.txt"
+        ),
+        &names,
+        &divergent_names,
     );
+}
+
+/// A corpus op (`tools/parity/emacs_oracle.py`): `[C-u [N] ]COMMAND`, with ` CHAR` after
+/// `self-insert-command` (#1156). `prefix` is the prefix argument's value (a bare `C-u` is 4).
+struct Op<'a> {
+    prefix: Option<(u32, Option<&'a str>)>,
+    name: &'a str,
+    char: Option<char>,
+}
+
+fn parse_op(op: &str) -> Op<'_> {
+    let mut rest = op;
+    let mut prefix = None;
+    if let Some(after) = rest.strip_prefix("C-u ") {
+        rest = after;
+        prefix = Some((4, None));
+        if let Some((digits, tail)) = after.split_once(' ') {
+            if let Ok(n) = digits.parse::<u32>() {
+                prefix = Some((n, Some(digits)));
+                rest = tail;
+            }
+        }
+    }
+    match rest.strip_prefix("self-insert-command ") {
+        Some(c) => Op {
+            prefix,
+            name: "self-insert-command",
+            char: c.chars().next(),
+        },
+        None => Op {
+            prefix,
+            name: rest,
+            char: None,
+        },
+    }
+}
+
+/// The by-name path's command for an op, and how many times to apply it: it has no prefix argument, so a
+/// prefix of N runs the command N times, which is what it means for the fixtured commands (self-insert and
+/// the character motions).
+fn by_name(op: &str) -> Option<(ruse_core::Command, u32)> {
+    let op = parse_op(op);
+    let cmd = match op.char {
+        Some(c) => ruse_core::Command::InsertChar(c),
+        None => emacs_command_by_name(op.name)?,
+    };
+    Some((cmd, op.prefix.map_or(1, |(n, _)| n)))
+}
+
+/// The keys of an op: the prefix argument (`C-u`, then its digits), then the command's keys, or the char a
+/// `self-insert-command` inserts.
+fn op_keys(op: &str) -> String {
+    let op = parse_op(op);
+    let mut keys = String::new();
+    if let Some((_, digits)) = op.prefix {
+        keys.push_str("<C-u>");
+        keys.push_str(digits.unwrap_or(""));
+    }
+    match op.char {
+        Some(c) => keys.push(c),
+        None => keys.push_str(&emacs_keys(op.name)),
+    }
+    keys
+}
+
+/// The keys that run an Emacs command in Emacs 31.1's default `global-map`, in the headless harness's Vim
+/// notation (`<C-f>`, `<M-f>`, …; `<M-x>` is `ESC x`, as a terminal sends it). A command with no default
+/// binding that a legacy terminal can send (`capitalize-region`; `kill-whole-line` is `C-S-<backspace>`) is
+/// typed as `M-x {name} RET`, which is still the real key path.
+fn emacs_keys(op: &str) -> String {
+    let bound = match op {
+        "back-to-indentation" => "<M-m>",
+        "backward-char" => "<C-b>",
+        "backward-kill-word" => "<M-BS>",
+        "backward-paragraph" => "<M-{>",
+        "backward-word" => "<M-b>",
+        "beginning-of-buffer" => "<M-<>",
+        "capitalize-word" => "<M-c>",
+        "delete-char" => "<C-d>",
+        "delete-horizontal-space" => "<M-\\>",
+        "delete-indentation" => "<M-^>",
+        "downcase-region" => "<C-x><C-l>",
+        "downcase-word" => "<M-l>",
+        "end-of-buffer" => "<M->>",
+        "exchange-point-and-mark" => "<C-x><C-x>",
+        "forward-char" => "<C-f>",
+        "forward-paragraph" => "<M-}>",
+        "forward-word" => "<M-f>",
+        "just-one-space" => "<M-Space>",
+        "kill-line" => "<C-k>",
+        "kill-region" => "<C-w>",
+        "kill-ring-save" => "<M-w>",
+        "kill-word" => "<M-d>",
+        "mark-word" => "<M-@>",
+        "move-beginning-of-line" => "<C-a>",
+        "move-end-of-line" => "<C-e>",
+        "newline" => "<CR>",
+        "next-line" => "<C-n>",
+        "open-line" => "<C-o>",
+        "previous-line" => "<C-p>",
+        "set-mark-command" => "<C-Space>",
+        "transpose-chars" => "<C-t>",
+        "transpose-words" => "<M-t>",
+        "upcase-region" => "<C-x><C-u>",
+        "upcase-word" => "<M-u>",
+        "yank" => "<C-y>",
+        _ => "",
+    };
+    if bound.is_empty() {
+        format!("<M-x>{op}<CR>")
+    } else {
+        bound.to_string()
+    }
+}
+
+/// Fixtures of the Emacs corpus that diverge when their commands are TYPED (#895) rather than resolved by
+/// name. The by-name comparator above skips the keymap and the session; this list is what the real key
+/// path costs today. Same ratchet: a new divergence or a stale entry fails the test.
+const KEY_PATH_DIVERGENCES: &str =
+    include_str!("../../../tests/parity/emacs/known-key-divergences.txt");
+
+/// The Emacs corpus through the REAL key path (#895, #604): each command name becomes the keys Emacs binds
+/// it to, typed into a headless Emacs-profile session, so the keymap and `Session::on_key` (the session's
+/// intercepts included) decide what runs. Observables and oracle are the by-name comparator's.
+#[test]
+fn parity_emacs_corpus_through_real_keys() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/parity/emacs/fixtures/corpus.yaml"
+    );
+    let raw = std::fs::read_to_string(path).expect("corpus");
+    let corpus: Value = serde_json::from_str(&raw).expect("corpus is JSON-in-YAML");
+    let fixtures = corpus["fixtures"].as_array().expect("fixtures array");
+
+    let mut divergent: Vec<String> = Vec::new();
+    for fx in fixtures {
+        let name = fx["name"].as_str().expect("name");
+        let ops = as_op_vec(&fx["ops"]);
+        let point = fx.get("point").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let expect = &fx["expect"];
+
+        let text = fx["text"].as_str().expect("text");
+        let mut h = Headless::emacs(text);
+        h.set_cursor(char_to_byte(text, point));
+        let keys: String = ops.iter().map(|op| op_keys(op)).collect();
+        h.keys(&keys);
+
+        let (kill, _) = h.register('"');
+        let joined = h.text();
+        let r_text: Vec<String> = joined.split('\n').map(str::to_string).collect();
+        let r_point = byte_to_char(&joined, h.cursor());
+        let r_mark = h.mark().map(|m| byte_to_char(&joined, m));
+        let r_kill = (!kill.is_empty()).then_some(kill);
+
+        let mut diffs = Vec::new();
+        if r_text != as_str_vec(&expect["text"]) {
+            diffs.push(format!(
+                "text {r_text:?} != {:?}",
+                as_str_vec(&expect["text"])
+            ));
+        }
+        if r_point != expect["point"].as_i64().expect("point") {
+            diffs.push(format!("point {r_point} != {}", expect["point"]));
+        }
+        if r_mark != opt_i64(&expect["mark"]) {
+            diffs.push(format!("mark {r_mark:?} != {:?}", opt_i64(&expect["mark"])));
+        }
+        if r_kill != opt_str(&expect["kill"]) {
+            diffs.push(format!("kill {r_kill:?} != {:?}", opt_str(&expect["kill"])));
+        }
+        if diffs.is_empty() {
+            println!("  VERIFIED  {name:<28} keys={keys:?}");
+        } else {
+            println!("  DIVERGENT {name:<28} keys={keys:?}");
+            for d in &diffs {
+                println!("              - {d}");
+            }
+            divergent.push(name.to_string());
+        }
+    }
+    println!(
+        "\n=== emacs keys: {}/{} verified ===",
+        fixtures.len() - divergent.len(),
+        fixtures.len()
+    );
+
+    let names: Vec<&str> = fixtures
+        .iter()
+        .map(|fx| fx["name"].as_str().expect("name"))
+        .collect();
+    let allowed = parity_ratchet::parse(KEY_PATH_DIVERGENCES).expect("the key-path list parses");
+    if let Err(e) = parity_ratchet::check(&allowed, &names, &divergent) {
+        panic!("emacs key-path ratchet (tests/parity/emacs/known-key-divergences.txt):\n{e}");
+    }
 }

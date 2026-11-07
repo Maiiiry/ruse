@@ -1,0 +1,7 @@
+# Fixtures in fixtures/corpus.yaml that ruse is ALLOWED to diverge on when the commands are TYPED through
+# the real key path (#895): apps/tui/tests/emacs_parity_compare.rs `parity_emacs_corpus_through_real_keys`
+# types each command's default Emacs binding into a headless Emacs-profile session. Same ratchet as
+# known-divergences.txt: a divergent fixture not listed fails, and so does a listed one that now verifies.
+#
+# Empty: every fixture verifies through the real keys. The Vim Normal-mode intercepts of the session no
+# longer run under the Emacs profile (#1156).

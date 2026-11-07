@@ -4,7 +4,7 @@
 //! the kernel design end-to-end in code — the "prove the design in code" step, not a UI.
 
 use ruse_core::{
-    pos, AnchorPolicy, Bias, Document, DocumentId, Edit, EditList, GroupHint, Revision,
+    pos, AnchorPolicy, Bias, BytePos, Document, DocumentId, Edit, EditList, GroupHint, Revision,
     Transaction, TransactionOrigin, TxnError,
 };
 
@@ -32,14 +32,14 @@ fn f001_apply_strictly_increases_revision_and_records_origin() {
     let r1 = doc
         .apply(txn(
             &doc,
-            Edit::insert(3, b"d".to_vec()),
+            Edit::insert(ruse_core::BytePos(3), b"d".to_vec()),
             TransactionOrigin::UserInput,
         ))
         .unwrap();
     let r2 = doc
         .apply(txn(
             &doc,
-            Edit::insert(4, b"e".to_vec()),
+            Edit::insert(ruse_core::BytePos(4), b"e".to_vec()),
             TransactionOrigin::Lsp,
         ))
         .unwrap();
@@ -75,14 +75,14 @@ fn f001_apply_is_atomic_stale_base_revision_is_refused() {
     let stale_base = doc.revision();
     doc.apply(txn(
         &doc,
-        Edit::insert(5, b"!".to_vec()),
+        Edit::insert(ruse_core::BytePos(5), b"!".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
 
     let stale = Transaction::new(
         stale_base,
-        EditList::new(vec![Edit::insert(0, b"X".to_vec())]).unwrap(),
+        EditList::new(vec![Edit::insert(ruse_core::BytePos(0), b"X".to_vec())]).unwrap(),
         TransactionOrigin::UserInput,
     );
     let before = doc.bytes().to_vec();
@@ -98,7 +98,11 @@ fn f001_apply_is_atomic_stale_base_revision_is_refused() {
 #[test]
 fn f001_apply_is_atomic_out_of_range_is_refused() {
     let mut doc = opened("hi");
-    let bad = txn(&doc, Edit::delete(1, 100), TransactionOrigin::UserInput);
+    let bad = txn(
+        &doc,
+        Edit::delete(ruse_core::BytePos(1), 100),
+        TransactionOrigin::UserInput,
+    );
     let err = doc.apply(bad).unwrap_err();
     assert!(matches!(err, TxnError::OutOfRange { .. }));
     assert_eq!(doc.as_str(), Some("hi"), "no partial-apply state");
@@ -116,7 +120,7 @@ fn f001_undo_restores_byte_identical_document() {
 
     doc.apply(txn(
         &doc,
-        Edit::replace(4, 5, b"slow".to_vec()),
+        Edit::replace(ruse_core::BytePos(4), 5, b"slow".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
@@ -145,11 +149,11 @@ fn f001_undo_restores_byte_identical_document() {
 fn f002_anchor_survives_edits_via_not_raw_offsets() {
     let mut doc = opened("cursor here");
     // A cursor anchored just before "here" (byte 7).
-    let cursor = doc.create_anchor(7, Bias::After, AnchorPolicy::Clamp);
+    let cursor = doc.create_anchor(BytePos(7), Bias::After, AnchorPolicy::Clamp);
     // Insert at the start; a raw offset would now point at the wrong text, an anchor tracks the edit.
     doc.apply(txn(
         &doc,
-        Edit::insert(0, b">> ".to_vec()),
+        Edit::insert(ruse_core::BytePos(0), b">> ".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
@@ -165,11 +169,11 @@ fn f002_anchor_survives_edits_via_not_raw_offsets() {
 fn f002_anchor_gravity_at_exact_edit_point() {
     // Two anchors at the same offset with opposite gravity behave differently on an insertion there.
     let mut doc = opened("ab");
-    let left = doc.create_anchor(1, Bias::Before, AnchorPolicy::Clamp);
-    let right = doc.create_anchor(1, Bias::After, AnchorPolicy::Clamp);
+    let left = doc.create_anchor(BytePos(1), Bias::Before, AnchorPolicy::Clamp);
+    let right = doc.create_anchor(BytePos(1), Bias::After, AnchorPolicy::Clamp);
     doc.apply(txn(
         &doc,
-        Edit::insert(1, b"XYZ".to_vec()),
+        Edit::insert(ruse_core::BytePos(1), b"XYZ".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
@@ -197,10 +201,10 @@ fn f002_byte_and_char_coordinates_are_distinct() {
 
     // An anchor tracks BYTES; a wide multi-byte insertion elsewhere shifts it by byte length, and the
     // char coordinate is a correct derivation, never desynced.
-    let tail = doc.create_anchor(5, Bias::After, AnchorPolicy::Clamp); // end of document
+    let tail = doc.create_anchor(BytePos(5), Bias::After, AnchorPolicy::Clamp); // end of document
     doc.apply(txn(
         &doc,
-        Edit::insert(0, "🎉".as_bytes().to_vec()),
+        Edit::insert(ruse_core::BytePos(0), "🎉".as_bytes().to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
@@ -223,7 +227,7 @@ fn f005_new_change_after_undo_branches_without_losing_history() {
     let mut doc = opened("");
     doc.apply(txn(
         &doc,
-        Edit::insert(0, b"A".to_vec()),
+        Edit::insert(ruse_core::BytePos(0), b"A".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap(); // node 1
@@ -231,7 +235,7 @@ fn f005_new_change_after_undo_branches_without_losing_history() {
         // a break keeps B a separate undo group from A, so undo lands on A (not "" — see f005 grouping)
         txn(
             &doc,
-            Edit::insert(1, b"B".to_vec()),
+            Edit::insert(ruse_core::BytePos(1), b"B".to_vec()),
             TransactionOrigin::UserInput,
         )
         .with_hint(GroupHint::BreakBefore),
@@ -245,7 +249,7 @@ fn f005_new_change_after_undo_branches_without_losing_history() {
     // A new change here BRANCHES: node 2 ("AB") is not on the current lineage but must not be lost.
     doc.apply(txn(
         &doc,
-        Edit::insert(1, b"C".to_vec()),
+        Edit::insert(ruse_core::BytePos(1), b"C".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap(); // node 3
@@ -274,7 +278,7 @@ fn f005_insert_session_is_one_undo_step() {
         let at = doc.len();
         doc.apply(txn(
             &doc,
-            Edit::insert(at, ch),
+            Edit::insert(ruse_core::BytePos(at), ch),
             TransactionOrigin::UserInput,
         ))
         .unwrap();
@@ -310,13 +314,13 @@ fn f005_a_different_origin_never_merges_into_typing() {
     let mut doc = opened("");
     doc.apply(txn(
         &doc,
-        Edit::insert(0, b"user".to_vec()),
+        Edit::insert(ruse_core::BytePos(0), b"user".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
     doc.apply(txn(
         &doc,
-        Edit::insert(4, b"-fmt".to_vec()),
+        Edit::insert(ruse_core::BytePos(4), b"-fmt".to_vec()),
         TransactionOrigin::Lsp,
     ))
     .unwrap();
@@ -342,14 +346,14 @@ fn f005_join_prev_merges_across_the_boundary() {
     let mut doc = opened("");
     doc.apply(txn(
         &doc,
-        Edit::insert(0, b"a".to_vec()),
+        Edit::insert(ruse_core::BytePos(0), b"a".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
     doc.apply(
         txn(
             &doc,
-            Edit::insert(1, b"b".to_vec()),
+            Edit::insert(ruse_core::BytePos(1), b"b".to_vec()),
             TransactionOrigin::UserInput,
         )
         .with_hint(GroupHint::BreakBefore), // would be its own group…
@@ -358,7 +362,7 @@ fn f005_join_prev_merges_across_the_boundary() {
     doc.apply(
         txn(
             &doc,
-            Edit::insert(2, b"c".to_vec()),
+            Edit::insert(ruse_core::BytePos(2), b"c".to_vec()),
             TransactionOrigin::UserInput,
         )
         .with_hint(GroupHint::JoinPrev), // …but this joins b's group
@@ -383,14 +387,14 @@ fn f005_join_prev_merges_across_the_boundary() {
 #[test]
 fn snapshot_is_immutable_under_later_edits() {
     let mut doc = opened("v1");
-    let mark = doc.create_anchor(2, Bias::After, AnchorPolicy::Clamp); // end of "v1"
+    let mark = doc.create_anchor(BytePos(2), Bias::After, AnchorPolicy::Clamp); // end of "v1"
     let snap = doc.snapshot();
     assert_eq!(snap.revision(), Revision::ZERO);
 
     // Edit the live document after taking the snapshot.
     doc.apply(txn(
         &doc,
-        Edit::insert(0, b"prefix-".to_vec()),
+        Edit::insert(ruse_core::BytePos(0), b"prefix-".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
@@ -419,7 +423,7 @@ fn snapshot_is_immutable_under_later_edits() {
 #[test]
 fn golden_scenario_transcript() {
     let mut doc = opened("hello");
-    let cursor = doc.create_anchor(5, Bias::After, AnchorPolicy::Clamp);
+    let cursor = doc.create_anchor(BytePos(5), Bias::After, AnchorPolicy::Clamp);
     let mut log = String::new();
     let step = |doc: &Document, label: &str, log: &mut String| {
         log.push_str(&format!(
@@ -434,7 +438,7 @@ fn golden_scenario_transcript() {
     step(&doc, "open", &mut log);
     doc.apply(txn(
         &doc,
-        Edit::insert(5, b", world".to_vec()),
+        Edit::insert(ruse_core::BytePos(5), b", world".to_vec()),
         TransactionOrigin::UserInput,
     ))
     .unwrap();
@@ -444,7 +448,7 @@ fn golden_scenario_transcript() {
     doc.apply(
         txn(
             &doc,
-            Edit::replace(0, 5, b"HELLO".to_vec()),
+            Edit::replace(ruse_core::BytePos(0), 5, b"HELLO".to_vec()),
             TransactionOrigin::UserInput,
         )
         .with_hint(GroupHint::BreakBefore),

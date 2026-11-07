@@ -7,6 +7,8 @@
 //! (wcwidth via `unicode-width`, tab-aware). The four are distinct types and never interchanged as bare
 //! `usize`, per F-002 ("distinct types, not interchanged").
 
+use crate::cells::Tabs;
+
 /// A strictly-monotonic per-Document version stamp (**INV-TXN**, RFC-0007 §2).
 ///
 /// Opaque and comparable; it is **not** a wall clock and **not** a tree position. *Every* apply —
@@ -96,20 +98,20 @@ pub fn grapheme_to_byte(text: &str, g: GraphemePos) -> BytePos {
 
 /// The **display cell column** just before byte position `b` (F-002): the summed terminal width of
 /// `text[..b]`, where a wide/CJK glyph is 2 cells, a zero-width combining mark 0, and a tab advances
-/// to the next `tab_width` stop. This is the coordinate the renderer places the cursor at — distinct
+/// to its next stop (`'tabstop'`/`'vartabstop'`). This is the coordinate the renderer places the cursor at — distinct
 /// from the grapheme count (`宽` is one grapheme but two cells).
 #[must_use]
-pub fn byte_to_cell(text: &str, b: BytePos, tab_width: usize) -> CellCol {
+pub fn byte_to_cell(text: &str, b: BytePos, tab_width: impl Into<Tabs>) -> CellCol {
+    let tab_width: Tabs = tab_width.into();
     use unicode_width::UnicodeWidthChar;
     debug_assert!(
         b.0 <= text.len() && text.is_char_boundary(b.0),
         "byte pos not on a char boundary"
     );
-    let tab = tab_width.max(1);
     let mut col = 0usize;
     for ch in text[..b.0].chars() {
         col += match ch {
-            '\t' => tab - (col % tab),
+            '\t' => tab_width.padding(col),
             c => c.width().unwrap_or(0),
         };
     }
@@ -121,50 +123,100 @@ pub fn byte_to_cell(text: &str, b: BytePos, tab_width: usize) -> CellCol {
 // breaks are `\n`, columns are the caller's business — byte vs char vs cell) so both the core and the
 // frontend share ONE implementation instead of each re-scanning for newlines.
 
-/// The 0-based row of `byte` — the number of `\n` before it.
+/// The number of `\n` in `bytes` — the one home for the newline count the core and frontend share.
+/// Written as a WRAPPING fold rather than `filter(..).count()`: under `overflow-checks` (#899 measured
+/// release with them on) `count()`'s checked running sum blocks vectorisation and made
+/// `line_math/line_of_end` ~2.7x slower. The total is bounded by `bytes.len()`, so the wrapping add can
+/// never actually wrap — the same count in every profile, minus the impossible-overflow branch.
 #[must_use]
-pub fn line_of(bytes: &[u8], byte: usize) -> usize {
-    bytes[..byte.min(bytes.len())]
+pub fn count_newlines(bytes: &[u8]) -> usize {
+    bytes
         .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
+        .fold(0usize, |n, &b| n.wrapping_add(usize::from(b == b'\n')))
 }
 
-/// The byte offset where the line CONTAINING `byte` starts (just after the previous `\n`, or 0).
+/// The 0-based row of `at` — the number of `\n` before it.
 #[must_use]
-pub fn line_start(bytes: &[u8], byte: usize) -> usize {
-    bytes[..byte.min(bytes.len())]
-        .iter()
-        .rposition(|&c| c == b'\n')
-        .map_or(0, |i| i + 1)
+pub fn line_of(bytes: &[u8], at: BytePos) -> usize {
+    raw::line_of(bytes, at.0)
 }
 
-/// The byte offset where the line CONTAINING `byte` ends (at the next `\n`, or the buffer end).
+/// Where the line CONTAINING `at` starts (just after the previous `\n`, or 0).
 #[must_use]
-pub fn line_end(bytes: &[u8], byte: usize) -> usize {
-    let p = byte.min(bytes.len());
-    bytes[p..]
-        .iter()
-        .position(|&c| c == b'\n')
-        .map_or(bytes.len(), |i| p + i)
+pub fn line_start(bytes: &[u8], at: BytePos) -> BytePos {
+    BytePos(raw::line_start(bytes, at.0))
 }
 
-/// The byte offset where the 0-based `line`-th line starts (clamped to `bytes.len()`).
+/// Where the line CONTAINING `at` ends (at the next `\n`, or the buffer end).
 #[must_use]
-pub fn nth_line_start(bytes: &[u8], line: usize) -> usize {
-    if line == 0 {
-        return 0;
+pub fn line_end(bytes: &[u8], at: BytePos) -> BytePos {
+    BytePos(raw::line_end(bytes, at.0))
+}
+
+/// Where the 0-based `line`-th line starts (clamped to `bytes.len()`).
+#[must_use]
+pub fn nth_line_start(bytes: &[u8], line: usize) -> BytePos {
+    BytePos(raw::nth_line_start(bytes, line))
+}
+
+/// The line math over bare byte offsets, for the core's own single-unit arithmetic (motions, operators,
+/// the undo cursor, the anchor sweep). It is inside the crate boundary, so it stays untyped (RFC-0022
+/// rule 1); the `pub` functions above are the typed face a frontend calls.
+pub(crate) mod raw {
+    use super::count_newlines;
+
+    /// The 0-based row of `byte` — the number of `\n` before it.
+    #[must_use]
+    pub(crate) fn line_of(bytes: &[u8], byte: usize) -> usize {
+        count_newlines(&bytes[..byte.min(bytes.len())])
     }
-    let mut seen = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            seen += 1;
-            if seen == line {
-                return i + 1;
+
+    /// The byte offset where the line CONTAINING `byte` starts (just after the previous `\n`, or 0).
+    #[must_use]
+    pub(crate) fn line_start(bytes: &[u8], byte: usize) -> usize {
+        bytes[..byte.min(bytes.len())]
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .map_or(0, |i| i + 1)
+    }
+
+    /// The byte offset where the line CONTAINING `byte` ends (at the next `\n`, or the buffer end).
+    #[must_use]
+    pub(crate) fn line_end(bytes: &[u8], byte: usize) -> usize {
+        let p = byte.min(bytes.len());
+        bytes[p..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(bytes.len(), |i| p + i)
+    }
+
+    /// The byte offset where the 0-based `line`-th line starts (clamped to `bytes.len()`).
+    #[must_use]
+    pub(crate) fn nth_line_start(bytes: &[u8], line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        // Whole chunks are skipped by the vectorised [`count_newlines`]; only the chunk holding the
+        // `line`-th newline is walked byte by byte (#1257: an Ex line command looks lines up per call).
+        const CHUNK: usize = 512;
+        let mut seen = 0;
+        for (k, chunk) in bytes.chunks(CHUNK).enumerate() {
+            let n = count_newlines(chunk);
+            if seen + n < line {
+                seen += n;
+                continue;
+            }
+            for (i, &b) in chunk.iter().enumerate() {
+                if b == b'\n' {
+                    seen += 1;
+                    if seen == line {
+                        return k * CHUNK + i + 1;
+                    }
+                }
             }
         }
+        bytes.len()
     }
-    bytes.len()
 }
 
 #[cfg(test)]

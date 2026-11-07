@@ -1,7 +1,7 @@
 //! The Transaction — the only sanctioned way to mutate an editable Document (INV-TXN).
 
 use crate::edit::EditList;
-use crate::pos::Revision;
+use crate::pos::{BytePos, Revision};
 
 /// Who caused a mutation (**INV-ORIGIN**). Every transaction records exactly one; undo grouping and
 /// post-hoc audit ("what did the AI change") key off it.
@@ -36,6 +36,9 @@ pub struct Transaction {
     pub origin: TransactionOrigin,
     /// How this change groups with the previous one for undo (persistence §6).
     pub group_hint: GroupHint,
+    /// Where the cursor stood when the change began (Vim's `uh_cursor`), in the text before it — where
+    /// `u`/`C-r` put the cursor back. `None` takes the start of the first edited line.
+    pub cursor: Option<BytePos>,
 }
 
 impl Transaction {
@@ -47,7 +50,15 @@ impl Transaction {
             edits,
             origin,
             group_hint: GroupHint::Continue,
+            cursor: None,
         }
+    }
+
+    /// Record where the cursor stood when this change began (see [`Transaction::cursor`]).
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: BytePos) -> Transaction {
+        self.cursor = Some(cursor);
+        self
     }
 
     /// Set an explicit grouping hint (`BreakBefore` / `JoinPrev`).

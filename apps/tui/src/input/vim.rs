@@ -3,7 +3,7 @@
 //! self-contained grammar DATA — the engine methods that consult it (`feed`, the operator/motion dispatch)
 //! stay in the engine core, keeping the Feed/Command/Mode coupling there (a deliberate PARTIAL split).
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use ruse_core::keymap::{Layer, LayerStack, UnmatchedKey};
 use ruse_core::{Command, Motion};
 
@@ -21,7 +21,9 @@ pub(crate) fn motion_key(code: KeyCode) -> Option<Motion> {
         KeyCode::Char('W') => Motion::BigWordFwd,
         KeyCode::Char('B') => Motion::BigWordBack,
         KeyCode::Char('E') => Motion::BigWordEnd,
-        KeyCode::Char('$') => Motion::LineEnd,
+        KeyCode::Char('$') | KeyCode::End => Motion::LineEnd,
+        // `<Home>` is `0` (never a count digit, so it can live here).
+        KeyCode::Home => Motion::LineStart,
         KeyCode::Char('^') => Motion::LineFirstNonBlank,
         // `+` / `<CR>` — count lines down to the first non-blank; `-` — count lines up; `_` — count-1 down
         // (`_` alone == `^`). All linewise under an operator (`d+`, `d-`, `d_`==`dd`).
@@ -68,6 +70,52 @@ pub(crate) fn text_object(ch: char, inner: bool) -> Option<Motion> {
         't' => Motion::Tag { around },
         _ => return None,
     })
+}
+
+/// Whether `key` can CONTINUE an armed operator `op` in the base Normal tier (Vim's `checkclearop` list,
+/// inverted) for a NON-chord key: a count digit, a motion or motion initiator, a forced-wise `v`/`V`, a text-object
+/// start, a search, or the key that doubles `op` into its linewise form. Anything else aborts the whole
+/// construct (#790) — verified against nvim 0.12.6 typed key by key (`ydw`, `yx`, `yD`, `dJ`, `y~`, `drx`,
+/// `dp`, `yu`, `d"a`, `dma`, `gUd`, `dgU` all abort and consume only the offending key).
+pub(super) fn continues_op(op: super::Op, key: KeyEvent) -> bool {
+    use super::Op;
+    // Chords (`d<C-v>`, `d<C-j>`, `d<C-k>`) are decided by the engine's chord table, never here.
+    debug_assert!(!super::is_chord(key), "chords are resolved by feed_chord");
+    // `<Space>` / `<BS>` are the wrapping `l` / `h` (`Motion::WrapRight` / `WrapLeft`).
+    if motion_key(key.code).is_some() || key.code == KeyCode::Backspace {
+        return true;
+    }
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    let doubles = match op {
+        Op::Delete => 'd',
+        Op::Change => 'c',
+        Op::Yank => 'y',
+        Op::ShiftRight => '>',
+        Op::ShiftLeft => '<',
+        Op::Reindent => '=',
+        Op::Filter => '!',
+        Op::CaseLower => 'u',
+        Op::CaseUpper => 'U',
+        Op::CaseToggle => '~',
+        Op::Rot13 => '?',
+        // `gqgq` / `gwgw` double through the `g` tier (`g` is a motion prefix below).
+        Op::Format => 'q',
+        Op::FormatKeep => 'w',
+        // `gcc` is the line form (`gcgc` is the comment text object in nvim, not modelled).
+        Op::Comment => 'c',
+    };
+    c == doubles
+        || c.is_ascii_digit()
+        || matches!(
+            c,
+            // char search and its repeats, the `g` / bracket / mark motion prefixes, line jumps
+            ' ' | 'f' | 'F' | 't' | 'T' | ';' | ',' | 'g' | 'G' | '%' | ']' | '[' | '`' | '\''
+            // forced wise, text objects, searches (`:` keeps opening the command line, as before), and
+            // the keyword searches `*`/`#` (`d*`, #1071)
+            | 'v' | 'V' | 'i' | 'a' | '/' | '?' | 'n' | 'N' | ':' | '*' | '#'
+        )
 }
 
 /// The Vim keymap namespaces this engine currently implements, as LAYERS of the D-045 stack.
@@ -221,8 +269,8 @@ impl VimProfile {
     }
 
     /// Every namespace the profile declares, for the addressability / depth-1-sealed assertions
-    /// (VS-OBL-4 / KL-OBL-3) and the palette's binding reverse-lookup (F-004 #2). The eight Vim
-    /// map-mode namespaces.
+    /// (VS-OBL-4 / KL-OBL-3). The eight Vim map-mode namespaces.
+    #[cfg(test)]
     pub(crate) fn all() -> [Ns; 8] {
         [
             Ns::Normal,

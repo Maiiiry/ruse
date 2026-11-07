@@ -21,6 +21,33 @@ pub enum SearchOp {
     Change,
     /// `y/pat`: yank `[cursor, match)`.
     Yank,
+    /// `gu/pat` / `gU/pat` / `g~/pat` / `g?/pat` (and `gUn`, `gUgn`): recase the span.
+    Case(WordCase),
+    /// `>/pat` (`left: false`) / `</pat` (`left: true`): shift every line the span touches.
+    Shift { left: bool },
+    /// `=/pat`: reindent every line the span touches.
+    Reindent,
+    /// `gq/pat` (`keep: false`) / `gw/pat` (`keep: true`): reflow every line the span touches.
+    Format { keep: bool },
+    /// `gc/pat`: comment or uncomment every line the span touches.
+    Comment,
+}
+
+impl SearchOp {
+    /// The span operator this search folds into, for every form beyond the bare move and the d/c/y trio
+    /// (which keep their own search-specific planning). Shared with [`MarkOp`] so a search, a `gn` match
+    /// and a mark all apply case / shift / reindent / format through ONE planner (#800).
+    #[must_use]
+    pub fn span_op(self) -> Option<MarkOp> {
+        match self {
+            SearchOp::Move | SearchOp::Delete | SearchOp::Change | SearchOp::Yank => None,
+            SearchOp::Case(c) => Some(MarkOp::Case(c)),
+            SearchOp::Shift { left } => Some(MarkOp::Shift { left }),
+            SearchOp::Reindent => Some(MarkOp::Reindent),
+            SearchOp::Format { keep } => Some(MarkOp::Format { keep }),
+            SearchOp::Comment => Some(MarkOp::Comment),
+        }
+    }
 }
 
 /// A Vim search offset — the `{offset}` after the closing `/` (forward) or `?` (backward) of a search
@@ -167,6 +194,41 @@ pub enum MarkOp {
     },
     /// `` =`a `` — reindent the spanned lines to their bracket-depth level.
     Reindent,
+    /// `` gq`a `` (`keep: false`) / `` gw`a `` (`keep: true`) — reflow the spanned lines to `'textwidth'`.
+    Format {
+        keep: bool,
+    },
+    /// `` gc`a `` — comment or uncomment the spanned lines with `'commentstring'`.
+    Comment,
+}
+
+/// A Visual operator beyond `d`/`c`/`y`/`p`/`r`/case ([`Command::VisualOp`]). Each acts on the live
+/// selection: most treat it as WHOLE LINES whatever its shape (`:help v_D`, `v_>`, `v_J`, `v_=`, `v_gq`).
+/// Ground truth is nvim v0.12.6 (the `v_*`/`vb_*` oracle fixtures).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VisualOp {
+    /// `D`/`X` (delete), `Y` (yank), `C`/`S`/`R` (change): the operator over every selected line, as a
+    /// linewise span. Blockwise `S`/`R` are linewise too; blockwise `X`/`Y` are plain block `d`/`y`.
+    Lines(OpKind),
+    /// Blockwise `D`/`C`: the block from its left column to the END of every row (`:help v_b_D`).
+    BlockToEol(OpKind),
+    /// `>`/`<`: shift every selected line `count` indent levels (`left` for `<`).
+    Shift { left: bool, count: u32 },
+    /// `J` (`spaces`) / `gJ`: join the selected lines; a one-line selection joins it with the next.
+    Join { spaces: bool },
+    /// `=`: reindent the selected lines.
+    Reindent,
+    /// `gq`: reflow the selected lines.
+    Format,
+    /// `gc`: comment or uncomment the selected lines with `'commentstring'` (#618).
+    Comment,
+    /// Blockwise `O`: move to the other corner on the SAME row (the anchor takes the cursor's column).
+    OtherCorner,
+    /// `zy`: yank the selection like `y`, but without a block's trailing white space (`:help zy`).
+    YankTrim,
+    /// `:`/`!` (`:help v_:`): leave the selection with the cursor at its start, as Vim's colon operator
+    /// does before it opens the command line on `'<,'>`.
+    LeaveAtStart,
 }
 
 /// A motion's forced wise-ness (Vim `o_v` / `o_V` / `o_CTRL-V`): the operator applies the motion but
@@ -280,6 +342,21 @@ pub enum Command {
     /// recorder does not capture the expression string, so `.` does not replay the insert (a documented
     /// divergence).
     InsertEval(String),
+    /// A bracketed paste in Insert (`:help paste`, #600): splice `text` at the caret LITERALLY, staying in
+    /// the current mode with the caret after it. One edit however large the text, and none of the
+    /// insert-time rewrites a typed key gets (no autoindent, no abbreviation, no auto-pair): the frontend
+    /// never rewrites this command. Recorded in the insert session, so `.` replays the pasted text. Line
+    /// endings are already normalised to `\n` by the frontend. Over a charwise or linewise Visual/Select
+    /// selection it REPLACES the selection, as [`Command::ReplaceSelection`] does, and enters Insert.
+    InsertPaste(String),
+    /// A bracketed paste in Replace mode (`R`): overwrite as many characters of the current line as the
+    /// text holds (newlines excluded), then splice the text, as nvim's `vim.paste` does. The caret lands
+    /// after the text. A replace-mode `<BS>` does not restore what the paste overwrote.
+    ReplacePaste(String),
+    /// A bracketed paste under the Emacs profile (Emacs 31.1 `xterm-paste` with the default
+    /// `xterm-store-paste-on-kill-ring`): put `text` on the kill ring, then yank it — insert at point,
+    /// point after the text, mark at its start.
+    EmacsPaste(String),
     /// `i_CTRL-W` — delete the word before the caret, staying in Insert (Vim). Deletes `[word-back, caret)`
     /// on the current line (does not cross the line start). A no-op at column 0.
     InsertDeleteWordBack,
@@ -303,6 +380,23 @@ pub enum Command {
     InsertIndent,
     /// `i_CTRL-D` — dedent the current line by one shiftwidth (see [`Command::InsertIndent`]).
     InsertDedent,
+    /// `i_0_CTRL-D` / `i_^_CTRL-D` — delete ALL indent of the current line, staying in Insert; the caret rides
+    /// with the text. (The typed `0`/`^` is removed by a `DeleteBack` the input engine emits first.)
+    InsertDeleteIndent,
+    /// `i_^_CTRL-D` — [`Command::InsertDeleteIndent`], and the next Insert `<CR>` under `'autoindent'`
+    /// gives the new line the deleted indent back (nvim's `old_indent`, #617).
+    InsertDeleteIndentRestore,
+    /// `i_CTRL-G_j` / `i_CTRL-G_k` — move the caret one line down / up to the column where inserting
+    /// started (Vim's `Insstart`: the insert entry, or where typing resumed after a caret jump). A no-op on
+    /// the last / first line.
+    InsertStartColumnLine {
+        down: bool,
+    },
+    /// `i_CTRL-G_U` then `<Left>`/`<Right>` — move the caret one char within the line WITHOUT breaking the
+    /// undo sequence (and, in the input engine, without ending the `.` record).
+    InsertCaretStep {
+        right: bool,
+    },
     /// `<Tab>` in Insert mode: insert whitespace at the caret to reach the next tabstop. With `expandtab`
     /// (space style) this is `tab_width - (vcol % tab_width)` spaces; otherwise a single `\t`. Distinct from
     /// `InsertIndent` (`i_CTRL-T`), which shifts the whole line from its start regardless of caret column.
@@ -422,6 +516,9 @@ pub enum Command {
     /// line (no buffer mutation). Frontend-resolved (the engine has no buffer): the frontend reads the
     /// focused buffer's bytes + cursor and formats via [`crate::info::ascii_info`].
     AsciiInfo,
+    /// `g8` — print the UTF-8 bytes of the character under the cursor in hex, composing characters after a
+    /// `+` ([`crate::info::utf8_info`]). Frontend-resolved like [`Command::AsciiInfo`].
+    Utf8Info,
     /// `CTRL-G` (Normal) — print file info (name, modified flag, line count, cursor percentage) to the
     /// status line. Frontend-resolved via [`crate::info::file_info`]; no buffer mutation.
     FileInfo,
@@ -470,6 +567,13 @@ pub enum Command {
         count: u32,
         motion: Motion,
     },
+    /// `gc` {motion} (and `gcc`, `motion: Line`) — comment the motion's LINES out with `'commentstring'`,
+    /// or uncomment them when every non-blank one already is (nvim's `vim._comment`, #618). An empty
+    /// `'commentstring'` does nothing.
+    Comment {
+        count: u32,
+        motion: Motion,
+    },
     /// `gq` / `gw` {motion} — reflow the motion's LINES to `'textwidth'` (or 79 when tw=0): each blank-line-
     /// separated paragraph is re-wrapped, preserving its first line's indent. `gw` (`keep_cursor`) restores
     /// the cursor to where it started; `gq` leaves it on the last reformatted line. Operator-over-motion.
@@ -487,6 +591,20 @@ pub enum Command {
         last_line: usize,
         levels: Vec<usize>,
     },
+    /// Set the indent of each line in `[first_line, last_line]` to `cols[i]` columns, or keep it for
+    /// `None` (an indent expression's `-1`); blank lines stay empty. The frontend emits it for an indenter
+    /// that answers in columns (Python's `python#GetIndent`: a continuation line aligns with its open
+    /// bracket, #1205): for `=` in Normal mode, as `SetIndents` does, and in Insert mode for the line under
+    /// the caret, re-indented by a typed key ('indentkeys', #1206), which keeps the caret on its text.
+    SetIndentCols {
+        first_line: usize,
+        last_line: usize,
+        cols: Vec<Option<usize>>,
+    },
+    /// `i_CTRL-F` (`!^F` in 'indentkeys'): re-indent the line under the caret. The frontend resolves it
+    /// to a [`Command::SetIndentCols`] (or [`Command::SetIndents`]) from the buffer's indenter; without one
+    /// it does nothing, as in nvim without an indent expression.
+    InsertReindent,
     // editing grammar: count + motion / operator (Phase D)
     Move(u32, Motion),
     Delete(u32, Motion),
@@ -513,14 +631,22 @@ pub enum Command {
     },
     /// Visual `p` / `P` — replace the current selection with the register's contents. `swap` (Vim `p`) puts
     /// the deleted selection into the unnamed register; `P` (`swap: false`) preserves the register so it can
-    /// be pasted over successive selections. A no-op outside a selection.
+    /// be pasted over successive selections. `count` puts the register that many times (`v2p`, #1093). A
+    /// no-op outside a selection.
     PasteSelection {
         swap: bool,
+        count: u32,
     },
     /// `]p` / `[p` (and `]P`/`[P`) — paste like `p`/`P` but ADJUST the indent of a linewise register to the
     /// current line: the first pasted line takes the current line's indent, the rest shift by the same
     /// column delta (Vim `:help ]p`). A charwise/blockwise register pastes unchanged (Vim `]p` = `p` there).
     PasteIndent {
+        after: bool,
+        count: u32,
+    },
+    /// `zp` / `zP` — paste like `p`/`P`, but a blockwise register's short rows get no trailing spaces
+    /// (Vim `:help zp`). Any other register pastes exactly as `p`/`P` does.
+    PasteBlockInner {
         after: bool,
         count: u32,
     },
@@ -561,6 +687,9 @@ pub enum Command {
     /// Select's `open/replace-selection` policy: a printable key deletes the selection, inserts the char,
     /// and enters Insert. The one behaviour that distinguishes Select from Visual over identical state.
     ReplaceSelection(char),
+    /// A line-oriented (or block-to-end-of-line) Visual operator over the live selection: `D`/`X`/`Y`/
+    /// `C`/`S`/`R`, `>`/`<`, `J`/`gJ`, `=`, `gq`, and block `O`. See [`VisualOp`].
+    VisualOp(VisualOp),
     /// Blockwise Visual `I`/`A`/`c`: enter Insert on the block's top row, arming a replicate session — on
     /// `<Esc>` the text typed on the top row is inserted at the same column on every other row of the block.
     BlockInsert(BlockInsertKind),
@@ -568,22 +697,27 @@ pub enum Command {
     SearchNext(String),
     SearchPrev(String),
     /// `*`/`#` (and `g*`/`g#`) — search for the keyword under the cursor, forward (`*`) or backward (`#`).
-    /// `whole_word` (`*`/`#`) wraps the pattern in `\<…\>`; `g*`/`g#` match anywhere. The frontend resolves
-    /// the word from the buffer (the input engine has no buffer) and rewrites this to a [`Command::SearchNext`]
-    /// / [`Command::SearchPrev`] with the concrete pattern, so traces record the deterministic search.
+    /// `whole_word` (`*`/`#`) wraps the pattern in `\<…\>`; `g*`/`g#` match anywhere. The planner resolves
+    /// the keyword under (or after, on the line) the cursor and searches from the keyword's START, as Vim
+    /// does (`#` mid-word skips the word itself). Like `/pat` it is a motion: `count` steps that many
+    /// matches and `op` operates over the exclusive span from the cursor (`d*`, `c#`, `gUg*` — #1071). The
+    /// frontend reads the same pattern ([`crate::Workspace::word_search_pattern`]) to record it as the last
+    /// search and for hlsearch.
     SearchWordUnder {
         forward: bool,
         whole_word: bool,
+        op: SearchOp,
+        count: u32,
     },
     /// `g&` — repeat the last `:s` over the WHOLE FILE with its flags (Vim). The core has no substitute
     /// history, so the FRONTEND resolves this against its last-substitute state (like [`SearchWordUnder`]);
     /// the planner treats it as a no-op.
     RepeatSubstituteGlobal,
-    /// `&` — repeat the last `:s` on the CURRENT LINE, WITHOUT its flags (Vim: `&` == `:s` with no flags,
-    /// so `g`/`i`/`I` are dropped and only the first match on the cursor's line is replaced). Contrast with
-    /// [`RepeatSubstituteGlobal`] (`g&`), which keeps the flags and runs over the whole file. Like `g&`, the
-    /// core has no substitute history, so the FRONTEND resolves this against its last-substitute state; the
-    /// planner treats it as a no-op.
+    /// `&` — repeat the last `:s` on the CURRENT LINE, KEEPING its flags: nvim's default mapping is
+    /// `nnoremap & :&&<CR>` (`:help &-default`), unlike Vim's flag-dropping `&`. Contrast with
+    /// [`RepeatSubstituteGlobal`] (`g&`), which runs over the whole file. Like `g&`, the core has no
+    /// substitute history, so the FRONTEND resolves this against its last-substitute state (the typed key
+    /// with its count, this command without one); the planner treats it as a no-op.
     RepeatSubstituteLine,
     /// `gd` / `gD` — go to the (local / global) declaration of the keyword under the cursor using Vim's pure
     /// TEXT heuristic (NOT LSP; ruse has a separate LSP goto). The frontend reads the word from the buffer
@@ -607,8 +741,8 @@ pub enum Command {
     /// list forms). Purely a display command (no buffer mutation): the input engine has no buffer, so the
     /// FRONTEND resolves the keyword and scans the lines (like [`SearchWordUnder`]/[`GotoDeclaration`])
     /// and never plans it. The `#include`-following forms (`:checkpath`, searching included files) are
-    /// OUT (cross-file); ruse has no `iskeyword`, so word boundaries follow the Word class (alnum/`_`/
-    /// non-ASCII) — a documented divergence. Formats verified against nvim v0.12.4.
+    /// OUT (cross-file); ruse has no `iskeyword`, so word boundaries follow Vim's character classes with
+    /// the default `iskeyword` (`crate::charclass`, #745). Formats verified against nvim v0.12.4.
     ShowKeywordLines {
         above: bool,
         list: bool,
@@ -651,6 +785,8 @@ pub enum Command {
     UndoOlder,
     /// `g+` — step to the chronologically newer text state, across branches.
     UndoNewer,
+    /// `U` — undo all the latest changes on the last changed line; itself undoable, and a second `U` redoes.
+    LineUndo,
     Save,
     Quit,
     // Emacs region (D-027 depth-1: a single per-buffer mark, the degenerate one-caret `Ring<Selection>`).
@@ -742,6 +878,10 @@ pub enum Command {
     /// rests at the join. Distinct from Vim `J` (which joins the NEXT line onto the current one) — D-051.
     /// No kill-ring write.
     EmacsDeleteIndentation,
+    /// A resolved Ex edit, or the frontend state one depends on (RFC-0020, D-061): `:s`, `:g`, `:d`, `:m`,
+    /// `:sort`, `:r` with its bytes, `:normal`'s group, … with every line number and pattern already
+    /// resolved, so a trace replays it without an Ex parser, cursor context or IO.
+    Ex(crate::editor::ExCmd),
 }
 
 /// Which case operation [`Command::EmacsCaseWord`] applies over the word span.
@@ -763,6 +903,10 @@ fn motion_token(m: Motion) -> String {
     let s = match m {
         Motion::Left => "left",
         Motion::Right => "right",
+        Motion::WrapLeft => "wrap_left",
+        Motion::WrapRight => "wrap_right",
+        Motion::EmacsCharBack => "emacs_char_back",
+        Motion::EmacsCharFwd => "emacs_char_fwd",
         Motion::Up => "up",
         Motion::Down => "down",
         Motion::LineStart => "line_start",
@@ -815,9 +959,19 @@ fn motion_token(m: Motion) -> String {
         Motion::MethodEndFwd => "method_end_fwd",
         Motion::MethodEndBack => "method_end_back",
         // A single whitespace-free token so the `<count> <motion>` split still works: the char is its decimal
-        // scalar value; `f`/`t` and forward/back are flags. e.g. `find_char:120:1:0` = `fx`.
-        Motion::FindChar { ch, forward, till } => {
-            return format!("find_char:{}:{}:{}", ch as u32, forward as u8, till as u8)
+        // scalar value; `f`/`t` and forward/back are flags. e.g. `find_char:120:1:0` = `fx`. A `;`/`,` repeat
+        // appends `:r` (`find_char:120:1:1:r` = `;` after `tx`), so the older three-field form still parses.
+        Motion::FindChar {
+            ch,
+            forward,
+            till,
+            repeat,
+        } => {
+            let r = if repeat { ":r" } else { "" };
+            return format!(
+                "find_char:{}:{}:{}{r}",
+                ch as u32, forward as u8, till as u8
+            );
         }
         // Delimiter/quote text objects carry their char(s) + around flag as a single whitespace-free token,
         // mirroring `find_char` so the `<count> <motion>` split still holds.
@@ -838,10 +992,20 @@ fn motion_from_token(s: &str) -> Option<Motion> {
         let ch = char::from_u32(it.next()?.parse().ok()?)?;
         let forward = it.next()? == "1";
         let till = it.next()? == "1";
+        let repeat = match it.next() {
+            None => false,
+            Some("r") => true,
+            Some(_) => return None, // trailing garbage
+        };
         if it.next().is_some() {
             return None; // trailing garbage
         }
-        return Some(Motion::FindChar { ch, forward, till });
+        return Some(Motion::FindChar {
+            ch,
+            forward,
+            till,
+            repeat,
+        });
     }
     if let Some(rest) = s.strip_prefix("pair:") {
         let mut it = rest.split(':');
@@ -874,6 +1038,10 @@ fn motion_from_token(s: &str) -> Option<Motion> {
     Some(match s {
         "left" => Motion::Left,
         "right" => Motion::Right,
+        "wrap_left" => Motion::WrapLeft,
+        "wrap_right" => Motion::WrapRight,
+        "emacs_char_back" => Motion::EmacsCharBack,
+        "emacs_char_fwd" => Motion::EmacsCharFwd,
         "up" => Motion::Up,
         "down" => Motion::Down,
         "line_start" => Motion::LineStart,
@@ -958,6 +1126,9 @@ fn mark_op_token(op: MarkOp) -> String {
         MarkOp::Shift { left: true } => "shift_left".into(),
         MarkOp::Shift { left: false } => "shift_right".into(),
         MarkOp::Reindent => "reindent".into(),
+        MarkOp::Format { keep: false } => "format".into(),
+        MarkOp::Format { keep: true } => "format_keep".into(),
+        MarkOp::Comment => "comment".into(),
     }
 }
 
@@ -979,8 +1150,59 @@ fn mark_op_from_token(s: &str) -> Option<MarkOp> {
         "shift_left" => MarkOp::Shift { left: true },
         "shift_right" => MarkOp::Shift { left: false },
         "reindent" => MarkOp::Reindent,
+        "format" => MarkOp::Format { keep: false },
+        "format_keep" => MarkOp::Format { keep: true },
+        "comment" => MarkOp::Comment,
         _ => return None,
     })
+}
+
+/// The trace-codec argument of a [`Command::VisualOp`] line (`visual_op <arg>`).
+fn visual_op_token(op: VisualOp) -> String {
+    match op {
+        VisualOp::Lines(k) => format!("lines {}", op_kind_token(k)),
+        VisualOp::BlockToEol(k) => format!("block_eol {}", op_kind_token(k)),
+        VisualOp::Shift { left, count } => {
+            format!("shift {} {count}", if left { "left" } else { "right" })
+        }
+        VisualOp::Join { spaces: true } => "join".into(),
+        VisualOp::Join { spaces: false } => "join_raw".into(),
+        VisualOp::Reindent => "reindent".into(),
+        VisualOp::Format => "format".into(),
+        VisualOp::Comment => "comment".into(),
+        VisualOp::OtherCorner => "other_corner".into(),
+        VisualOp::YankTrim => "yank_trim".into(),
+        VisualOp::LeaveAtStart => "leave_at_start".into(),
+    }
+}
+
+fn visual_op_from_token(s: &str) -> Option<VisualOp> {
+    let mut it = s.split_whitespace();
+    let op = match it.next()? {
+        "lines" => VisualOp::Lines(op_kind_from_token(it.next()?)?),
+        "block_eol" => VisualOp::BlockToEol(op_kind_from_token(it.next()?)?),
+        "shift" => {
+            let left = match it.next()? {
+                "left" => true,
+                "right" => false,
+                _ => return None,
+            };
+            VisualOp::Shift {
+                left,
+                count: it.next()?.parse().ok()?,
+            }
+        }
+        "join" => VisualOp::Join { spaces: true },
+        "join_raw" => VisualOp::Join { spaces: false },
+        "reindent" => VisualOp::Reindent,
+        "format" => VisualOp::Format,
+        "comment" => VisualOp::Comment,
+        "other_corner" => VisualOp::OtherCorner,
+        "yank_trim" => VisualOp::YankTrim,
+        "leave_at_start" => VisualOp::LeaveAtStart,
+        _ => return None,
+    };
+    it.next().is_none().then_some(op)
 }
 
 fn forced_wise_token(w: ForcedWise) -> &'static str {
@@ -1000,22 +1222,31 @@ fn forced_wise_from_token(s: &str) -> Option<ForcedWise> {
     })
 }
 
-fn search_op_token(op: SearchOp) -> &'static str {
+/// The trace-codec token for a [`SearchOp`]: `move`, or the same single token [`mark_op_token`] writes for
+/// the operator (`delete`, `case:upcase`, `shift_left`, `format_keep`, ...).
+fn search_op_token(op: SearchOp) -> String {
     match op {
-        SearchOp::Move => "move",
-        SearchOp::Delete => "delete",
-        SearchOp::Change => "change",
-        SearchOp::Yank => "yank",
+        SearchOp::Move => "move".into(),
+        SearchOp::Delete => "delete".into(),
+        SearchOp::Change => "change".into(),
+        SearchOp::Yank => "yank".into(),
+        other => mark_op_token(other.span_op().expect("every other SearchOp is a span op")),
     }
 }
 
 fn search_op_from_token(s: &str) -> Option<SearchOp> {
-    Some(match s {
-        "move" => SearchOp::Move,
-        "delete" => SearchOp::Delete,
-        "change" => SearchOp::Change,
-        "yank" => SearchOp::Yank,
-        _ => return None,
+    if s == "move" {
+        return Some(SearchOp::Move);
+    }
+    Some(match mark_op_from_token(s)? {
+        MarkOp::Delete => SearchOp::Delete,
+        MarkOp::Change => SearchOp::Change,
+        MarkOp::Yank => SearchOp::Yank,
+        MarkOp::Case(c) => SearchOp::Case(c),
+        MarkOp::Shift { left } => SearchOp::Shift { left },
+        MarkOp::Reindent => SearchOp::Reindent,
+        MarkOp::Format { keep } => SearchOp::Format { keep },
+        MarkOp::Comment => SearchOp::Comment,
     })
 }
 
@@ -1042,6 +1273,10 @@ pub enum CommandParseError {
     Empty,
     UnknownVerb(String),
     BadArgument(String),
+    /// A record past a live limit (RFC-0020 R6: an `ex_edits` batch past [`crate::MAX_APPLY_EDITS`] or
+    /// [`crate::MAX_APPLY_EDIT_BYTES`], an `ex_register` value past [`crate::MAX_REGISTER_BYTES`]). Found
+    /// before the bytes are decoded, so a hostile line is refused without a large allocation.
+    TooLarge(String),
 }
 
 /// Parse a `u32` argument (a count or a char codepoint) from a command line's token, or a `BadArgument`
@@ -1072,6 +1307,34 @@ fn arg_word_case(arg: Option<&str>, line: &str) -> Result<WordCase, CommandParse
         Some("rot13") => Ok(WordCase::Rot13),
         _ => Err(CommandParseError::BadArgument(line.to_string())),
     }
+}
+
+/// Lowercase hex of `text`'s UTF-8 bytes, for a trace argument that may hold any character.
+fn hex_encode(text: &str) -> String {
+    let mut s = String::with_capacity(text.len() * 2);
+    for b in text.bytes() {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// The inverse of [`hex_encode`]: an odd length, a non-hex digit, or bytes that are not UTF-8 are errors.
+fn hex_decode(arg: &str, line: &str) -> Result<String, CommandParseError> {
+    let bad = || CommandParseError::BadArgument(line.to_string());
+    let digits = arg.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return Err(bad());
+    }
+    let bytes = digits
+        .chunks(2)
+        .map(|p| {
+            std::str::from_utf8(p)
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(bad)
+        })
+        .collect::<Result<Vec<u8>, _>>()?;
+    String::from_utf8(bytes).map_err(|_| bad())
 }
 
 impl Command {
@@ -1110,6 +1373,10 @@ impl Command {
             Command::InsertRegister(c) => format!("insert_register {}", *c as u32),
             // The expression text is the untrimmed remainder (it may contain spaces), like `search_next`.
             Command::InsertEval(e) => format!("insert_eval {e}"),
+            // Pasted text may hold any byte (newlines, spaces), so it is hex-encoded to stay one line.
+            Command::InsertPaste(t) => format!("insert_paste {}", hex_encode(t)),
+            Command::ReplacePaste(t) => format!("replace_paste {}", hex_encode(t)),
+            Command::EmacsPaste(t) => format!("emacs_paste {}", hex_encode(t)),
             Command::InsertDeleteWordBack => "insert_delete_word_back".into(),
             Command::InsertDeleteToLineStart => "insert_delete_to_line_start".into(),
             // `back` then the candidate text (the untrimmed remainder, like `insert_eval`; a keyword has no
@@ -1117,6 +1384,20 @@ impl Command {
             Command::CompleteWord { back, text } => format!("complete_word {back} {text}"),
             Command::InsertIndent => "insert_indent".into(),
             Command::InsertDedent => "insert_dedent".into(),
+            Command::InsertDeleteIndent => "insert_delete_indent".into(),
+            Command::InsertDeleteIndentRestore => "insert_delete_indent_restore".into(),
+            Command::InsertStartColumnLine { down } => {
+                format!(
+                    "insert_start_column_line {}",
+                    if *down { "down" } else { "up" }
+                )
+            }
+            Command::InsertCaretStep { right } => {
+                format!(
+                    "insert_caret_step {}",
+                    if *right { "right" } else { "left" }
+                )
+            }
             Command::InsertTab => "insert_tab".into(),
             Command::InsertNewline => "insert_newline".into(),
             Command::OpenLineIndent { kind, level } => {
@@ -1158,6 +1439,7 @@ impl Command {
             Command::GotoNewerJump => "goto_newer_jump".into(),
             Command::InsertAtLastInsert => "insert_at_last_insert".into(),
             Command::AsciiInfo => "ascii_info".into(),
+            Command::Utf8Info => "utf8_info".into(),
             Command::FileInfo => "file_info".into(),
             Command::CursorInfo => "cursor_info".into(),
             Command::SetNamedMark(c) => format!("set_named_mark {}", *c as u32),
@@ -1184,6 +1466,9 @@ impl Command {
             Command::Reindent { count, motion } => {
                 format!("reindent {count} {}", motion_token(*motion))
             }
+            Command::Comment { count, motion } => {
+                format!("comment {count} {}", motion_token(*motion))
+            }
             Command::Format {
                 count,
                 motion,
@@ -1205,6 +1490,22 @@ impl Command {
                 }
                 s
             }
+            Command::SetIndentCols {
+                first_line,
+                last_line,
+                cols,
+            } => {
+                let mut s = format!("set_indent_cols {first_line} {last_line}");
+                for c in cols {
+                    s.push(' ');
+                    match c {
+                        Some(c) => s.push_str(&c.to_string()),
+                        None => s.push('-'),
+                    }
+                }
+                s
+            }
+            Command::InsertReindent => "insert_reindent".into(),
             Command::Move(n, m) => format!("move {n} {}", motion_token(*m)),
             Command::Delete(n, m) => format!("delete {n} {}", motion_token(*m)),
             Command::Change(n, m) => format!("change {n} {}", motion_token(*m)),
@@ -1247,11 +1548,19 @@ impl Command {
                     format!("paste_before_indent {count}")
                 }
             }
-            Command::PasteSelection { swap } => {
-                if *swap {
-                    "paste_selection swap".into()
+            Command::PasteBlockInner { after, count } => {
+                if *after {
+                    format!("paste_after_inner {count}")
                 } else {
-                    "paste_selection keep".into()
+                    format!("paste_before_inner {count}")
+                }
+            }
+            Command::PasteSelection { swap, count } => {
+                let mode = if *swap { "swap" } else { "keep" };
+                if *count == 1 {
+                    format!("paste_selection {mode}")
+                } else {
+                    format!("paste_selection {mode} {count}")
                 }
             }
             Command::SetRegister(name) => match name {
@@ -1280,6 +1589,7 @@ impl Command {
                 let _ = write!(s, "{}", *c as u32);
                 s
             }
+            Command::VisualOp(op) => format!("visual_op {}", visual_op_token(*op)),
             Command::BlockInsert(kind) => match kind {
                 BlockInsertKind::Insert => "block_insert".into(),
                 BlockInsertKind::Append => "block_append".into(),
@@ -1287,13 +1597,18 @@ impl Command {
             },
             Command::SearchNext(p) => format!("search_next {p}"),
             Command::SearchPrev(p) => format!("search_prev {p}"),
+            // The operator and count trail the direction/scope, so pre-#1071 traces (no op/count) still
+            // parse as the bare `Move` with count 1.
             Command::SearchWordUnder {
                 forward,
                 whole_word,
+                op,
+                count,
             } => format!(
-                "search_word_under {} {}",
+                "search_word_under {} {} {} {count}",
                 if *forward { "fwd" } else { "bwd" },
-                if *whole_word { "whole" } else { "any" }
+                if *whole_word { "whole" } else { "any" },
+                search_op_token(*op),
             ),
             Command::RepeatSubstituteGlobal => "repeat_substitute_global".into(),
             Command::RepeatSubstituteLine => "repeat_substitute_line".into(),
@@ -1339,6 +1654,7 @@ impl Command {
             Command::Redo => "redo".into(),
             Command::UndoOlder => "undo_older".into(),
             Command::UndoNewer => "undo_newer".into(),
+            Command::LineUndo => "line_undo".into(),
             Command::Save => "save".into(),
             Command::Quit => "quit".into(),
             Command::SetMark => "set_mark".into(),
@@ -1370,6 +1686,7 @@ impl Command {
             Command::EmacsCaseWord { case } => {
                 format!("emacs_case_word {}", word_case_token(*case))
             }
+            Command::Ex(ex) => ex.to_line(),
         }
     }
 
@@ -1446,6 +1763,9 @@ impl Command {
             }
             // The expression is the untrimmed remainder (may contain spaces), like `search_next`.
             "insert_eval" => Command::InsertEval(raw.to_string()),
+            "insert_paste" => Command::InsertPaste(hex_decode(arg.unwrap_or(""), line)?),
+            "replace_paste" => Command::ReplacePaste(hex_decode(arg.unwrap_or(""), line)?),
+            "emacs_paste" => Command::EmacsPaste(hex_decode(arg.unwrap_or(""), line)?),
             "insert_delete_word_back" => Command::InsertDeleteWordBack,
             "insert_delete_to_line_start" => Command::InsertDeleteToLineStart,
             "complete_word" => {
@@ -1462,6 +1782,22 @@ impl Command {
             }
             "insert_indent" => Command::InsertIndent,
             "insert_dedent" => Command::InsertDedent,
+            "insert_delete_indent" => Command::InsertDeleteIndent,
+            "insert_delete_indent_restore" => Command::InsertDeleteIndentRestore,
+            "insert_start_column_line" => Command::InsertStartColumnLine {
+                down: match arg {
+                    Some("down") => true,
+                    Some("up") => false,
+                    _ => return Err(CommandParseError::BadArgument(line.to_string())),
+                },
+            },
+            "insert_caret_step" => Command::InsertCaretStep {
+                right: match arg {
+                    Some("right") => true,
+                    Some("left") => false,
+                    _ => return Err(CommandParseError::BadArgument(line.to_string())),
+                },
+            },
             "insert_tab" => Command::InsertTab,
             "insert_newline" => Command::InsertNewline,
             "open_line_indent" => {
@@ -1558,6 +1894,7 @@ impl Command {
             "goto_newer_jump" => Command::GotoNewerJump,
             "insert_at_last_insert" => Command::InsertAtLastInsert,
             "ascii_info" => Command::AsciiInfo,
+            "utf8_info" => Command::Utf8Info,
             "file_info" => Command::FileInfo,
             "cursor_info" => Command::CursorInfo,
             "set_named_mark" => {
@@ -1634,6 +1971,7 @@ impl Command {
                 });
             }
             "reindent" => return op_cmd(arg, |count, motion| Command::Reindent { count, motion }),
+            "comment" => return op_cmd(arg, |count, motion| Command::Comment { count, motion }),
             "format" => {
                 // `format {count} {motion} {keep|move}`
                 let a = arg.ok_or_else(|| CommandParseError::BadArgument(line.to_string()))?;
@@ -1653,6 +1991,32 @@ impl Command {
                     keep_cursor,
                 });
             }
+            "set_indent_cols" => {
+                let a = arg.ok_or_else(|| CommandParseError::BadArgument(line.to_string()))?;
+                let mut it = a.split_whitespace();
+                let mut num = || {
+                    it.next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| CommandParseError::BadArgument(a.to_string()))
+                };
+                let first_line = num()?;
+                let last_line = num()?;
+                let cols = a
+                    .split_whitespace()
+                    .skip(2)
+                    .map(|s| match s {
+                        "-" => Ok(None),
+                        s => s.parse::<usize>().map(Some),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| CommandParseError::BadArgument(a.to_string()))?;
+                return Ok(Command::SetIndentCols {
+                    first_line,
+                    last_line,
+                    cols,
+                });
+            }
+            "insert_reindent" => Command::InsertReindent,
             "set_indents" => {
                 let a = arg.ok_or_else(|| CommandParseError::BadArgument(line.to_string()))?;
                 let mut it = a.split_whitespace();
@@ -1754,9 +2118,23 @@ impl Command {
                 after: false,
                 count: arg_u32(arg, line)?,
             },
-            "paste_selection" => Command::PasteSelection {
-                swap: !matches!(arg.map(str::trim), Some("keep")),
+            "paste_after_inner" => Command::PasteBlockInner {
+                after: true,
+                count: arg_u32(arg, line)?,
             },
+            "paste_before_inner" => Command::PasteBlockInner {
+                after: false,
+                count: arg_u32(arg, line)?,
+            },
+            "paste_selection" => {
+                let mut words = arg.unwrap_or("").split_whitespace();
+                let swap = words.next() != Some("keep");
+                let count = match words.next() {
+                    Some(n) => arg_u32(Some(n), line)?,
+                    None => 1,
+                };
+                Command::PasteSelection { swap, count }
+            }
             "select_register" => {
                 // No arg → the unnamed register; otherwise a decimal Unicode scalar for the register name.
                 let name = match arg {
@@ -1804,6 +2182,10 @@ impl Command {
                     .ok_or_else(|| CommandParseError::BadArgument(line.to_string()))?;
                 Command::ReplaceSelection(c)
             }
+            "visual_op" => Command::VisualOp(
+                arg.and_then(visual_op_from_token)
+                    .ok_or_else(|| CommandParseError::BadArgument(line.to_string()))?,
+            ),
             "block_insert" => Command::BlockInsert(BlockInsertKind::Insert),
             "block_append" => Command::BlockInsert(BlockInsertKind::Append),
             "block_change" => Command::BlockInsert(BlockInsertKind::Change),
@@ -1813,9 +2195,22 @@ impl Command {
                 let mut it = raw.split_whitespace();
                 let forward = !matches!(it.next(), Some("bwd"));
                 let whole_word = !matches!(it.next(), Some("any"));
+                let op = match it.next() {
+                    None => SearchOp::Move,
+                    Some(t) => search_op_from_token(t)
+                        .ok_or_else(|| CommandParseError::BadArgument(line.to_string()))?,
+                };
+                let count = match it.next() {
+                    None => 1,
+                    Some(c) => c
+                        .parse()
+                        .map_err(|_| CommandParseError::BadArgument(line.to_string()))?,
+                };
                 Command::SearchWordUnder {
                     forward,
                     whole_word,
+                    op,
+                    count,
                 }
             }
             "repeat_substitute_global" => Command::RepeatSubstituteGlobal,
@@ -1881,6 +2276,7 @@ impl Command {
             "redo" => Command::Redo,
             "undo_older" => Command::UndoOlder,
             "undo_newer" => Command::UndoNewer,
+            "line_undo" => Command::LineUndo,
             "save" => Command::Save,
             "quit" => Command::Quit,
             "set_mark" => Command::SetMark,
@@ -1922,6 +2318,10 @@ impl Command {
                 Some("end") => Command::EmacsBufferEdge { start: false },
                 _ => return Err(CommandParseError::BadArgument(line.to_string())),
             },
+            // Resolved Ex edits (RFC-0020); their verbs are parsed in `editor/ex_cmd.rs`.
+            other if other.starts_with("ex_") => {
+                Command::Ex(crate::editor::ExCmd::from_parts(other, raw, line)?)
+            }
             other => return Err(CommandParseError::UnknownVerb(other.to_string())),
         })
     }
@@ -1930,6 +2330,20 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_1071_search_word_under_traces_parse_as_the_bare_move() {
+        assert_eq!(
+            Command::from_line("search_word_under bwd any"),
+            Ok(Command::SearchWordUnder {
+                forward: false,
+                whole_word: false,
+                op: SearchOp::Move,
+                count: 1,
+            })
+        );
+        assert!(Command::from_line("search_word_under fwd whole bogus 1").is_err());
+    }
 
     #[test]
     fn round_trips_every_variant() {
@@ -2036,6 +2450,7 @@ mod tests {
             },
             Command::InsertAtLastInsert,
             Command::AsciiInfo,
+            Command::Utf8Info,
             Command::FileInfo,
             Command::CursorInfo,
             Command::SetNamedMark('a'),
@@ -2087,6 +2502,32 @@ mod tests {
                 name: 'h',
                 linewise: false,
             },
+            Command::OpToMark {
+                op: MarkOp::Format { keep: false },
+                name: 'i',
+                linewise: true,
+            },
+            Command::OpToMark {
+                op: MarkOp::Format { keep: true },
+                name: 'j',
+                linewise: false,
+            },
+            Command::OpToMark {
+                op: MarkOp::Comment,
+                name: 'k',
+                linewise: true,
+            },
+            Command::Comment {
+                count: 2,
+                motion: Motion::Line,
+            },
+            Command::Search {
+                op: SearchOp::Comment,
+                count: 1,
+                pattern: "c".into(),
+                backward: false,
+                offset: SearchOffset::None,
+            },
             Command::BreakUndo,
             Command::ShiftRight(1),
             Command::ShiftRight(3),
@@ -2116,6 +2557,17 @@ mod tests {
                 last_line: 5,
                 levels: vec![0, 1, 2, 1],
             },
+            Command::SetIndentCols {
+                first_line: 1,
+                last_line: 3,
+                cols: vec![Some(0), None, Some(9)],
+            },
+            Command::SetIndentCols {
+                first_line: 0,
+                last_line: 0,
+                cols: vec![],
+            },
+            Command::InsertReindent,
             Command::InsertChar('🎉'),
             Command::InsertChar(' '),
             Command::InsertRegister('"'),
@@ -2134,6 +2586,12 @@ mod tests {
             },
             Command::InsertIndent,
             Command::InsertDedent,
+            Command::InsertDeleteIndent,
+            Command::InsertDeleteIndentRestore,
+            Command::InsertStartColumnLine { down: true },
+            Command::InsertStartColumnLine { down: false },
+            Command::InsertCaretStep { right: true },
+            Command::InsertCaretStep { right: false },
             Command::InsertTab,
             Command::InsertNewline,
             Command::OpenLineIndent {
@@ -2239,6 +2697,7 @@ mod tests {
                     ch: 'x',
                     forward: true,
                     till: false,
+                    repeat: false,
                 },
             ),
             Command::Delete(
@@ -2247,6 +2706,7 @@ mod tests {
                     ch: ')',
                     forward: true,
                     till: true,
+                    repeat: false,
                 },
             ),
             Command::Move(
@@ -2255,6 +2715,16 @@ mod tests {
                     ch: '가',
                     forward: false,
                     till: false,
+                    repeat: false,
+                },
+            ),
+            Command::Move(
+                1,
+                Motion::FindChar {
+                    ch: 'x',
+                    forward: true,
+                    till: true,
+                    repeat: true,
                 },
             ),
             Command::Move(1, Motion::LastLine),
@@ -2274,6 +2744,11 @@ mod tests {
             Command::Delete(25, Motion::GotoPercent),
             Command::Move(50, Motion::MidLine),
             Command::Delete(25, Motion::MidLine),
+            Command::Move(3, Motion::WrapLeft),
+            Command::Delete(1, Motion::WrapLeft),
+            Command::Move(3, Motion::WrapRight),
+            Command::Move(2, Motion::EmacsCharBack),
+            Command::Delete(4, Motion::EmacsCharFwd),
             Command::Move(1, Motion::ParagraphFwd),
             Command::Move(2, Motion::ParagraphBack),
             Command::Delete(1, Motion::ParagraphFwd),
@@ -2323,8 +2798,18 @@ mod tests {
                 after: false,
                 count: 3,
             },
-            Command::PasteSelection { swap: true },
-            Command::PasteSelection { swap: false },
+            Command::PasteBlockInner {
+                after: true,
+                count: 2,
+            },
+            Command::PasteSelection {
+                swap: true,
+                count: 1,
+            },
+            Command::PasteSelection {
+                swap: false,
+                count: 3,
+            },
             Command::SetRegister(None),
             Command::SetRegister(Some('a')),
             Command::SetRegister(Some('Z')),
@@ -2333,6 +2818,10 @@ mod tests {
             Command::SetExprRegister(String::new()),
             Command::InsertEval("3.0/2".into()),
             Command::InsertEval("'n='.5".into()),
+            Command::InsertPaste("dd:q!\n  x y\t한\u{1b}".into()),
+            Command::InsertPaste(String::new()),
+            Command::ReplacePaste("a b\nc".into()),
+            Command::EmacsPaste("kill\nring".into()),
             Command::EnterVisual {
                 kind: SelectKind::Charwise,
             },
@@ -2359,6 +2848,25 @@ mod tests {
             Command::ReplaceSelection('z'),
             Command::ReplaceSelection('가'),
             Command::ReplaceSelection('🎉'),
+            Command::VisualOp(VisualOp::Lines(OpKind::Delete)),
+            Command::VisualOp(VisualOp::Lines(OpKind::Yank)),
+            Command::VisualOp(VisualOp::BlockToEol(OpKind::Change)),
+            Command::VisualOp(VisualOp::Shift {
+                left: true,
+                count: 3,
+            }),
+            Command::VisualOp(VisualOp::Shift {
+                left: false,
+                count: 1,
+            }),
+            Command::VisualOp(VisualOp::Join { spaces: true }),
+            Command::VisualOp(VisualOp::Join { spaces: false }),
+            Command::VisualOp(VisualOp::Reindent),
+            Command::VisualOp(VisualOp::Comment),
+            Command::VisualOp(VisualOp::Format),
+            Command::VisualOp(VisualOp::OtherCorner),
+            Command::VisualOp(VisualOp::YankTrim),
+            Command::VisualOp(VisualOp::LeaveAtStart),
             Command::BlockInsert(BlockInsertKind::Insert),
             Command::BlockInsert(BlockInsertKind::Append),
             Command::BlockInsert(BlockInsertKind::Change),
@@ -2488,8 +2996,47 @@ mod tests {
                 pattern: "a b".into(),
                 backward: true,
             },
+            Command::SearchObject {
+                op: SearchOp::Case(WordCase::Upcase),
+                count: 1,
+                pattern: "b".into(),
+                backward: false,
+            },
+            Command::SearchObject {
+                op: SearchOp::Shift { left: true },
+                count: 2,
+                pattern: "b".into(),
+                backward: false,
+            },
+            Command::Search {
+                op: SearchOp::Format { keep: true },
+                count: 1,
+                pattern: "end".into(),
+                backward: false,
+                offset: SearchOffset::None,
+            },
+            Command::Search {
+                op: SearchOp::Reindent,
+                count: 1,
+                pattern: "x y".into(),
+                backward: true,
+                offset: SearchOffset::None,
+            },
+            Command::SearchWordUnder {
+                forward: true,
+                whole_word: true,
+                op: SearchOp::Move,
+                count: 1,
+            },
+            Command::SearchWordUnder {
+                forward: false,
+                whole_word: false,
+                op: SearchOp::Case(WordCase::Upcase),
+                count: 3,
+            },
             Command::Undo,
             Command::Redo,
+            Command::LineUndo,
             Command::Save,
             Command::Quit,
             Command::EmacsYank { count: 1 },
@@ -2528,6 +3075,10 @@ mod tests {
             },
             Command::EmacsDeleteIndentation,
         ];
+        // Every resolved Ex edit (RFC-0020); `editor/ex_cmd.rs` lists one of each.
+        let cases = cases
+            .into_iter()
+            .chain(crate::editor::ex_cmd_samples().into_iter().map(Command::Ex));
         for c in cases {
             assert_eq!(Command::from_line(&c.to_line()), Ok(c.clone()), "{c:?}");
         }

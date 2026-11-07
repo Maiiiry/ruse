@@ -15,23 +15,27 @@
 //! its arena slots into an [`EditorState`], the UNCHANGED `plan`/`commit`/`apply_command` pipeline
 //! runs, and the pair is swapped back. Nothing else can reference the Document during that window (one
 //! command at a time, single-threaded; other Views hold only its id), so the move is sound and the
-//! single-window path stays byte-identical to F-007 step (a).
+//! single-window path stays byte-identical to F-007 step (a). The register store is editor-global
+//! (D-057 slice 2, #944): the Workspace owns it and lends it into the swapped-out View for that window
+//! ([`Workspace::lend`] / [`Workspace::reclaim`]), so a View at rest holds an empty store.
 //!
 //! **Layout (flat, MVP).** The MVP layout is a flat list of Windows with one split direction
 //! ([`SplitDir`]) and a focus index — enough for equal `:split`/`:vsplit` into 2+ panes, `C-w w`
 //! (focus next), `C-w c` (close focused). The full recursive layout tree, tab pages, resize
 //! constraints, and the rest of the `C-w` family are deferred (docs/design/view-window-workspace.md).
 
+use crate::anchor::{LineGravity, Tracked};
 use crate::clipboard::{Clipboard, NoClipboard};
 use crate::command::Command;
 use crate::document::{Document, DocumentId};
 use crate::editor::{
     apply_command, CaretGravity, EditorState, GlobalCmd, LineAddr, SubFlags, SubOutcome, SubRange,
-    Substitution, View,
+    Substitution, View, ViewOptions,
 };
 use crate::effect::Effect;
 use crate::pattern::RegexError;
-use crate::register::RegKind;
+use crate::pos::BytePos;
+use crate::register::{RegKind, RegisterStore};
 use crate::transaction::TransactionOrigin;
 
 /// A handle to a [`View`] in the workspace arena (INV-HANDLE). Distinct from [`DocumentId`] (a buffer)
@@ -109,18 +113,40 @@ pub struct Workspace {
     /// The alternate buffer (Vim `#`): the buffer focus last left, so `:b#` toggles back. `None` until
     /// the first switch.
     alt: Option<DocumentId>,
-    /// The workspace's DEFAULT search-case (`'ignorecase'`/`'smartcase'`), applied to every View it creates
-    /// so a shipped-profile default (which the app turns ON) reaches new buffers and splits, not just the
-    /// first one. The engine/`EditorState::new` default stays vanilla-off (the differential parity oracle
-    /// drives `EditorState` directly), so this Workspace-level seam is where ruse's better-than-Vim default
-    /// lives without the oracle ever seeing it. `(false, false)` = Vim factory until the frontend sets it.
-    default_ignore_case: bool,
-    default_smart_case: bool,
+    /// The GLOBAL option values (Vim's global copy of each option), given to every View the workspace
+    /// creates so a setting reaches new buffers, not just the first one (#754): the shipped search-case
+    /// default (which the app turns ON; the engine/`EditorState::new` default stays vanilla-off for the
+    /// differential parity oracle), the profile's caret gravity, the indent config, and every `:set`.
+    defaults: ViewOptions,
+    /// The global copy of the window-local display options (#615, #616): what a View the workspace creates
+    /// for a buffer starts with, unless it replaces the focused window's View (then it keeps that window's
+    /// values, as an nvim window keeps its options across `:edit`).
+    window_defaults: crate::WindowOptions,
     /// The injected OS-clipboard provider behind the `"+`/`"*` registers (`:help quoteplus`). Defaults to
     /// [`NoClipboard`] (a no-op) so core stays pure and CI — which has no clipboard — is deterministic; the
     /// frontend installs a real shell-out provider at startup via [`Workspace::set_clipboard`], and unit
     /// tests inject [`MemClipboard`](crate::clipboard::MemClipboard).
     clipboard: Box<dyn Clipboard>,
+    /// A command applied since the last [`Workspace::take_beep`] failed ([`Effect::Beep`], #1085).
+    beeped: bool,
+    /// An operator applied since the last [`Workspace::take_refused`] was refused by its register
+    /// ([`Effect::RegisterRefused`], #1184).
+    refused: bool,
+    /// An Ex edit applied since the last [`Workspace::take_not_modifiable`] was refused by
+    /// `'nomodifiable'` (#619).
+    not_modifiable: bool,
+    /// The `"+`/`"*` value the last clipboard pull wrote, when the pull changed the slot, until the frontend
+    /// takes it for the trace ([`Workspace::take_clipboard_read`], RFC-0020 R6).
+    clipboard_read: Option<crate::register::Register>,
+    /// The editor-global register store (Vim registers are shared by every buffer and window; D-057
+    /// slice 2, #944). Lent into the focused View for one command by [`Workspace::lend`].
+    registers: RegisterStore,
+    /// The positions the views at rest pinned in the lent document ([`Workspace::lend`]), read back and
+    /// removed by [`Workspace::reclaim`]. Empty between the two.
+    pins: Vec<(ViewId, std::ops::Range<usize>)>,
+    /// Who causes the edits commands make (INV-ORIGIN): [`TransactionOrigin::UserInput`] unless the
+    /// frontend says otherwise ([`Workspace::set_origin`], #880).
+    origin: TransactionOrigin,
 }
 
 impl Workspace {
@@ -140,9 +166,137 @@ impl Workspace {
             names: vec![None],
             buffer_order: vec![id],
             alt: None,
-            default_ignore_case: false,
-            default_smart_case: false,
+            defaults: ViewOptions::DEFAULT,
+            window_defaults: crate::WindowOptions::default(),
             clipboard: Box::new(NoClipboard),
+            beeped: false,
+            not_modifiable: false,
+            refused: false,
+            clipboard_read: None,
+            registers: RegisterStore::new(),
+            pins: Vec::new(),
+            origin: TransactionOrigin::UserInput,
+        }
+    }
+
+    /// The swap-trick's first half: an [`EditorState`] over `doc`/`view` holding the workspace register
+    /// store. Every `lend` is paired with a [`Workspace::reclaim`], or the store is lost.
+    fn lend(&mut self, mut doc: Document, view: View) -> EditorState {
+        // Every OTHER view of this document (the lent one is out of the arena) pins its marks and its
+        // cursor, so an edit made through the lent view moves them too (#686), as nvim's `mark_adjust`
+        // moves other windows' cursors and jumplists.
+        for (i, v) in self.views.iter().enumerate() {
+            let Some(v) = v.as_ref().filter(|v| v.doc() == doc.id()) else {
+                continue;
+            };
+            let mut t = v.tracked();
+            t.push(Tracked::line(Some(v.cursor()), LineGravity::Cursor));
+            let at = doc.pin_tracked(&t);
+            self.pins.push((ViewId(i), at..at + t.len()));
+        }
+        let mut st = EditorState::from_parts(doc, view);
+        st.swap_registers(&mut self.registers);
+        st.set_origin(self.origin);
+        st
+    }
+
+    /// Set who causes the edits the commands applied from now on make (INV-ORIGIN, #880): the frontend
+    /// sets [`TransactionOrigin::Macro`] while it replays a register's keys (`@{reg}`, `@:`, `Q`) and puts
+    /// [`TransactionOrigin::UserInput`] back after. [`Workspace::apply_edits`] takes its origin directly.
+    pub fn set_origin(&mut self, origin: TransactionOrigin) {
+        self.origin = origin;
+    }
+
+    /// The origin the commands applied now are recorded under ([`Workspace::set_origin`]).
+    #[must_use]
+    pub fn origin(&self) -> TransactionOrigin {
+        self.origin
+    }
+
+    /// The swap-trick's second half: take the register store back from `st` and split it into parts.
+    fn reclaim(&mut self, mut st: EditorState) -> (Document, View) {
+        st.swap_registers(&mut self.registers);
+        let (mut doc, view) = st.into_parts();
+        let pinned = doc.take_pinned();
+        for (vid, range) in std::mem::take(&mut self.pins) {
+            let Some(v) = self.views[vid.0].as_mut() else {
+                continue;
+            };
+            let (cursor, marks) = pinned[range]
+                .split_last()
+                .expect("the cursor is pinned last");
+            v.untrack(marks);
+            let cursor = cursor.pos.map_or(0, |p| p.0).min(doc.len());
+            v.set_cursor(BytePos(crate::motion::snap(doc.bytes(), cursor)));
+        }
+        (doc, view)
+    }
+
+    /// The swap-trick in one place (#769): take view `vid` and its document out of their arena slots, lend
+    /// them to `f` as an [`EditorState`] (with the clipboard provider, for the `"+`/`"*` sync), then reclaim
+    /// them and put them back. The only caller of [`Workspace::lend`] / [`Workspace::reclaim`], so no path
+    /// can forget the register store or the other views' pinned marks.
+    fn with_view<R>(
+        &mut self,
+        vid: ViewId,
+        f: impl FnOnce(&mut EditorState, &mut dyn Clipboard) -> R,
+    ) -> R {
+        let view = self.views[vid.0].take().expect("view live");
+        let slot = Self::doc_slot(view.doc());
+        let doc = self.docs[slot].take().expect("doc live");
+        let mut st = self.lend(doc, view);
+        let out = f(&mut st, self.clipboard.as_mut());
+        let (doc, view) = self.reclaim(st);
+        self.docs[slot] = Some(doc);
+        self.views[vid.0] = Some(view);
+        out
+    }
+
+    /// [`Workspace::with_view`] on the FOCUSED window.
+    fn with_focused<R>(&mut self, f: impl FnOnce(&mut EditorState) -> R) -> R {
+        self.with_view(self.windows[self.focus].view, |st, _| f(st))
+    }
+
+    /// The editor-global register store (read-only).
+    #[must_use]
+    pub fn registers(&self) -> &RegisterStore {
+        &self.registers
+    }
+
+    /// Whether a command failed (Vim beeped) since the last call, clearing the flag. The frontend flushes the
+    /// keys that were not typed (a macro's rest) when it is set, as Vim's `beep_flush` does (#1085).
+    pub fn take_beep(&mut self) -> bool {
+        std::mem::take(&mut self.beeped)
+    }
+
+    /// Whether an Ex edit was refused by `'nomodifiable'` since the last call (`E21`), clearing the flag.
+    pub fn take_not_modifiable(&mut self) -> bool {
+        std::mem::take(&mut self.not_modifiable)
+    }
+
+    /// Whether an operator was refused by its register ([`Effect::RegisterRefused`]) since the last call,
+    /// clearing the flag: the failure behind a beep that nvim saves for `.` (#1184).
+    pub fn take_refused(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
+    }
+
+    /// Record a failure the frontend found itself (an unknown key, Vim's `nv_error`), so it flushes the
+    /// untyped keys as for a failed command (#1111).
+    pub fn beep(&mut self) {
+        self.beeped = true;
+    }
+
+    /// The `"+`/`"*` value a clipboard pull wrote since the last call, if a pull changed the slot: what
+    /// another application copied, read as external input. The frontend records it in the trace ahead of
+    /// the command that read it (an `ex_register` record, RFC-0020 R6), so a replay, which has no clipboard,
+    /// puts the same text.
+    pub fn take_clipboard_read(&mut self) -> Option<crate::register::Register> {
+        self.clipboard_read.take()
+    }
+
+    fn note_clipboard_read(&mut self, pulled: Option<crate::register::Register>) {
+        if pulled.is_some() {
+            self.clipboard_read = pulled;
         }
     }
 
@@ -154,30 +308,24 @@ impl Workspace {
     }
 
     /// Set the workspace default search-case and apply it to EVERY live view (existing and, via
-    /// [`Self::apply_default_search_case`], any created afterward). The frontend calls this once at startup
+    /// [`Self::push_view`], any created afterward). The frontend calls this once at startup
     /// to install ruse's shipped default (ignorecase + smartcase ON) so it holds across `:e`/`:split`/reload
     /// — without touching `EditorState::new`, which the parity oracle drives at the Vim factory default.
     pub fn set_default_search_case(&mut self, ignore_case: bool, smart_case: bool) {
-        self.default_ignore_case = ignore_case;
-        self.default_smart_case = smart_case;
-        for vid in 0..self.views.len() {
-            if self.views[vid].is_some() {
-                self.apply_default_search_case(ViewId(vid));
-            }
+        self.defaults.set_search_case(ignore_case, smart_case);
+        for v in self.views.iter_mut().flatten() {
+            v.update_options(|o| o.set_search_case(ignore_case, smart_case));
         }
     }
 
-    /// Apply the stored default search-case to one view (the [`EditorState::from_parts`] round-trip the other
-    /// per-view mutations use). Called for every newly created view so the default propagates to new buffers.
-    fn apply_default_search_case(&mut self, vid: ViewId) {
-        let view = self.views[vid.0].take().expect("view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("doc live");
-        let mut st = EditorState::from_parts(doc, view);
-        st.set_search_case(self.default_ignore_case, self.default_smart_case);
-        let (doc, view) = st.into_parts();
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+    /// Append a fresh View onto `doc` carrying the global option values ([`Workspace::defaults`]), and
+    /// return its id. Every View the workspace creates (other than a split's clone) comes from here.
+    fn push_view(&mut self, doc: DocumentId) -> ViewId {
+        let mut view = View::fresh(doc);
+        view.set_options(self.defaults.clone());
+        view.set_window_options(self.window_defaults.clone());
+        self.views.push(Some(view));
+        ViewId(self.views.len() - 1)
     }
 
     /// The arena slot index for a `DocumentId` (ids are 1-based, assigned monotonically, never reused).
@@ -191,6 +339,15 @@ impl Workspace {
         self.windows.len()
     }
 
+    /// The buffer each Window shows, in tile order (the focused one at [`Workspace::focus`]).
+    #[must_use]
+    pub fn window_buffers(&self) -> Vec<DocumentId> {
+        self.windows
+            .iter()
+            .filter_map(|w| self.views[w.view.0].as_ref().map(View::doc))
+            .collect()
+    }
+
     /// The current split direction of the flat layout.
     #[must_use]
     pub fn split_dir(&self) -> SplitDir {
@@ -201,6 +358,13 @@ impl Workspace {
     #[must_use]
     pub fn focus(&self) -> usize {
         self.focus
+    }
+
+    /// The View the focused Window shows. Unlike [`Workspace::focus`], it names the window itself: closing
+    /// the focused first window leaves the index at 0 but focuses another View.
+    #[must_use]
+    pub fn focused_view(&self) -> ViewId {
+        self.windows[self.focus].view
     }
 
     /// Borrow the `i`th Window as a [`Pane`] for rendering / viewport math. Panics on a bad index or a
@@ -227,9 +391,28 @@ impl Workspace {
         self.pane(self.focus)
     }
 
+    /// `:[range]mark {name}`: set the focused view's named mark at column 0 of the range's last line (the
+    /// cursor's line for no range), clamped to the buffer (#1088).
+    pub fn set_mark_on_line(&mut self, range: SubRange, name: char) {
+        let vid = self.windows[self.focus].view;
+        let did = self.views[vid.0].as_ref().expect("focused view live").doc();
+        let b = self.docs[Self::doc_slot(did)]
+            .as_ref()
+            .expect("focused doc live")
+            .bytes();
+        let lines = crate::pos::count_newlines(b) + usize::from(b.last() != Some(&b'\n'));
+        let view = self.views[vid.0].as_mut().expect("focused view live");
+        let line = match range {
+            SubRange::CurrentLine => crate::pos::raw::line_of(b, view.cursor().0),
+            SubRange::WholeFile => lines.saturating_sub(1),
+            SubRange::Lines(_, last) => last.clamp(1, lines.max(1)) - 1,
+        };
+        view.set_named_mark(name, crate::pos::raw::nth_line_start(b, line));
+    }
+
     /// Place the FOCUSED view's cursor at byte offset `pos` (the frontend uses this to scroll a
     /// `:s///c` match into view during the confirm loop). Clamped to the buffer.
-    pub fn place_focused_cursor(&mut self, pos: usize) {
+    pub fn place_focused_cursor(&mut self, pos: BytePos) {
         let vid = self.windows[self.focus].view;
         let did = self.views[vid.0].as_ref().expect("focused view live").doc();
         let len = self.docs[Self::doc_slot(did)]
@@ -238,7 +421,16 @@ impl Workspace {
             .bytes()
             .len();
         if let Some(v) = self.views[vid.0].as_mut() {
-            v.set_cursor(pos.min(len));
+            v.set_cursor(pos.min(BytePos(len)));
+        }
+    }
+
+    /// Record `from` on the FOCUSED view's jumplist (Vim's `setpcmark`), for a jump the frontend runs: a
+    /// `:s` that found a match (#940).
+    pub fn push_focused_jump(&mut self, from: BytePos) {
+        let vid = self.windows[self.focus].view;
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.push_jump(from.0);
         }
     }
 
@@ -246,6 +438,7 @@ impl Workspace {
     /// startup with `BetweenChar` when the Emacs profile is active, so its edits rest on Emacs point rather
     /// than being Vim-clamped. Splits clone the focused View, so a later `:split` inherits the gravity.
     pub fn set_caret_gravity(&mut self, gravity: CaretGravity) {
+        self.defaults.set_caret(gravity);
         for v in self.views.iter_mut().flatten() {
             v.set_caret_gravity(gravity);
         }
@@ -257,6 +450,74 @@ impl Workspace {
         let vid = self.windows[i].view;
         if let Some(v) = self.views[vid.0].as_mut() {
             v.set_top(top);
+        }
+    }
+
+    /// Set the `i`th Window's text-area width, which `'wrapmargin'` and a `gq` without `'textwidth'`
+    /// measure against (#618).
+    pub fn set_text_cols(&mut self, i: usize, cols: usize) {
+        let vid = self.windows[i].view;
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.set_text_cols(cols);
+        }
+    }
+
+    /// Set the `i`th Window's first displayed column when `'wrap'` is off (the frontend's horizontal
+    /// scroll, #615).
+    pub fn set_leftcol(&mut self, i: usize, col: usize) {
+        let vid = self.windows[i].view;
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.set_leftcol(col);
+        }
+    }
+
+    /// Set the `i`th Window's skipped virtual columns of its top line (`'smoothscroll'`, #615).
+    pub fn set_skipcol(&mut self, i: usize, col: usize) {
+        let vid = self.windows[i].view;
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.set_skipcol(col);
+        }
+    }
+
+    /// The global copy of the window-local display options (#615, #616).
+    #[must_use]
+    pub fn window_defaults(&self) -> &crate::WindowOptions {
+        &self.window_defaults
+    }
+
+    /// Change the window-local display options at `level`: the focused window's own copy (`:setlocal`),
+    /// the global copy new windows start from (`:setglobal`), or both (`:set`).
+    pub fn update_window_options(
+        &mut self,
+        level: OptionLevel,
+        mut change: impl FnMut(&mut crate::WindowOptions),
+    ) {
+        if level != OptionLevel::Local {
+            change(&mut self.window_defaults);
+        }
+        if level != OptionLevel::Global {
+            let vid = self.windows[self.focus].view;
+            if let Some(v) = self.views[vid.0].as_mut() {
+                let mut opts = v.window_options().clone();
+                change(&mut opts);
+                v.set_window_options(opts);
+            }
+        }
+    }
+
+    /// Set (or clear) the FOCUSED Window's own `'scrolloff'` (`:setlocal so`, #1151).
+    pub fn set_focused_scrolloff(&mut self, so: Option<i64>) {
+        let vid = self.windows[self.focus].view;
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.set_scrolloff_local(so);
+        }
+    }
+
+    /// Set the `i`th Window's 'scroll' amount (`{count}CTRL-D`), valid while its height stays `height`.
+    pub fn set_scroll(&mut self, i: usize, lines: usize, height: usize) {
+        let vid = self.windows[i].view;
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.set_scroll(lines, height);
         }
     }
 
@@ -274,59 +535,53 @@ impl Workspace {
     /// `apply_command` pipeline, swaps them back, and returns the [`Effect`]s for the frontend.
     pub fn apply(&mut self, cmd: &Command) -> Vec<Effect> {
         let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let did = view.doc();
-        let slot = Self::doc_slot(did);
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-
-        // `"+`/`"*` (`:help quoteplus`): this command touches the system clipboard when the one-shot pending
-        // register is `+`/`*` (a `"+y`/`"+p`/`"+d`), or it is an `i_CTRL-R` insert directly from `+`/`*`. The
-        // OS clipboard is an impure side effect, so it is synced HERE (the orchestration boundary), never in
-        // the pure planner: PULL the external clipboard into the mirror slot before the command so a paste
-        // reflects what another app copied, then PUSH the mirror slot out after so a yank/delete propagates.
-        let touches_clipboard = crate::register::RegisterStore::is_clipboard(st.pending_register())
-            || matches!(
-                cmd,
-                Command::InsertRegister('+') | Command::InsertRegister('*')
-            );
-        if touches_clipboard {
-            if let Some(text) = self.clipboard.get() {
-                st.sync_clipboard_in(text.into_bytes());
+        let effects = self.with_view(vid, |st, clipboard| {
+            // `"+`/`"*` (`:help quoteplus`): this command touches the system clipboard when the one-shot
+            // pending register is `+`/`*` (a `"+y`/`"+p`/`"+d`), or it is an `i_CTRL-R` insert directly from
+            // `+`/`*`. The OS clipboard is an impure side effect, so it is synced HERE (the orchestration
+            // boundary), never in the pure planner: PULL the external clipboard into the mirror slot before
+            // the command so a paste reflects what another app copied, then PUSH the mirror slot out after so
+            // a yank/delete propagates.
+            let touches_clipboard =
+                crate::register::RegisterStore::is_clipboard(st.pending_register())
+                    || matches!(
+                        cmd,
+                        Command::InsertRegister('+') | Command::InsertRegister('*')
+                    );
+            let pulled = if touches_clipboard {
+                pull_clipboard(st, clipboard)
+            } else {
+                None
+            };
+            let effects = apply_command(st, cmd);
+            if touches_clipboard {
+                // The mirror slot now holds the yanked/deleted bytes (a paste leaves it unchanged, so the
+                // push is idempotent). `String::from_utf8_lossy` keeps a non-UTF-8 buffer from ever
+                // panicking the write.
+                let bytes = st.registers().clipboard().text().to_vec();
+                clipboard.set(&String::from_utf8_lossy(&bytes));
             }
-        }
-
-        let effects = apply_command(&mut st, cmd);
-
-        if touches_clipboard {
-            // The mirror slot now holds the yanked/deleted bytes (a paste leaves it unchanged, so the push is
-            // idempotent). `String::from_utf8_lossy` keeps a non-UTF-8 buffer from ever panicking the write.
-            let bytes = st.registers().clipboard().text().to_vec();
-            self.clipboard.set(&String::from_utf8_lossy(&bytes));
-        }
-
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+            (effects, pulled)
+        });
+        let (effects, pulled) = effects;
+        self.note_clipboard_read(pulled);
+        self.beeped |= effects.contains(&Effect::Beep);
+        self.refused |= effects.contains(&Effect::RegisterRefused);
         effects
+    }
+
+    /// Place the FOCUSED view's cursor at byte offset `pos` the way [`EditorState::set_cursor`] does:
+    /// clamped, snapped to a char boundary, and seeding the sticky column, so a following vertical move
+    /// aims at `pos`'s column (the swap-trick). For homing a test fixture's start point;
+    /// [`Workspace::place_focused_cursor`] leaves the sticky column alone.
+    pub fn set_focused_cursor(&mut self, pos: BytePos) {
+        self.with_focused(|st| st.set_cursor(pos));
     }
 
     /// Store raw macro bytes into a named register of the FOCUSED view (D-055; the swap-trick). Shares the
     /// a-z slots with yank/paste, so a recorded macro pastes as text and yanked text runs as a macro.
     pub fn set_register_raw(&mut self, name: Option<char>, bytes: Vec<u8>) {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        st.set_register_raw(name, bytes);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+        self.with_focused(|st| st.set_register_raw(name, bytes));
     }
 
     /// Sync the four read-only special registers `"/ ": ". "%` of the FOCUSED view from frontend state
@@ -340,47 +595,27 @@ impl Workspace {
         inserted: Option<String>,
         file: Option<String>,
     ) {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        st.set_special_registers(search, last_ex, inserted, file);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+        self.with_focused(|st| st.set_special_registers(search, last_ex, inserted, file));
     }
 
-    /// The raw bytes of a named register of the FOCUSED view (D-055 macro replay; the swap-trick). Empty
+    /// Sync `"#`, the alternate file name (`:help quote#`); `None` when there is no alternate file.
+    pub fn set_alternate_register(&mut self, name: Option<String>) {
+        self.registers.set_alternate(name);
+    }
+
+    /// The raw bytes of a named register of the FOCUSED view (D-055 macro replay). Empty
     /// when the register is unset.
-    pub fn register_bytes(&mut self, name: Option<char>) -> Vec<u8> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let bytes = st.registers().get(name).text().to_vec();
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        bytes
+    #[must_use]
+    pub fn register_bytes(&self, name: Option<char>) -> Vec<u8> {
+        self.registers.get(name).text().to_vec()
     }
 
     /// A snapshot of the FOCUSED view's NON-EMPTY registers as `(name, kind, bytes)` — the unnamed slot
-    /// (`"`), the yank register (`0`), and the named `a`-`z` — for `:registers` (the swap-trick). Order: `"`,
+    /// (`"`), the yank register (`0`), and the named `a`-`z` — for `:registers`. Order: `"`,
     /// `0`, a..z. The [`RegKind`] drives the frontend's Type column (`c`/`l`/`b`, per Vim's `:reg` layout).
-    pub fn register_snapshot(&mut self) -> Vec<(char, RegKind, Vec<u8>)> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let regs = st.registers();
+    #[must_use]
+    pub fn register_snapshot(&self) -> Vec<(char, RegKind, Vec<u8>)> {
+        let regs = &self.registers;
         let mut out = Vec::new();
         // Vim `:reg` order: unnamed, the yank register "0, the numbered delete-ring "1–"9, the small-delete
         // register "-, then the named slots "a–"z. Empty slots are omitted.
@@ -390,59 +625,26 @@ impl Workspace {
             .chain(std::iter::once(('-', regs.get(Some('-')))))
             .chain(('a'..='z').map(|c| (c, regs.get(Some(c)))))
         {
-            if !r.is_empty() {
+            if r.is_set() {
                 out.push((name, r.kind(), r.text().to_vec()));
             }
         }
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
         out
     }
 
     /// The FOCUSED view's set marks (`a`-`z`, `.`, `^`) as `(name, byte offset)` for `:marks` (swap-trick).
-    pub fn marks_snapshot(&mut self) -> Vec<(char, usize)> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let marks = st.marks_snapshot();
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        marks
+    pub fn marks_snapshot(&mut self) -> Vec<(char, BytePos)> {
+        self.with_focused(|st| st.marks_snapshot())
     }
 
     /// The FOCUSED view's jumplist positions for `:jumps` (swap-trick).
-    pub fn jumps_snapshot(&mut self) -> Vec<usize> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-        let st = EditorState::from_parts(doc, view);
-        let out = st.jumps_snapshot();
-        let (doc, view) = st.into_parts();
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        out
+    pub fn jumps_snapshot(&mut self) -> Vec<BytePos> {
+        self.with_focused(|st| st.jumps_snapshot())
     }
 
     /// The FOCUSED view's change-list positions for `:changes` (swap-trick).
-    pub fn changes_snapshot(&mut self) -> Vec<usize> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-        let st = EditorState::from_parts(doc, view);
-        let out = st.changes_snapshot();
-        let (doc, view) = st.into_parts();
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        out
+    pub fn changes_snapshot(&mut self) -> Vec<BytePos> {
+        self.with_focused(|st| st.changes_snapshot())
     }
 
     /// Run `:[range]s/pat/rep/flags` against the FOCUSED Window (the swap-trick, like [`Workspace::apply`]),
@@ -454,19 +656,7 @@ impl Workspace {
         replacement: &str,
         flags: SubFlags,
     ) -> Result<SubOutcome, RegexError> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let did = view.doc();
-        let slot = Self::doc_slot(did);
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let result = st.substitute(range, pattern, replacement, flags);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        result
+        self.with_focused(|st| st.substitute(range, pattern, replacement, flags))
     }
 
     /// Compute (do NOT apply) the substitutions `:s///c` would offer on the focused window — the
@@ -482,18 +672,7 @@ impl Workspace {
         // `substitute_preview` reads only, but `EditorState` owns its parts and `Document` is not
         // `Clone`, so swap the focused (Document, View) out, compute, and swap them back unchanged
         // (like `apply`, but the document is never mutated). Runs once per `:s///c`, not per keystroke.
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let out = st.substitute_preview(range, pattern, replacement, flags);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        out
+        self.with_focused(|st| st.substitute_preview(range, pattern, replacement, flags))
     }
 
     /// Count — WITHOUT editing — the matches `:[range]s/pat//n` (the `n` report-only flag) would act on
@@ -505,35 +684,13 @@ impl Workspace {
         pattern: &str,
         flags: SubFlags,
     ) -> Result<SubOutcome, RegexError> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let out = st.substitute_count(range, pattern, flags);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        out
+        self.with_focused(|st| st.substitute_count(range, pattern, flags))
     }
 
     /// Apply an accepted set of [`Substitution`]s to the focused window as one undo group (the tail of
     /// the `:s///c` confirm loop). Swap-trick like [`Workspace::apply`].
     pub fn apply_substitutions(&mut self, subs: &[Substitution]) -> SubOutcome {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let out = st.apply_substitutions(subs);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        out
+        self.with_focused(|st| st.apply_substitutions(subs))
     }
 
     /// Run `:[range]g/pat/cmd` against the FOCUSED window (the swap-trick, like [`Workspace::apply`]):
@@ -545,18 +702,7 @@ impl Workspace {
         negate: bool,
         cmd: &GlobalCmd,
     ) -> Result<usize, RegexError> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let result = st.global(range, pattern, negate, cmd);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        result
+        self.with_focused(|st| st.global(range, pattern, negate, cmd))
     }
 
     /// PASS 1 of `:g` against the FOCUSED window: the 1-based line numbers the pattern marks (or, with
@@ -566,7 +712,7 @@ impl Workspace {
     /// placement helpers.
     ///
     /// # Errors
-    /// [`RegexError`] if the `:g` pattern is unrepresentable/malformed, or the buffer is not valid UTF-8.
+    /// [`RegexError`] if the `:g` pattern is unrepresentable/malformed.
     pub fn global_marks(
         &mut self,
         range: SubRange,
@@ -575,140 +721,68 @@ impl Workspace {
     ) -> Result<Vec<usize>, RegexError> {
         // The swap-trick (like [`Workspace::global`]): move the focused parts into an [`EditorState`] to
         // reuse its single marking rule, then swap them back untouched (marking is read-only).
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let result = st.global_marks(range, pattern, negate);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+        let result = self.with_focused(|st| st.global_marks(range, pattern, negate));
         Ok(result?.into_iter().map(|li| li + 1).collect())
     }
 
     /// Run `:[range]d` against the FOCUSED window (the swap-trick, like [`Workspace::apply`]): delete the
     /// range's lines as one undo group. Returns the number of lines deleted.
     pub fn delete_lines(&mut self, range: SubRange) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
+        self.delete_lines_into(range, None)
+    }
 
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.delete_lines(range);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+    /// [`Workspace::delete_lines`] into register `reg` (`None` = the unnamed one), for `:d {x}` / `:y {x}`.
+    pub fn delete_lines_into(&mut self, range: SubRange, reg: Option<char>) -> usize {
+        self.with_focused(|st| st.delete_lines_into(range, reg))
     }
 
     /// Apply a disjoint `(start, end, text)` batch edit to the FOCUSED window (the swap-trick, like
     /// [`Workspace::apply`]) as one undo group, tagged with the caller-supplied `origin` — a
     /// provenance-agnostic primitive (the LSP frontend passes [`TransactionOrigin::Lsp`]). See
-    /// [`EditorState::apply_edits`].
-    pub fn apply_edits(&mut self, edits: &[(usize, usize, String)], origin: TransactionOrigin) {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        st.apply_edits(edits, origin);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+    /// [`EditorState::apply_edits`]: all or nothing, `false` when refused.
+    pub fn apply_edits(
+        &mut self,
+        edits: &[(BytePos, BytePos, String)],
+        origin: TransactionOrigin,
+    ) -> bool {
+        self.with_focused(|st| st.apply_edits(edits, origin))
     }
 
     /// Run `:[range]y` against the FOCUSED window (the swap-trick, like [`Workspace::apply`]): yank the
     /// range's lines linewise into the unnamed register (and `"0`). Returns the number of lines yanked.
     pub fn yank_lines(&mut self, range: SubRange) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
+        self.yank_lines_into(range, None)
+    }
 
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.yank_lines(range);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+    /// [`Workspace::yank_lines`] into register `reg` (`None` = the unnamed one), for `:d {x}` / `:y {x}`.
+    pub fn yank_lines_into(&mut self, range: SubRange, reg: Option<char>) -> usize {
+        self.with_focused(|st| st.yank_lines_into(range, reg))
     }
 
     /// Run `:[range]j[oin][!]` against the FOCUSED window (the swap-trick, like [`Workspace::apply`]): join
     /// the range's lines, reusing the same core join `J`/`gJ` emit. `no_space` is the `!` (raw `gJ`) form.
     /// Returns the number of lines joined.
     pub fn join_lines(&mut self, range: SubRange, no_space: bool) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.join_lines(range, no_space);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+        self.with_focused(|st| st.join_lines(range, no_space))
     }
 
     /// Run `:[range]>` / `:[range]<` against the FOCUSED window (the swap-trick, like [`Workspace::apply`]):
     /// shift the range's lines `levels` indent levels right (`left = false`) or left (`left = true`), reusing
     /// the core `>>`/`<<` shift. Returns the number of lines in the range.
     pub fn shift_lines(&mut self, range: SubRange, left: bool, levels: u32) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.shift_lines(range, left, levels);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+        self.with_focused(|st| st.shift_lines(range, left, levels))
     }
 
     /// Run `:[range]m {addr}` against the FOCUSED window (swap-trick): move the range's lines to after the
     /// destination. Returns the lines moved, or `None` if the destination is inside the source.
     pub fn move_lines(&mut self, range: SubRange, dest: LineAddr) -> Option<usize> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.move_lines(range, dest);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+        self.with_focused(|st| st.move_lines(range, dest))
     }
 
     /// Run `:[range]t {addr}` / `:copy` against the FOCUSED window (swap-trick): copy the range's lines to
     /// after the destination. Returns the lines copied.
     pub fn copy_lines(&mut self, range: SubRange, dest: LineAddr) -> Option<usize> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.copy_lines(range, dest);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+        self.with_focused(|st| st.copy_lines(range, dest))
     }
 
     /// Run `:[line]put [reg]` against the FOCUSED window (swap-trick): put the register's text LINEWISE as
@@ -718,21 +792,15 @@ impl Workspace {
     /// another app copied. A put only READS a register, so nothing is pushed back out.
     pub fn put_lines(&mut self, addr: LineAddr, reg: Option<char>) -> usize {
         let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        if crate::register::RegisterStore::is_clipboard(reg) {
-            if let Some(text) = self.clipboard.get() {
-                st.sync_clipboard_in(text.into_bytes());
-            }
-        }
-        let n = st.put_lines(addr, reg);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+        let (n, pulled) = self.with_view(vid, |st, clipboard| {
+            let pulled = if crate::register::RegisterStore::is_clipboard(reg) {
+                pull_clipboard(st, clipboard)
+            } else {
+                None
+            };
+            (st.put_lines(addr, reg), pulled)
+        });
+        self.note_clipboard_read(pulled);
         n
     }
 
@@ -741,70 +809,77 @@ impl Workspace {
     /// `cursor_on_last` picks the cursor's landing line (last inserted for a command read, first otherwise —
     /// nvim's quirk). Returns the number of lines inserted.
     pub fn read_lines(&mut self, addr: LineAddr, text: &[u8], cursor_on_last: bool) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.read_lines(addr, text, cursor_on_last);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+        self.with_focused(|st| st.read_lines(addr, text, cursor_on_last))
     }
 
     /// The text of the FOCUSED window's lines in `range` (each with a trailing `\n`), as the frontend feeds a
-    /// `:{range}!{cmd}` filter's stdin. `None` for an empty / non-UTF-8 buffer. Read-only in effect, but takes
-    /// `&mut self` to reuse the swap-trick that reconstitutes the [`EditorState`] (which owns the resolver).
-    pub fn range_text(&mut self, range: SubRange) -> Option<String> {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let st = EditorState::from_parts(doc, view);
-        let out = st.range_text(range);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        out
+    /// `:{range}!{cmd}` filter's stdin, as raw bytes. `None` for an empty buffer. Read-only in effect, but
+    /// takes `&mut self` to reuse the swap-trick that reconstitutes the [`EditorState`] (which owns the
+    /// resolver).
+    pub fn range_text(&mut self, range: SubRange) -> Option<Vec<u8>> {
+        self.with_focused(|st| st.range_text(range))
     }
 
     /// Run `:{range}!{cmd}` against the FOCUSED window (swap-trick): replace the range's lines with `text`
     /// (the filter command's stdout, captured by the frontend). Returns the number of input lines filtered.
     pub fn filter_lines(&mut self, range: SubRange, text: &[u8]) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
+        self.with_focused(|st| st.filter_lines(range, text))
+    }
 
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.filter_lines(range, text);
-        let (doc, view) = st.into_parts();
+    /// Run `:[range]retab[!] [N]` against the FOCUSED window (swap-trick; see [`EditorState::retab`]).
+    /// Returns whether any line changed.
+    pub fn retab(
+        &mut self,
+        range: SubRange,
+        bang: bool,
+        new_tabstop: Option<crate::cells::VarStops>,
+    ) -> bool {
+        self.with_focused(|st| st.retab(range, bang, new_tabstop))
+    }
 
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+    /// `:keepjumps` (#609): while `on`, no view records a jumplist or change-list entry (so `''`, `` `. ``,
+    /// `CTRL-O` and `g;` are as they were before the command).
+    pub fn set_keep_jumps(&mut self, on: bool) {
+        for view in self.views.iter_mut().flatten() {
+            view.keep_jumps = on;
+        }
+    }
+
+    /// Whether `:keepjumps` is in force (see [`Workspace::set_keep_jumps`]).
+    #[must_use]
+    pub fn keep_jumps(&self) -> bool {
+        self.views.iter().flatten().any(|v| v.keep_jumps)
+    }
+
+    /// Make `id` the alternate buffer (`None` clears it), as `:keepalt` restores it (#609).
+    pub fn set_alternate(&mut self, id: Option<DocumentId>) {
+        self.alt = id;
+    }
+
+    /// Name (or rename) buffer `id`; a retired id is ignored (`:cd` renames every buffer, #610).
+    pub fn set_buffer_name(&mut self, id: DocumentId, name: impl Into<String>) {
+        if let Some(slot) = self.names.get_mut(Self::doc_slot(id)) {
+            *slot = Some(name.into());
+        }
+    }
+
+    /// Remove the FOCUSED buffer's name (`:0file`, #610).
+    pub fn clear_focused_buffer_name(&mut self) {
+        let slot = Self::doc_slot(self.focused_buffer());
+        self.names[slot] = None;
     }
 
     /// Run `:[range]sort` against the FOCUSED window (swap-trick): sort the range's lines as one undo
     /// group. Returns the number of lines removed by the `unique` flag.
-    pub fn sort_lines(&mut self, range: SubRange, opts: &crate::SortOptions) -> usize {
-        let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-
-        let mut st = EditorState::from_parts(doc, view);
-        let n = st.sort_lines(range, opts);
-        let (doc, view) = st.into_parts();
-
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
-        n
+    ///
+    /// # Errors
+    /// [`RegexError`] if the sort pattern does not compile; the buffer is left as it was.
+    pub fn sort_lines(
+        &mut self,
+        range: SubRange,
+        opts: &crate::SortOptions,
+    ) -> Result<usize, RegexError> {
+        self.with_focused(|st| st.sort_lines(range, opts))
     }
 
     /// Move focus to the next Window in tile order, wrapping (Vim `C-w w`). No-op with one Window.
@@ -814,14 +889,26 @@ impl Workspace {
         }
     }
 
+    /// Move focus to the previous Window in tile order, wrapping (Vim `C-w W`). No-op with one Window.
+    pub fn focus_prev(&mut self) {
+        if !self.windows.is_empty() {
+            self.focus = (self.focus + self.windows.len() - 1) % self.windows.len();
+        }
+    }
+
+    /// Focus the `i`th Window in tile order (0-based), clamped to the last one (Vim `{count}C-w w`).
+    pub fn focus_window(&mut self, i: usize) {
+        if !self.windows.is_empty() {
+            self.focus = i.min(self.windows.len() - 1);
+        }
+    }
+
     /// Split the focused Window into a second Window onto the SAME buffer, in direction `dir`, and
     /// focus the new pane (Vim opens and focuses the new split). The new View is a CLONE of the focused
-    /// View — same buffer id, same cursor/scroll/registers/config snapshot — so both panes start at the
+    /// View — same buffer id, same cursor/scroll/config snapshot — so both panes start at the
     /// same place then diverge independently (F-007 acceptance #1). `dir` sets the whole flat layout's
-    /// tiling (MVP: one direction, no tree). Returns the new [`ViewId`].
-    ///
-    /// Registers/config are cloned here rather than shared live — a documented post-MVP Vim-parity
-    /// refinement (global registers across Views), tracked with folds/session in the F-007 backlog.
+    /// tiling (MVP: one direction, no tree). Returns the new [`ViewId`]. Registers are not cloned: the
+    /// Workspace owns the one store both panes share (#944).
     pub fn split(&mut self, dir: SplitDir) -> ViewId {
         self.split = dir;
         let src = self.windows[self.focus].view;
@@ -838,35 +925,18 @@ impl Workspace {
         new_vid
     }
 
-    /// Close the focused Window (Vim `C-w c`): drop the layout slot, retire its View, and — if no other
-    /// View still names its buffer — retire the shared Document too (F-007 acceptance #3: the buffer
-    /// survives while another View holds it). Refuses to close the LAST Window (returns `false`); an
+    /// Close the focused Window (Vim `C-w c`): drop the layout slot and retire its View. Its buffer stays
+    /// loaded, hidden if no other window shows it (F-007 acceptance #3). Refuses to close the LAST Window (returns `false`); an
     /// app-level `:q` handles quitting. On success returns `true` and focus lands on the neighbour.
     pub fn close_focused(&mut self) -> bool {
         if self.windows.len() <= 1 {
             return false; // never leave zero windows — `:q` is the quit path
         }
         let win = self.windows.remove(self.focus);
-        let did = self.views[win.view.0]
-            .as_ref()
-            .expect("closing view live")
-            .doc();
-        self.views[win.view.0] = None; // retire the View
-
-        // Retire the Document iff no surviving Window's View still names it (refcount-by-scan).
-        let still_held = self.windows.iter().any(|w| {
-            self.views[w.view.0]
-                .as_ref()
-                .is_some_and(|v| v.doc() == did)
-        });
-        if !still_held {
-            self.docs[Self::doc_slot(did)] = None;
-            self.names[Self::doc_slot(did)] = None;
-            self.buffer_order.retain(|&id| id != did);
-            if self.alt == Some(did) {
-                self.alt = None;
-            }
-        }
+        // Retire only the View. The Document stays loaded even when no window shows it any more: it becomes
+        // hidden, still `:ls`-listed and reopenable with `:b`, as with `:only`. Freeing it would drop unsaved
+        // edits (#736).
+        self.views[win.view.0] = None;
 
         if self.focus >= self.windows.len() {
             self.focus = self.windows.len() - 1; // closed the last-in-order pane
@@ -899,12 +969,96 @@ impl Workspace {
         closed
     }
 
+    /// The invariant walker over the whole editor state (#906): every buffer and every view by
+    /// [`Document::assert_invariants`] and [`View::assert_invariants`], plus the workspace's own rules —
+    /// buffer slot `i` holds `DocumentId(i + 1)` (so no id is used twice), every window shows a live view
+    /// of a live buffer and no two windows share a view, focus names a window, the buffer list holds each
+    /// live buffer once, the alternate buffer is live, and no positions stay pinned between commands.
+    /// The flat MVP layout has no tree, so there is no cycle to look for. Panics on the first broken
+    /// rule; property and fuzz tests call it after every step.
+    pub fn assert_invariants(&self) {
+        assert_eq!(
+            self.names.len(),
+            self.docs.len(),
+            "a buffer slot lost its name"
+        );
+        for (i, d) in self.docs.iter().enumerate() {
+            if let Some(d) = d {
+                assert_eq!(
+                    d.id(),
+                    DocumentId(i as u64 + 1),
+                    "buffer slot {i} holds another id"
+                );
+                d.assert_invariants();
+            }
+        }
+        for (i, v) in self.views.iter().enumerate() {
+            if let Some(v) = v {
+                let d = self
+                    .document(v.doc())
+                    .unwrap_or_else(|| panic!("view {i} shows retired buffer {:?}", v.doc()));
+                v.assert_invariants(d.bytes());
+            }
+        }
+        assert!(!self.windows.is_empty(), "no window");
+        assert!(self.focus < self.windows.len(), "focus past the windows");
+        let mut shown = std::collections::HashSet::new();
+        for w in &self.windows {
+            assert!(
+                self.views.get(w.view.0).is_some_and(Option::is_some),
+                "a window shows retired view {:?}",
+                w.view
+            );
+            assert!(shown.insert(w.view), "two windows share view {:?}", w.view);
+        }
+        let mut listed = std::collections::HashSet::new();
+        for id in &self.buffer_order {
+            assert!(
+                self.doc_is_live(*id),
+                "the buffer list holds retired {id:?}"
+            );
+            assert!(listed.insert(*id), "{id:?} is listed twice");
+        }
+        assert_eq!(
+            listed.len(),
+            self.docs.iter().flatten().count(),
+            "a live buffer is not listed"
+        );
+        if let Some(a) = self.alt {
+            assert!(self.doc_is_live(a), "the alternate buffer {a:?} is retired");
+        }
+        assert!(
+            self.pins.is_empty(),
+            "positions left pinned after a command"
+        );
+        for d in self.docs.iter().flatten() {
+            assert!(
+                d.pinned_is_empty(),
+                "{:?} still carries pinned positions",
+                d.id()
+            );
+        }
+    }
+
     /// Whether a `DocumentId` still has a live buffer slot (for tests / retirement assertions).
     #[must_use]
     pub fn doc_is_live(&self, id: DocumentId) -> bool {
-        self.docs
-            .get(Self::doc_slot(id))
-            .is_some_and(Option::is_some)
+        self.document(id).is_some() // id 0 is no buffer (#870), never a slot underflow
+    }
+
+    /// The document of buffer `id`, or `None` for a retired slot. Read-only, so a frontend can observe an
+    /// unfocused buffer (e.g. to journal its unsaved bytes) without focusing it.
+    #[must_use]
+    pub fn document(&self, id: DocumentId) -> Option<&Document> {
+        let slot = (id.0 as usize).checked_sub(1)?;
+        self.docs.get(slot).and_then(Option::as_ref)
+    }
+
+    /// The buffer `id`, mutably, or `None` if it is not live (an undo block or anchor owner that outlived
+    /// a buffer switch).
+    pub fn document_mut(&mut self, id: DocumentId) -> Option<&mut Document> {
+        let slot = (id.0 as usize).checked_sub(1)?;
+        self.docs.get_mut(slot).and_then(Option::as_mut)
     }
 
     /// The `DocumentId` of the buffer the FOCUSED window currently shows.
@@ -941,10 +1095,54 @@ impl Workspace {
     pub fn reload_focused(&mut self, bytes: impl Into<Vec<u8>>) {
         let id = self.focused_buffer();
         let slot = Self::doc_slot(id);
-        let mut doc = Document::new(id, bytes);
+        let last = self.docs[slot]
+            .as_ref()
+            .map_or(crate::pos::Revision::ZERO, Document::revision);
+        let modifiable = self.docs[slot].as_ref().is_none_or(Document::is_modifiable);
+        let mut doc = Document::replacing(id, bytes, last);
         doc.mark_saved();
+        doc.set_modifiable(modifiable);
+        // Every other view of the buffer keeps its place, clamped into the new text (#686, #687).
+        for v in self.views.iter_mut().flatten().filter(|v| v.doc() == id) {
+            let c = crate::motion::snap(doc.bytes(), v.cursor().0);
+            v.set_cursor(BytePos(c));
+            v.snap_offsets(doc.bytes());
+        }
         self.docs[slot] = Some(doc);
-        self.place_focused_cursor(0);
+        self.place_focused_cursor(BytePos(0));
+    }
+
+    /// Re-read buffer `id` from its file's new `bytes` as ONE undoable change (nvim's `'autoread'` reload,
+    /// which `u` takes back while the file is under `'undoreload'`), then mark it saved. Every view of it
+    /// keeps its place, clamped into the new text. `'nomodifiable'` does not stop a reload. Returns whether
+    /// the text changed.
+    pub fn reload_undoable(&mut self, id: DocumentId, bytes: Vec<u8>) -> bool {
+        let Some(doc) = self.document(id) else {
+            return false;
+        };
+        if doc.bytes() == bytes.as_slice() {
+            if let Some(d) = self.document_mut(id) {
+                d.mark_saved();
+            }
+            return false;
+        }
+        let ok = if id == self.focused_buffer() {
+            self.with_focused(|st| st.with_tracked(|d, t| d.reload_tracked(bytes, t)))
+        } else {
+            match self.document_mut(id) {
+                Some(d) => d.reload_tracked(bytes, &mut []),
+                None => false,
+            }
+        };
+        let slot = Self::doc_slot(id);
+        if let Some(doc) = self.docs[slot].as_ref() {
+            for v in self.views.iter_mut().flatten().filter(|v| v.doc() == id) {
+                let c = crate::motion::snap(doc.bytes(), v.cursor().0);
+                v.set_cursor(BytePos(c));
+                v.snap_offsets(doc.bytes());
+            }
+        }
+        ok
     }
 
     /// Add a new buffer over `bytes` with optional display `name`, plus a fresh View onto it (not shown
@@ -952,12 +1150,16 @@ impl Workspace {
     /// brings it into the focused window.
     pub fn add_buffer(&mut self, bytes: impl Into<Vec<u8>>, name: Option<String>) -> DocumentId {
         let id = DocumentId(self.docs.len() as u64 + 1);
+        // Stability §1: a duplicate DocumentId is an invariant violation, not an error.
+        debug_assert!(
+            self.docs.iter().flatten().all(|d| d.id() != id),
+            "duplicate {id:?}"
+        );
         let mut doc = Document::new(id, bytes);
         doc.mark_saved();
         self.docs.push(Some(doc));
         self.names.push(name);
-        self.views.push(Some(View::fresh(id)));
-        self.apply_default_search_case(ViewId(self.views.len() - 1));
+        self.push_view(id);
         self.buffer_order.push(id);
         id
     }
@@ -980,9 +1182,13 @@ impl Workspace {
             }
         });
         reusable.unwrap_or_else(|| {
-            let vid = ViewId(self.views.len());
-            self.views.push(Some(View::fresh(id)));
-            self.apply_default_search_case(vid);
+            // A buffer new to this window keeps the window's display options (nvim's window-local
+            // options stay with the window across `:edit` / `:buffer`).
+            let opts = self.focused().view.window_options().clone();
+            let vid = self.push_view(id);
+            if let Some(v) = self.views[vid.0].as_mut() {
+                v.set_window_options(opts);
+            }
             vid
         })
     }
@@ -1080,9 +1286,7 @@ impl Workspace {
         for i in 0..self.windows.len() {
             let vid = self.windows[i].view;
             if self.views[vid.0].as_ref().map(View::doc) == Some(id) {
-                let nv = ViewId(self.views.len());
-                self.views.push(Some(View::fresh(replacement)));
-                self.apply_default_search_case(nv);
+                let nv = self.push_view(replacement);
                 self.windows[i].view = nv;
             }
         }
@@ -1102,20 +1306,15 @@ impl Workspace {
         true
     }
 
-    /// Set the focused View's indent config (`>>`/`<<`) — the seam a config loader/test uses; mirrors
+    /// Set the indent config (`>>`/`<<`) of the focused View and of every View created afterward (the
+    /// global value, as `:set` writes) — the seam a config loader/test uses; mirrors
     /// [`EditorState::set_indent`]. No new schema key (editor.tab_width / editor.indent_style).
     pub fn set_indent(&mut self, tab_width: usize, indent_style: crate::editor::IndentStyle) {
-        // Round-trip through EditorState so the single set_indent implementation stays authoritative.
+        self.defaults.set_indent(tab_width, indent_style);
         let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let did = view.doc();
-        let slot = Self::doc_slot(did);
-        let doc = self.docs[slot].take().expect("focused doc live");
-        let mut st = EditorState::from_parts(doc, view);
-        st.set_indent(tab_width, indent_style);
-        let (doc, view) = st.into_parts();
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+        if let Some(v) = self.views[vid.0].as_mut() {
+            v.update_options(|o| o.set_indent(tab_width, indent_style));
+        }
     }
 
     /// The 0-based inclusive line range a `=`/`Reindent` motion covers on the focused buffer (its op-span's
@@ -1125,21 +1324,43 @@ impl Workspace {
     pub fn reindent_range(&self, motion: crate::Motion, count: u32) -> Option<(usize, usize)> {
         let pane = self.focused();
         let b = pane.doc.bytes();
-        let (s, e, _) = crate::editor::op_span(b, pane.view.cursor(), motion, count);
+        let (s, e, _) = crate::editor::op_span(b, pane.view.cursor().0, motion, count);
         if s >= e {
             return None;
         }
-        Some((crate::pos::line_of(b, s), crate::pos::line_of(b, e - 1)))
+        Some((
+            crate::pos::raw::line_of(b, s),
+            crate::pos::raw::line_of(b, e - 1),
+        ))
+    }
+
+    /// The 0-based inclusive line range of the focused buffer that the operator span of `cmd` covers (a
+    /// search, `n`/`N`, `*`/`#`, a `gn` match or a mark), or `None` when it has no target. See
+    /// [`EditorState::span_lines`]; the frontend numbers the `!{motion}` filter's `:{range}!` line from it.
+    pub fn span_lines(&mut self, cmd: &crate::Command) -> Option<(usize, usize)> {
+        self.with_focused(|st| st.span_lines(cmd))
+    }
+
+    /// The search pattern `*`/`#` (`whole_word`, `\<word\>`) or `g*`/`g#` (the bare word) builds from the
+    /// keyword under the focused cursor — the same pattern the planner searches for
+    /// [`Command::SearchWordUnder`](crate::Command::SearchWordUnder). `None` when the line has no keyword
+    /// at or after the cursor (E348).
+    #[must_use]
+    pub fn word_search_pattern(&self, whole_word: bool) -> Option<String> {
+        let pane = self.focused();
+        crate::editor::word_search(pane.doc.bytes(), pane.view.cursor().0, whole_word)
+            .map(|(_, p)| p)
     }
 
     /// The keyword under (or forward-on-line from) the focused cursor — the pattern source for Vim `*`/`#`.
-    /// `None` when the current line has no keyword at/after the cursor.
+    /// `None` when the current line has no keyword at/after the cursor. A byte that is not UTF-8 is
+    /// spelled as the regex engine's escape char ([`crate::pattern::spell`]), so the text is a pattern.
     #[must_use]
     pub fn word_under_cursor(&self) -> Option<String> {
         let pane = self.focused();
         let b = pane.doc.bytes();
-        let (s, e) = crate::motion::word_under_cursor(b, pane.view.cursor())?;
-        std::str::from_utf8(&b[s..e]).ok().map(str::to_string)
+        let (s, e) = crate::motion::word_under_cursor(b, pane.view.cursor().0)?;
+        Some(crate::pattern::spell(&b[s..e]).into_owned())
     }
 
     /// The `<cword>` under the focused caret — the keyword (or, failing that, non-blank run) Vim's
@@ -1160,7 +1381,7 @@ impl Workspace {
     fn cword_impl(&self, big: bool) -> Option<String> {
         let pane = self.focused();
         let b = pane.doc.bytes();
-        let (s, e) = crate::motion::cword_under_cursor(b, pane.view.cursor(), big)?;
+        let (s, e) = crate::motion::cword_under_cursor(b, pane.view.cursor().0, big)?;
         std::str::from_utf8(&b[s..e]).ok().map(str::to_string)
     }
 
@@ -1169,26 +1390,30 @@ impl Workspace {
     /// (the engine has no buffer). Returns `None` when there is no such line, or the adjacent line has no
     /// character at that column (a Vim no-op / bell — verified against nvim v0.12.4).
     ///
-    /// Column here is the count of CHARACTERS (Unicode scalar values) before the caret on the current
-    /// line. This equals Vim's display/virtual column for plain single-width, TAB-free text — the cases
-    /// this slice targets and tests. TABs and wide (2-cell) characters are NOT virtual-column-mapped yet,
-    /// so a caret past a TAB (or a wide char on the adjacent line) can diverge from Vim; that refinement
-    /// is deferred (documented caveat).
+    /// The column is the caret's VIRTUAL column, as nvim's `ins_copychar` measures it: the char whose cells
+    /// cover it on the adjacent line (a tab, a wide char, a byte that is not UTF-8's `<ff>`, #1252). A byte
+    /// that is not UTF-8 there is copied as the Latin-1 char of its value, as nvim inserts it (`ÿ` for
+    /// 0xFF). A cluster gives its first char.
     #[must_use]
     pub fn adjacent_line_char(&self, above: bool) -> Option<char> {
         let pane = self.focused();
         let b = pane.doc.bytes();
-        let cur = pane.view.cursor();
-        // Char column of the caret on the current line.
-        let ls = crate::pos::line_start(b, cur);
-        let col = std::str::from_utf8(b.get(ls..cur)?).ok()?.chars().count();
+        let cur = pane.view.cursor().0.min(b.len());
+        let tabw = pane.view.tabs();
+        let vcol = crate::editor::vcols_at(b, cur, tabw).0;
         // The adjacent row. `checked_sub` guards "no line above" on the first line; a row past the last
         // line resolves to an empty slice below, which yields no char (so "no line below" also → None).
-        let row = crate::pos::line_of(b, cur);
+        let row = crate::pos::raw::line_of(b, cur);
         let target = if above { row.checked_sub(1)? } else { row + 1 };
-        let ts = crate::pos::nth_line_start(b, target);
-        let te = crate::pos::line_end(b, ts);
-        std::str::from_utf8(b.get(ts..te)?).ok()?.chars().nth(col)
+        let ts = crate::pos::raw::nth_line_start(b, target);
+        let at = crate::editor::want_col(b, ts, vcol, tabw);
+        if at >= crate::pos::raw::line_end(b, ts) {
+            return None;
+        }
+        match crate::motion::char_len_at(b, at) {
+            Some(w) => std::str::from_utf8(&b[at..at + w]).ok()?.chars().next(),
+            None => Some(char::from(b[at])),
+        }
     }
 
     /// Insert-mode keyword completion source for `i_CTRL-N` / `i_CTRL-P` (F-003, current-buffer only).
@@ -1202,11 +1427,12 @@ impl Workspace {
     pub fn keyword_completion(&self) -> (String, Vec<String>) {
         let pane = self.focused();
         let b = pane.doc.bytes();
-        let cur = pane.view.cursor();
+        let cur = pane.view.cursor().0;
         let (_, base) = crate::motion::keyword_before_cursor(b, cur);
-        let base = base.to_string();
-        let cands = crate::motion::keyword_completions(b, cur, &base);
-        (base, cands)
+        let cands = crate::motion::keyword_completions(b, cur, base);
+        // The base travels spelled like the candidates (a byte that is not UTF-8 as its escape char): its
+        // char count is what the first step deletes (#1252).
+        (crate::pattern::spell(base).into_owned(), cands)
     }
 
     /// Insert-mode WHOLE-LINE completion source for `i_CTRL-X CTRL-L` (F-003, current-buffer only).
@@ -1221,22 +1447,132 @@ impl Workspace {
     pub fn line_completion(&self) -> (String, Vec<String>) {
         let pane = self.focused();
         let b = pane.doc.bytes();
-        let cur = pane.view.cursor();
+        let cur = pane.view.cursor().0;
         crate::motion::line_completions(b, cur)
     }
 
-    /// Set one `:set` option on the focused view (swap-trick, like [`Workspace::set_indent`]).
-    pub fn set_option(&mut self, opt: crate::editor::EditorOption) {
+    /// Run one resolved Ex edit ([`crate::ExCmd`], RFC-0020) against the FOCUSED window: the swap-trick, the
+    /// `"+`/`"*` pull a `:put +` needs (as [`Workspace::put_lines`]), and a `Set` that also writes the
+    /// global value (as [`Workspace::set_option`]). The frontend records the command and runs it here; a
+    /// trace replays it through `apply_command`, which calls the same [`EditorState::apply_ex`].
+    pub fn apply_ex(&mut self, ex: &crate::ExCmd) -> crate::ExOutcome {
+        match ex {
+            crate::ExCmd::Set(opt) => {
+                self.set_option(opt.clone());
+                return crate::ExOutcome::Done;
+            }
+            // `:keepjumps` reaches every view, as [`Workspace::set_keep_jumps`] does.
+            crate::ExCmd::KeepJumps(on) => {
+                self.set_keep_jumps(*on);
+                return crate::ExOutcome::Done;
+            }
+            _ => {}
+        }
         let vid = self.windows[self.focus].view;
-        let view = self.views[vid.0].take().expect("focused view live");
-        let slot = Self::doc_slot(view.doc());
-        let doc = self.docs[slot].take().expect("focused doc live");
-        let mut st = EditorState::from_parts(doc, view);
-        st.set_option(opt);
-        let (doc, view) = st.into_parts();
-        self.docs[slot] = Some(doc);
-        self.views[vid.0] = Some(view);
+        let (out, pulled) = self.with_view(vid, |st, clipboard| {
+            let pulled = match ex {
+                crate::ExCmd::Put { reg, .. }
+                    if crate::register::RegisterStore::is_clipboard(*reg) =>
+                {
+                    pull_clipboard(st, clipboard)
+                }
+                _ => None,
+            };
+            (st.apply_ex(ex), pulled)
+        });
+        self.note_clipboard_read(pulled);
+        self.not_modifiable |= out == crate::ExOutcome::NotModifiable;
+        out
     }
+
+    /// The 1-based inclusive lines `range` names in the FOCUSED window, resolved exactly as the Ex line
+    /// operations resolve it (no range = the cursor's line; both ends clamped into the buffer), so an
+    /// [`crate::ExCmd`] built from them runs on the same lines.
+    #[must_use]
+    pub fn resolve_range(&self, range: SubRange) -> (usize, usize) {
+        let p = self.focused();
+        let cursor_line = p.doc.line_of(p.view.cursor());
+        let (first, last) =
+            crate::editor::resolve_lines(range, crate::editor::line_count(p.doc), cursor_line);
+        (first + 1, last + 1)
+    }
+
+    /// The insert index `addr` names in the FOCUSED window ("after line N", `0..=lines`), as `:m`/`:t`/
+    /// `:put`/`:r` resolve it, or `None` for a relative address off the buffer (the command then does
+    /// nothing).
+    #[must_use]
+    pub fn resolve_addr(&self, addr: LineAddr) -> Option<usize> {
+        let p = self.focused();
+        let b = p.doc.bytes();
+        let nlines = if b.is_empty() {
+            0
+        } else {
+            crate::editor::line_count(p.doc)
+        };
+        addr.insert_index(p.doc.line_of(p.view.cursor()), nlines)
+    }
+
+    /// Set one `:set` option on the focused view and as the global value every View created afterward
+    /// takes (Vim's `:set` writes both the local and the global value, #754).
+    pub fn set_option(&mut self, opt: crate::editor::EditorOption) {
+        self.set_option_in(opt, OptionLevel::Both);
+    }
+
+    /// Set one option at `level` (`:set`, `:setlocal` or `:setglobal`). A local value lives on the
+    /// focused View, the global one on [`Workspace::defaults`], which every View created afterward takes.
+    /// A Vim-global option ([`crate::editor::EditorOption::is_global`]) has one value, so every level
+    /// writes the global value AND every open View.
+    pub fn set_option_in(&mut self, opt: crate::editor::EditorOption, level: OptionLevel) {
+        if opt.is_global() {
+            self.defaults.set(opt.clone());
+            for v in self.views.iter_mut().flatten() {
+                v.update_options(|o| o.set(opt.clone()));
+            }
+            return;
+        }
+        if level != OptionLevel::Local {
+            self.defaults.set(opt.clone());
+        }
+        if level != OptionLevel::Global {
+            let vid = self.windows[self.focus].view;
+            if let Some(v) = self.views[vid.0].as_mut() {
+                v.update_options(|o| o.set(opt));
+            }
+        }
+    }
+
+    /// The GLOBAL values of the options the core reads (the `:setglobal` copy new Views take), in the
+    /// order of [`EditorState::editing_options`]. The focused View's local values are
+    /// `self.focused().view.editing_options()`.
+    #[must_use]
+    pub fn global_editing_options(&self) -> Vec<crate::editor::EditorOption> {
+        self.defaults.editing_options()
+    }
+}
+
+/// Which copy of an option a set writes: Vim's `:set` (both), `:setlocal` or `:setglobal`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OptionLevel {
+    /// `:set` — the focused View's local value and the global value.
+    Both,
+    /// `:setlocal` — the focused View's local value only.
+    Local,
+    /// `:setglobal` — the global value only (what Views created afterward take).
+    Global,
+}
+
+/// Pull the OS clipboard into the `"+`/`"*` mirror slot of `st`, returning the slot's new value when the pull
+/// changed it (what the trace records, RFC-0020 R6), `None` when the provider had nothing or the same bytes.
+fn pull_clipboard(
+    st: &mut EditorState,
+    clipboard: &mut dyn Clipboard,
+) -> Option<crate::register::Register> {
+    let text = clipboard.get()?.into_bytes();
+    if st.registers().clipboard().text() == text.as_slice() {
+        return None;
+    }
+    st.sync_clipboard_in(text);
+    Some(st.registers().clipboard().clone())
 }
 
 #[cfg(test)]
@@ -1357,6 +1693,75 @@ mod tests {
         );
     }
 
+    const PASTE: Command = Command::Paste {
+        after: true,
+        count: 1,
+        move_after: false,
+    };
+
+    /// #944: registers are editor-global (Vim, D-057 slice 2): `yy` in buffer A, then `p` in buffer B
+    /// pastes the line, and `"ayy` in A reaches `"ap` in B.
+    #[test]
+    fn a_yank_in_one_buffer_pastes_in_another() {
+        let mut w = Workspace::new(b"from a\n".to_vec());
+        w.apply(&Command::Yank(1, Mo::Line));
+        w.apply(&Command::SetRegister(Some('a')));
+        w.apply(&Command::Yank(1, Mo::Line));
+        let b = w.add_buffer(b"b\n".to_vec(), Some("b".into()));
+        assert!(w.focus_buffer(b));
+        w.apply(&PASTE);
+        w.apply(&Command::SetRegister(Some('a')));
+        w.apply(&PASTE);
+        assert_eq!(w.focused().doc.bytes(), b"b\nfrom a\nfrom a\n");
+        assert_eq!(w.register_bytes(None), b"from a\n");
+    }
+
+    /// #944: a split shares the one store, so a yank in one pane pastes in the other.
+    #[test]
+    fn a_yank_in_one_split_pastes_in_the_other() {
+        let mut w = Workspace::new(b"one\ntwo\n".to_vec());
+        w.split(SplitDir::Horizontal);
+        w.apply(&Command::Yank(1, Mo::Line));
+        w.focus_next();
+        w.apply(&Command::Move(1, Mo::Down));
+        w.apply(&PASTE);
+        assert_eq!(w.focused().doc.bytes(), b"one\ntwo\none\n");
+        assert_eq!(w.registers().unnamed().text(), b"one\n");
+    }
+
+    /// #1022: `"#p` puts the alternate file name the frontend synced; a write naming a read-only register
+    /// fails and leaves the buffer and registers alone.
+    #[test]
+    fn hash_register_reads_the_alternate_and_read_only_writes_fail() {
+        let mut w = Workspace::new(b"ab\n".to_vec());
+        w.set_alternate_register(Some("other.txt".into()));
+        w.apply(&Command::SetRegister(Some('#')));
+        w.apply(&PASTE);
+        assert_eq!(w.focused().doc.bytes(), b"aother.txtb\n");
+        w.apply(&Command::SetRegister(Some('/')));
+        let effects = w.apply(&Command::Delete(1, Mo::Line));
+        assert!(effects.contains(&Effect::Beep), "\"/dd fails");
+        assert_eq!(w.focused().doc.bytes(), b"aother.txtb\n");
+        assert!(!w.registers().unnamed().is_set());
+        // #1184: refused by its register, which the frontend tells from a failed motion.
+        assert!(effects.contains(&Effect::RegisterRefused));
+        assert!(w.take_beep() && w.take_refused());
+        assert!(!w.take_refused(), "taking clears it");
+        // `"/dfz` with no `z`: the motion fails first, so the operator is never refused.
+        w.apply(&Command::SetRegister(Some('/')));
+        let effects = w.apply(&Command::Delete(
+            1,
+            Mo::FindChar {
+                ch: 'z',
+                forward: true,
+                till: false,
+                repeat: false,
+            },
+        ));
+        assert_eq!(effects, vec![Effect::Beep]);
+        assert!(w.take_beep() && !w.take_refused());
+    }
+
     /// F-007 #1: splitting shows two Views of ONE Document with INDEPENDENT cursors and scroll.
     #[test]
     fn split_gives_two_views_one_buffer_independent_cursors() {
@@ -1380,11 +1785,11 @@ mod tests {
 
         // Move the cursor in the focused (new) pane; the other pane's cursor is untouched.
         w.focus = 0;
-        let before = w.pane(1).view.cursor();
+        let before = w.pane(1).view.cursor().0;
         w.apply(&Command::Move(1, Motion::Down));
-        assert_ne!(w.pane(0).view.cursor(), before, "focused cursor moved");
+        assert_ne!(w.pane(0).view.cursor().0, before, "focused cursor moved");
         assert_eq!(
-            w.pane(1).view.cursor(),
+            w.pane(1).view.cursor().0,
             before,
             "the other view's cursor is independent"
         );
@@ -1497,8 +1902,9 @@ mod tests {
         let mut w = Workspace::new(b"foo\nbar\nbaz\n".to_vec());
         assert_eq!(w.join_lines(SubRange::CurrentLine, false), 2);
         assert_eq!(w.focused().doc.bytes(), b"foo bar\nbaz\n");
-        // The cursor rests on the join seam (the inserted space), exactly like normal `J`.
-        assert_eq!(w.focused().view.cursor(), 3);
+        // Unlike normal `J` (cursor on the join seam), `:j` leaves the cursor on the joined line's first
+        // non-blank (`ex_join` → `beginline`; re-probed on nvim v0.12.6, parity `ex_join_cursor_first_non_blank`).
+        assert_eq!(w.focused().view.cursor().0, 0);
         // One undo restores both lines (single group).
         w.apply(&Command::Undo);
         assert_eq!(w.focused().doc.bytes(), b"foo\nbar\nbaz\n");
@@ -1546,7 +1952,11 @@ mod tests {
         w.set_option(EditorOption::ShiftWidth(2));
         assert_eq!(w.shift_lines(SubRange::CurrentLine, false, 1), 1);
         assert_eq!(w.focused().doc.bytes(), b"  aa\nbb\ncc\ndd\nee\n");
-        assert_eq!(w.focused().view.cursor(), 2, "first non-blank of the line");
+        assert_eq!(
+            w.focused().view.cursor().0,
+            2,
+            "first non-blank of the line"
+        );
         // One undo restores it (single group).
         w.apply(&Command::Undo);
         assert_eq!(w.focused().doc.bytes(), b"aa\nbb\ncc\ndd\nee\n");
@@ -1558,7 +1968,7 @@ mod tests {
         assert_eq!(w.shift_lines(SubRange::Lines(2, 4), false, 1), 3);
         assert_eq!(w.focused().doc.bytes(), b"aa\n  bb\n  cc\n  dd\nee\n");
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             15,
             "first non-blank of the last line"
         );
@@ -1568,7 +1978,7 @@ mod tests {
         w.set_option(EditorOption::ShiftWidth(2));
         assert_eq!(w.shift_lines(SubRange::CurrentLine, false, 3), 1);
         assert_eq!(w.focused().doc.bytes(), b"      aa\nbb\ncc\ndd\nee\n");
-        assert_eq!(w.focused().view.cursor(), 6);
+        assert_eq!(w.focused().view.cursor().0, 6);
         // A single undo reverses all three levels — the levels merge into one group.
         w.apply(&Command::Undo);
         assert_eq!(
@@ -1583,7 +1993,7 @@ mod tests {
         assert_eq!(w.shift_lines(SubRange::Lines(1, 2), true, 1), 2);
         assert_eq!(w.focused().doc.bytes(), b"  aa\n  bb\ncc\n");
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             7,
             "line 2 '  bb' first non-blank"
         );
@@ -1643,6 +2053,18 @@ mod tests {
         assert_eq!(w.move_lines(SubRange::CurrentLine, LineAddr::Last), Some(1));
         assert_eq!(w.focused().doc.bytes(), b"b\nc\na\n");
 
+        // The moved lines take their marks along; the lines they pass shift (nvim `ex_copymove`, #1125).
+        let mut w = Workspace::new(b"a\nbxy\nc\nd\n".to_vec());
+        w.set_mark_on_line(SubRange::Lines(2, 2), 'a');
+        w.set_mark_on_line(SubRange::Lines(3, 3), 'c');
+        assert_eq!(
+            w.move_lines(SubRange::Lines(2, 2), LineAddr::Line(3)),
+            Some(1)
+        );
+        assert_eq!(w.focused().doc.bytes(), b"a\nc\nbxy\nd\n");
+        assert_eq!(w.focused().view.named_mark('a'), Some(BytePos(4)));
+        assert_eq!(w.focused().view.named_mark('c'), Some(BytePos(2)));
+
         // Destination inside the source → declined (Vim E134).
         let mut w = Workspace::new(b"a\nb\nc\nd\n".to_vec());
         assert_eq!(w.move_lines(SubRange::Lines(2, 3), LineAddr::Line(2)), None);
@@ -1700,10 +2122,38 @@ mod tests {
         assert_eq!(w.focused().doc.bytes(), "{\n\n    x\n".as_bytes());
     }
 
-    /// `=` reindents lines to their bracket depth (net unclosed `([{` × shiftwidth; closer-first lines
-    /// dedent; blank lines stay empty), as one undo group.
+    /// `SetIndentCols` (#1205) sets indents in columns and keeps a line for `None`; in Insert mode it
+    /// re-indents the caret's line and the caret stays on its text (#1206).
     #[test]
-    fn reindent_by_bracket_depth() {
+    fn set_indent_cols_sets_columns_or_keeps() {
+        let mut w = Workspace::new("a\n  b\n c\n".as_bytes().to_vec());
+        w.apply(&Command::SetIndentCols {
+            first_line: 0,
+            last_line: 2,
+            cols: vec![Some(3), None, Some(0)],
+        });
+        assert_eq!(w.focused().doc.bytes(), "   a\n  b\nc\n".as_bytes());
+        w.apply(&Command::Undo);
+        assert_eq!(w.focused().doc.bytes(), "a\n  b\n c\n".as_bytes());
+
+        // Insert mode: `    else` with the caret after it dedents and the caret follows the text.
+        let mut w = Workspace::new("if a:\n    x\n    else\n".as_bytes().to_vec());
+        w.apply(&Command::Move(2, Motion::Down));
+        w.apply(&Command::AppendLineEnd);
+        w.apply(&Command::SetIndentCols {
+            first_line: 2,
+            last_line: 2,
+            cols: vec![Some(0)],
+        });
+        assert_eq!(w.focused().doc.bytes(), "if a:\n    x\nelse\n".as_bytes());
+        assert_eq!(w.focused().view.cursor().0, 16);
+        assert_eq!(w.focused().view.mode(), crate::Mode::Insert);
+    }
+
+    /// `=` reindents lines by the C rules (nvim's `get_c_indent`, #1163: an unclosed `(` takes cino-`(`,
+    /// two shiftwidths; blank lines stay empty), as one undo group. nvim gives the same columns.
+    #[test]
+    fn reindent_by_the_c_rules() {
         let src = "fn main() {\nlet x = foo(\n1,\n2,\n);\n}\n";
         let mut w = Workspace::new(src.as_bytes().to_vec());
         // Default config: shiftwidth 4, spaces. `=G` reindents the whole buffer.
@@ -1711,7 +2161,8 @@ mod tests {
             count: 1,
             motion: Motion::LastLine,
         });
-        let expected = "fn main() {\n    let x = foo(\n        1,\n        2,\n    );\n}\n";
+        let expected =
+            "fn main() {\n    let x = foo(\n            1,\n            2,\n            );\n}\n";
         assert_eq!(w.focused().doc.bytes(), expected.as_bytes());
 
         // One undo restores the original in a single step.
@@ -1793,7 +2244,7 @@ mod tests {
 
         // On whitespace → the next keyword forward on the line.
         let mut w = Workspace::new(b"foo bar\n".to_vec());
-        w.place_focused_cursor(3); // the space
+        w.place_focused_cursor(BytePos(3)); // the space
         assert_eq!(w.word_under_cursor().as_deref(), Some("bar"));
 
         // No keyword on the line → None.
@@ -1806,7 +2257,7 @@ mod tests {
         let mut w = Workspace::new(b"foo foobar foo\n".to_vec());
         w.apply(&Command::SearchNext("\\<foo\\>".to_string()));
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             11,
             "whole-word search skips foobar"
         );
@@ -1844,7 +2295,7 @@ mod tests {
         ];
         for (line, cur, cword, cbig) in cases {
             let mut w = Workspace::new(line.to_vec());
-            w.place_focused_cursor(*cur);
+            w.place_focused_cursor(BytePos(*cur));
             assert_eq!(
                 w.cword_under_cursor().as_deref(),
                 *cword,
@@ -1868,35 +2319,35 @@ mod tests {
         // Base "fo" on a fresh last line: forward scan finds nothing, wraps from the top; the two "foo"
         // occurrences dedupe. (nvim: match set = foo, food, foobar.)
         let mut w = Workspace::new(b"foo food\nfoobar\nfoo\nfo".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len()); // end of the "fo" line
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len())); // end of the "fo" line
         let (base, cands) = w.keyword_completion();
         assert_eq!(base, "fo");
         assert_eq!(cands, vec!["foo", "food", "foobar"]);
 
         // Mid-buffer caret: forward to end, then wrap from the top; the caret's own "aa" is excluded.
         let mut w = Workspace::new(b"aa1 aa2\naa3\naa\naa4 aa5\naa6".to_vec());
-        w.place_focused_cursor(14); // end of the bare "aa" on line 3
+        w.place_focused_cursor(BytePos(14)); // end of the bare "aa" on line 3
         let (base, cands) = w.keyword_completion();
         assert_eq!(base, "aa");
         assert_eq!(cands, vec!["aa4", "aa5", "aa6", "aa1", "aa2", "aa3"]);
 
         // Exact match is a candidate distinct from the original text.
         let mut w = Workspace::new(b"foo foobar\nfoo".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len());
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len()));
         let (base, cands) = w.keyword_completion();
         assert_eq!(base, "foo");
         assert_eq!(cands, vec!["foo", "foobar"]);
 
         // No match → empty candidate list (a Vim no-op / bell).
         let mut w = Workspace::new(b"foo bar\nzz".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len());
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len()));
         let (base, cands) = w.keyword_completion();
         assert_eq!(base, "zz");
         assert!(cands.is_empty());
 
         // Empty base (caret after a non-word char) matches every keyword, none excluded.
         let mut w = Workspace::new(b"foo bar\n(".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len()); // just after '('
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len())); // just after '('
         let (base, cands) = w.keyword_completion();
         assert_eq!(base, "");
         assert_eq!(cands, vec!["foo", "bar"]);
@@ -1904,41 +2355,64 @@ mod tests {
 
     /// `line_completion` backs `i_CTRL-X CTRL-L`: the post-indent prefix before the caret plus the other
     /// buffer lines' post-indent content that start with it, in Vim's backward-from-caret-with-wrap order,
+    /// #1252: a line or keyword holding a byte that is not UTF-8 is a candidate, spelled (nvim 0.12.6
+    /// offers `x<ff>y` to `x` `CTRL-X CTRL-L`); `CTRL-Y`/`CTRL-E` read the char at the caret's virtual
+    /// column and give such a byte as its Latin-1 char, which nvim inserts as UTF-8.
+    #[test]
+    fn completion_and_copy_char_keep_an_invalid_byte() {
+        let spelled = |b: &[u8]| crate::pattern::spell(b).into_owned();
+        let mut w = Workspace::new(b"x\xffy\nxyz\nx".to_vec());
+        w.place_focused_cursor(BytePos(9));
+        assert_eq!(
+            w.line_completion(),
+            ("x".to_string(), vec!["xyz".to_string(), spelled(b"x\xffy")])
+        );
+        let mut w = Workspace::new(b"\xffabcdef\nx\n\tabc\nx\n\xe4\xb8\xadab\nx\n".to_vec());
+        // `x` then the caret at virtual column 1: inside `<ff>` (cells 0-3), the tab, the wide char.
+        for (at, want) in [(9, '\u{ff}'), (16, '\t'), (24, '中')] {
+            w.place_focused_cursor(BytePos(at));
+            assert_eq!(w.adjacent_line_char(true), Some(want), "caret at {at}");
+        }
+        let mut w = Workspace::new(b"\nab\xffcd\n".to_vec());
+        w.place_focused_cursor(BytePos(0));
+        assert_eq!(w.adjacent_line_char(false), Some('a'));
+    }
+
     /// deduped by content (indent ignored). Cases captured from nvim v0.12.4.
     #[test]
     fn line_completion_base_and_candidates() {
         // Prefix "foobar" on a fresh last line: backward scan (the two identical "foobar baz" dedupe).
         let mut w =
             Workspace::new(b"foobar baz\nfoobar qux\nfoobar baz\nhello world\nfoobar".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len());
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len()));
         let (base, cands) = w.line_completion();
         assert_eq!(base, "foobar");
         assert_eq!(cands, vec!["foobar baz", "foobar qux"]);
 
         // Mid-buffer caret: backward to the top, then wrap from the bottom upward; the caret line excluded.
         let mut w = Workspace::new(b"foo A\nfoo B\nfoo\nfoo C\nfoo D".to_vec());
-        w.place_focused_cursor(15); // end of the bare "foo" on line 3 (0-based row 2)
+        w.place_focused_cursor(BytePos(15)); // end of the bare "foo" on line 3 (0-based row 2)
         let (base, cands) = w.line_completion();
         assert_eq!(base, "foo");
         assert_eq!(cands, vec!["foo B", "foo A", "foo D", "foo C"]);
 
         // Indent is ignored for matching and dedup: "foo bar" and "    foo bar" collapse to one candidate.
         let mut w = Workspace::new(b"foo bar\n    foo bar\nfoo baz\nfoo".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len());
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len()));
         let (base, cands) = w.line_completion();
         assert_eq!(base, "foo");
         assert_eq!(cands, vec!["foo baz", "foo bar"]);
 
         // The prefix's own indent is stripped from `base` (its length is what the completion deletes).
         let mut w = Workspace::new(b"    indented alpha\nplain beta\n  in".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len());
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len()));
         let (base, cands) = w.line_completion();
         assert_eq!(base, "in");
         assert_eq!(cands, vec!["indented alpha"]);
 
         // No matching line → empty candidate list (a Vim no-op / bell).
         let mut w = Workspace::new(b"foo bar\nbaz\nzz".to_vec());
-        w.place_focused_cursor(w.focused().doc.bytes().len());
+        w.place_focused_cursor(BytePos(w.focused().doc.bytes().len()));
         let (base, cands) = w.line_completion();
         assert_eq!(base, "zz");
         assert!(cands.is_empty());
@@ -1953,15 +2427,15 @@ mod tests {
         assert_eq!(w.adjacent_line_char(false), Some('w'));
         assert_eq!(w.adjacent_line_char(true), None);
         // Caret at col 2 of line 1 ('l'): below 'world' at col 2 = 'r'.
-        w.place_focused_cursor(2);
+        w.place_focused_cursor(BytePos(2));
         assert_eq!(w.adjacent_line_char(false), Some('r'));
         // Caret on line 2, col 0: above 'hello' col 0 = 'h', below = None (no line below).
-        w.place_focused_cursor(6);
+        w.place_focused_cursor(BytePos(6));
         assert_eq!(w.adjacent_line_char(true), Some('h'));
         assert_eq!(w.adjacent_line_char(false), None);
         // Column past the end of the adjacent (shorter) line → None.
         let mut w = Workspace::new(b"hello\nab\n".to_vec());
-        w.place_focused_cursor(4); // col 4 of "hello"; "ab" has no col 4
+        w.place_focused_cursor(BytePos(4)); // col 4 of "hello"; "ab" has no col 4
         assert_eq!(w.adjacent_line_char(false), None);
     }
 
@@ -1985,44 +2459,44 @@ mod tests {
             .0;
 
         let mut w = Workspace::new(src.clone());
-        w.place_focused_cursor(last_foo);
+        w.place_focused_cursor(BytePos(last_foo));
         // Mirror the frontend rewrite (session.rs): keyword under cursor → whole-word first-match jump.
         let word = w.word_under_cursor().expect("on a keyword");
         assert_eq!(word, "foo");
         w.apply(&Command::GotoFirstMatch(format!("\\<{word}\\>")));
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             decl,
             "gd/gD lands on the first whole-word match from the top of the file"
         );
         // It was a JUMP: the leaving position (last `foo`) is on the jumplist and `CTRL-O` returns there.
         assert!(
-            w.jumps_snapshot().contains(&last_foo),
+            w.jumps_snapshot().contains(&BytePos(last_foo)),
             "the jump records the position it left"
         );
         w.apply(&Command::GotoOlderJump); // CTRL-O
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             last_foo,
             "CTRL-O returns to where gd/gD jumped from"
         );
 
         // No match → the cursor stays put (Vim rings the bell).
         let mut w = Workspace::new(src);
-        w.place_focused_cursor(last_foo);
+        w.place_focused_cursor(BytePos(last_foo));
         w.apply(&Command::GotoFirstMatch("\\<nope\\>".to_string()));
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             last_foo,
             "no match leaves the cursor put"
         );
 
         // The whole-word pattern skips substrings: `foobar` is not a match for `\<foo\>`.
         let mut w = Workspace::new(b"foobar\nfoo\n".to_vec());
-        w.place_focused_cursor(7); // on the standalone `foo` (line 2)
+        w.place_focused_cursor(BytePos(7)); // on the standalone `foo` (line 2)
         w.apply(&Command::GotoFirstMatch("\\<foo\\>".to_string()));
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             7,
             "the first WHOLE-word match is the standalone foo, not the foobar substring"
         );
@@ -2060,6 +2534,85 @@ mod tests {
             !w.focused().doc.is_modified(),
             "the reloaded buffer is clean"
         );
+    }
+
+    /// #687: a reload continues the buffer's revisions (never `Revision(0)` again under one id), and the
+    /// other views of the buffer are clamped into the new text.
+    #[test]
+    fn reload_continues_the_revision_and_clamps_other_views() {
+        let mut w = Workspace::new("a한글 x\n".as_bytes().to_vec());
+        w.split(SplitDir::Horizontal);
+        w.apply(&Command::Move(1, Motion::LineEnd));
+        let before = w.focused().doc.revision();
+        w.apply(&Command::EnterInsert);
+        w.apply(&Command::InsertChar('y'));
+        let edited = w.focused().doc.revision();
+        assert!(edited > before);
+        w.focus_next();
+        w.reload_focused(b"ab".to_vec());
+        assert!(w.focused().doc.revision() > edited, "revisions continue");
+        for i in 0..2 {
+            assert!(w.pane(i).view.cursor().0 <= 2, "pane {i} clamped");
+        }
+    }
+
+    /// #686: an edit through one window moves the other window's cursor and marks with their lines, as
+    /// nvim's `mark_adjust` does. nvim: `:split`, `jj`, `CTRL-W w`, `O999<Esc>`, `CTRL-W w`, `x` leaves
+    /// `999 11 22 3`.
+    #[test]
+    fn an_edit_in_one_window_moves_the_other_windows_cursor_and_marks() {
+        let mut w = Workspace::new(b"11\n22\n33\n".to_vec());
+        w.split(SplitDir::Horizontal);
+        w.apply(&Command::Move(2, Motion::Down));
+        w.apply(&Command::SetNamedMark('a'));
+        w.focus_next();
+        w.apply(&Command::OpenAbove);
+        for c in "999".chars() {
+            w.apply(&Command::InsertChar(c));
+        }
+        w.apply(&Command::EnterNormal);
+        w.focus_next();
+        assert_eq!(
+            w.focused().view.named_mark('a'),
+            Some(BytePos(10)),
+            "the mark followed its line"
+        );
+        w.apply(&Command::DeleteUnder(1));
+        assert_eq!(w.focused().doc.bytes(), b"999\n11\n22\n3\n");
+    }
+
+    /// `:setlocal` writes the focused View, `:setglobal` the copy new Views take, `:set` both; a
+    /// Vim-global option reaches every open View at any level (#614).
+    #[test]
+    fn set_option_levels() {
+        use crate::editor::EditorOption;
+        let ts = |opts: Vec<EditorOption>| {
+            opts.into_iter()
+                .find_map(|o| match o {
+                    EditorOption::TabStop(n) => Some(n),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let mut w = ws();
+        w.set_option_in(EditorOption::TabStop(3), OptionLevel::Local);
+        assert_eq!(ts(w.focused().view.editing_options()), 3);
+        assert_eq!(ts(w.global_editing_options()), 4);
+        w.set_option_in(EditorOption::TabStop(6), OptionLevel::Global);
+        assert_eq!(ts(w.focused().view.editing_options()), 3);
+        assert_eq!(ts(w.global_editing_options()), 6);
+        let id = w.add_buffer(b"x".to_vec(), None);
+        w.focus_buffer(id);
+        assert_eq!(ts(w.focused().view.editing_options()), 6);
+        // `ignorecase` is global: a `:setlocal` in one window reaches the other.
+        w.split(SplitDir::Horizontal);
+        w.set_option_in(EditorOption::IgnoreCase(true), OptionLevel::Local);
+        w.focus_next();
+        assert!(w
+            .focused()
+            .view
+            .editing_options()
+            .contains(&EditorOption::IgnoreCase(true)));
     }
 
     /// `:set ignorecase` flips the focused view's search case, observable through `:s` matching.
@@ -2112,6 +2665,68 @@ mod tests {
         assert_eq!(w.focused().doc.bytes(), b"baz Z\n");
     }
 
+    /// The workspace origin reaches every transaction a command makes, `U` included, so a macro replay's
+    /// edits are recorded as `Macro` (INV-ORIGIN, #880).
+    #[test]
+    fn commands_record_the_workspace_origin() {
+        let mut w = Workspace::new(b"ab\ncd\n".to_vec());
+        w.apply(&Command::Delete(1, Motion::Right));
+        w.focused_doc_mut().sync_undo();
+        w.set_origin(TransactionOrigin::Macro);
+        w.apply(&Command::Delete(1, Motion::Right));
+        w.focused_doc_mut().sync_undo();
+        w.apply(&Command::LineUndo);
+        w.set_origin(TransactionOrigin::UserInput);
+        w.apply(&Command::Delete(1, Motion::Right));
+        let origins: Vec<_> = w
+            .focused()
+            .doc
+            .history()
+            .creation_order()
+            .into_iter()
+            .filter_map(|(_, o, _)| o)
+            .collect();
+        assert_eq!(
+            origins,
+            [
+                TransactionOrigin::UserInput,
+                TransactionOrigin::Macro,
+                TransactionOrigin::Macro,
+                TransactionOrigin::UserInput,
+            ]
+        );
+    }
+
+    /// The caret gravity, the indent config and every `:set` reach buffers created afterward (Vim copies the
+    /// global option values into a new buffer; nvim 0.12.6 `:set ts=2 sw=3 noet tw=50 ic | enew` keeps all
+    /// five), including `:bd`'s replacement scratch (#754).
+    #[test]
+    fn options_and_caret_gravity_propagate_to_new_buffers() {
+        use crate::editor::{EditorOption, IndentStyle};
+        let mut w = Workspace::new(b"ab\n".to_vec());
+        w.set_caret_gravity(CaretGravity::BetweenChar);
+        w.set_indent(2, IndentStyle::Space);
+        w.set_option(EditorOption::ShiftWidth(3));
+        let b2 = w.add_buffer(b"cd\n".to_vec(), None);
+        w.focus_buffer(b2);
+        let v = w.focused().view;
+        assert_eq!(v.caret_gravity(), CaretGravity::BetweenChar);
+        assert_eq!((v.tab_width(), v.shift_width()), (2, 3));
+        // A `:set` in one buffer sets the global value but leaves the other buffer's local value alone.
+        w.set_option(EditorOption::TabStop(5));
+        let b1 = w.buffers()[0].id;
+        w.focus_buffer(b1);
+        assert_eq!(
+            w.focused().view.tab_width(),
+            2,
+            "b1 keeps its local tabstop"
+        );
+        assert!(w.remove_buffer(b1) && w.remove_buffer(b2));
+        let v = w.focused().view;
+        assert_eq!(v.caret_gravity(), CaretGravity::BetweenChar, "the scratch");
+        assert_eq!((v.tab_width(), v.shift_width()), (5, 3));
+    }
+
     /// `:bd` retires a buffer and repoints the window to the alternate; deleting the last buffer opens a
     /// fresh scratch (never zero buffers); a non-live id is a no-op.
     #[test]
@@ -2141,39 +2756,134 @@ mod tests {
     #[test]
     fn sort_lines_variants() {
         use crate::SortOptions;
-        let opts = |reverse, numeric, unique| SortOptions {
+        let opts = |reverse, numeric: bool, unique| SortOptions {
             reverse,
-            numeric,
+            key: if numeric {
+                crate::SortKind::Decimal
+            } else {
+                crate::SortKind::Text
+            },
             unique,
             ..SortOptions::default()
         };
         let mut w = Workspace::new(b"banana\napple\ncherry\n".to_vec());
-        w.sort_lines(SubRange::WholeFile, &opts(false, false, false));
+        w.sort_lines(SubRange::WholeFile, &opts(false, false, false))
+            .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"apple\nbanana\ncherry\n");
 
         // numeric: 10 sorts after 2, not lexicographically before it.
         let mut w = Workspace::new(b"10\n2\n1\n".to_vec());
-        w.sort_lines(SubRange::WholeFile, &opts(false, true, false));
+        w.sort_lines(SubRange::WholeFile, &opts(false, true, false))
+            .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"1\n2\n10\n");
 
         // reverse (descending).
         let mut w = Workspace::new(b"a\nb\nc\n".to_vec());
-        w.sort_lines(SubRange::WholeFile, &opts(true, false, false));
+        w.sort_lines(SubRange::WholeFile, &opts(true, false, false))
+            .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"c\nb\na\n");
 
         // unique drops duplicate lines after sorting.
         let mut w = Workspace::new(b"b\na\nb\na\n".to_vec());
         assert_eq!(
             w.sort_lines(SubRange::WholeFile, &opts(false, false, true)),
-            2,
+            Ok(2),
             "2 dupes removed"
         );
         assert_eq!(w.focused().doc.bytes(), b"a\nb\n");
 
         // A range limits the sort to those lines; the rest stays put.
         let mut w = Workspace::new(b"z\n3\n1\n2\n".to_vec());
-        w.sort_lines(SubRange::Lines(2, 4), &opts(false, true, false));
+        w.sort_lines(SubRange::Lines(2, 4), &opts(false, true, false))
+            .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"z\n1\n2\n3\n");
+    }
+
+    /// #719 (nvim v0.12.6): a key with no number sorts before every number, a number too large saturates,
+    /// `u` compares whole lines in the output order (after `!`), and a bad pattern leaves the text alone.
+    #[test]
+    fn sort_lines_numeric_keys_unique_and_bad_patterns() {
+        use crate::SortOptions;
+        let sorted = |text: &str, opts: SortOptions| {
+            let mut w = Workspace::new(text.as_bytes().to_vec());
+            w.sort_lines(SubRange::WholeFile, &opts).unwrap();
+            String::from_utf8(w.focused().doc.bytes().to_vec()).unwrap()
+        };
+        let numeric = SortOptions {
+            key: crate::SortKind::Decimal,
+            ..SortOptions::default()
+        };
+        assert_eq!(sorted("b\n-5\na\n3\n", numeric.clone()), "b\na\n-5\n3\n");
+        assert_eq!(
+            sorted(
+                "99999999999999999999\n5\n-99999999999999999999\n",
+                numeric.clone()
+            ),
+            "-99999999999999999999\n5\n99999999999999999999\n"
+        );
+        let numeric_unique = SortOptions {
+            unique: true,
+            ..numeric
+        };
+        assert_eq!(sorted("1\n01\n2\n", numeric_unique), "1\n01\n2\n");
+        let ic_unique = SortOptions {
+            ignore_case: true,
+            unique: true,
+            ..SortOptions::default()
+        };
+        assert_eq!(sorted("a\nA\nb\n", ic_unique.clone()), "a\nb\n");
+        let reversed = SortOptions {
+            reverse: true,
+            ..ic_unique
+        };
+        assert_eq!(sorted("a\nA\nb\n", reversed), "b\nA\n");
+
+        let mut w = Workspace::new(b"b\na\n".to_vec());
+        let bad = SortOptions {
+            pattern: Some("\\(".into()),
+            ..SortOptions::default()
+        };
+        assert!(w.sort_lines(SubRange::WholeFile, &bad).is_err());
+        assert_eq!(w.focused().doc.bytes(), b"b\na\n");
+    }
+
+    /// #1104: `:sort x`/`o`/`b`/`f`/`l` key extraction, checked against nvim v0.12.6.
+    #[test]
+    fn sort_lines_number_formats_and_locale() {
+        use crate::{SortKind, SortOptions};
+        let sorted = |text: &str, key: SortKind| {
+            let mut w = Workspace::new(text.as_bytes().to_vec());
+            let opts = SortOptions {
+                key,
+                ..SortOptions::default()
+            };
+            w.sort_lines(SubRange::WholeFile, &opts).unwrap();
+            String::from_utf8(w.focused().doc.bytes().to_vec()).unwrap()
+        };
+        assert_eq!(
+            sorted("x0x1F\nb\n0x0a\n-0x3\n0xff\nzz\n", SortKind::Hex),
+            "zz\n-0x3\n0x0a\nb\nx0x1F\n0xff\n"
+        );
+        assert_eq!(
+            sorted("0b101\n0b11\nb\n-0b1\n10\n", SortKind::Binary),
+            "b\n-0b1\n10\n0b11\n0b101\n"
+        );
+        assert_eq!(
+            sorted("017\n8\n07\na\n-01\n9\n", SortKind::Octal),
+            "a\n-01\n8\n9\n07\n017\n"
+        );
+        assert_eq!(
+            sorted("1.5\na\n-2e1\n0.3\nb\n1e-1\n3\n", SortKind::Float),
+            "-2e1\na\nb\n1e-1\n0.3\n1.5\n3\n"
+        );
+        assert_eq!(
+            sorted(
+                "x\n1.5e\ninf\n-inf\n2\n \n0x1p2\n0x.8\n+ 3\n",
+                SortKind::Float
+            ),
+            "-inf\n \nx\n0x.8\n1.5e\n2\n+ 3\n0x1p2\ninf\n"
+        );
+        assert_eq!(sorted("B\na\nb\nA\n", SortKind::Locale), "a\nA\nb\nB\n");
     }
 
     #[test]
@@ -2187,7 +2897,8 @@ mod tests {
                 ignore_case: true,
                 ..SortOptions::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"apple\nBanana\ncherry\n");
 
         // `/pattern/` — sort on the text AFTER the match (here, after the leading `id=` tag).
@@ -2198,7 +2909,8 @@ mod tests {
                 pattern: Some("id=".into()),
                 ..SortOptions::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"id=alice\nid=bob\nid=charlie\n");
 
         // `/pattern/` + `r` — sort on the MATCHED text itself (the number), numerically.
@@ -2208,10 +2920,11 @@ mod tests {
             &SortOptions {
                 pattern: Some("\\d\\+".into()),
                 use_match: true,
-                numeric: true,
+                key: crate::SortKind::Decimal,
                 ..SortOptions::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"c9\na99\nb100\n");
     }
 
@@ -2255,7 +2968,7 @@ mod tests {
         w.substitute(SubRange::CurrentLine, "x", "y", SubFlags::default())
             .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"y x\nx x\n", "first x on line 1");
-        w.place_focused_cursor(4); // start of line 2
+        w.place_focused_cursor(BytePos(4)); // start of line 2
         w.substitute(SubRange::CurrentLine, "x", "y", SubFlags::default())
             .unwrap();
         assert_eq!(w.focused().doc.bytes(), b"y x\ny x\n", "repeat on line 2");
@@ -2267,7 +2980,7 @@ mod tests {
     fn substitute_count_reports_without_editing_or_undo() {
         let src = b"foo bar foo\nfoo baz\nno match here\nfoo foo foo\n";
         let mut w = Workspace::new(src.to_vec());
-        w.place_focused_cursor(2); // anywhere — count must not move the cursor
+        w.place_focused_cursor(BytePos(2)); // anywhere — count must not move the cursor
         let global = SubFlags {
             global: true,
             ignore_case: None,
@@ -2287,7 +3000,7 @@ mod tests {
             "count-only must not edit the buffer"
         );
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             2,
             "count-only must not move the cursor"
         );
@@ -2341,7 +3054,7 @@ mod tests {
     fn marks_snapshot_lists_named_then_dot_and_caret() {
         let mut w = Workspace::new(b"abc\ndef\n".to_vec());
         assert!(w.marks_snapshot().is_empty(), "nothing set yet");
-        w.place_focused_cursor(5);
+        w.place_focused_cursor(BytePos(5));
         w.apply(&Command::SetNamedMark('a'));
         w.apply(&Command::DeleteUnder(1)); // sets the `.` last-change mark
         let snap = w.marks_snapshot();
@@ -2471,16 +3184,16 @@ mod tests {
 
         // Move the cursor in buffer A, then switch to B — B starts at its own cursor (0).
         w.apply(&Command::Move(1, Motion::Down));
-        let a_cursor = w.focused().view.cursor();
+        let a_cursor = w.focused().view.cursor().0;
         assert!(a_cursor > 0);
         assert!(w.focus_buffer(b), "switch to a live buffer succeeds");
         assert_eq!(w.focused_buffer(), b);
-        assert_eq!(w.focused().view.cursor(), 0, "B has its own cursor");
+        assert_eq!(w.focused().view.cursor().0, 0, "B has its own cursor");
 
         // Back to A — its cursor is preserved (the hidden view survived).
         assert!(w.focus_buffer(a));
         assert_eq!(
-            w.focused().view.cursor(),
+            w.focused().view.cursor().0,
             a_cursor,
             "A's cursor is restored on return"
         );

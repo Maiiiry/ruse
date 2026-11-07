@@ -1,8 +1,9 @@
 //! Full-stack keystroke FUZZER (testing-and-benchmarks.md §1.2 property + §1.9 e2e): the layer the
 //! micro suites miss. The oracle corpus checks short single ops; the core property tests fuzz `Command`
 //! streams; the input-engine property test fuzzes random (key, mode) pairs. NONE of them drive the
-//! COMPOSED stack — keystroke -> real input engine (mode following the REAL editor state, as
-//! `main.rs::run` does) -> Command -> edit -> undo — over a long realistic session, which is exactly
+//! COMPOSED stack — keystroke -> the session's real key path (`Session::on_key` through the headless
+//! harness, #895: macro layer, intercepts, input engine, Ex dispatch) -> Command -> edit -> undo — over a
+//! long realistic session, which is exactly
 //! where a modal editor's state-interaction bugs live (mode transitions × operators × counts × registers
 //! × dot-repeat × undo grouping). A failure here is a real defect; proptest shrinks to a minimal repro.
 //!
@@ -18,8 +19,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use proptest::prelude::*;
-use ruse_core::{apply_command, Command, EditorState};
-use ruse_tui::input::{Feed, InputEngine};
+use ruse_core::{Command, Workspace};
+use ruse_tui::headless::Headless;
 
 /// A realistic Vim keystroke alphabet: motions, operators, mode switches, edits, counts, find/search,
 /// registers, dot-repeat, and the multi-key control prefixes. Uniform selection over this set builds
@@ -29,16 +30,23 @@ use ruse_tui::input::{Feed, InputEngine};
 fn alphabet(include_history_ops: bool) -> Vec<KeyEvent> {
     let mut v = Vec::new();
     // Motions h j k l w b e W B E 0 $ ^ g G; modes i a o O v V R; edits x X p P J ~ D C Y s; operators
-    // d c y; find f F t T ; ,; search / n N; register "; dot .; counts 1 2 3; and literal insert chars
-    // (so insert sessions produce real bytes, incl. a multibyte one).
-    for c in "hjklwbeWBE0$^gGiaoOvVRxXpPJ~DCYsdcyfFtT;,nN/\".123AIqZ é".chars() {
+    // d c y; find f F t T ; ,; search / n N; register "; dot .; counts 1 2 3; the fold prefix z (with
+    // `f`, `o`, `c`, `a`, `d`, `E`, `R`, `M`, `j`, `k` from the set, so closed folds meet every operator,
+    // #819); and literal insert chars (so insert sessions produce real bytes: a Latin, a Hangul and a CJK
+    // wide char, a combining acute, a zero-width joiner, an emoji and a tab, so wide and composing text
+    // meets every operator, #909).
+    for c in
+        "hjklwbeWBE0$^gGiaoOvVRxXpPJ~DCYsdcyfFtT;,nN/\".123AIqZzM é가漢\u{301}\u{200d}👩\t".chars()
+    {
         v.push(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
     for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Backspace] {
         v.push(KeyEvent::new(code, KeyModifiers::NONE));
     }
-    // CTRL-O insert one-shot, CTRL-V blockwise, CTRL-^ Lang-Arg toggle — history-neutral prefixes.
-    for c in ['o', 'v', '^'] {
+    // CTRL-O insert one-shot, CTRL-V blockwise, CTRL-^ Lang-Arg toggle — history-neutral prefixes; CTRL-W
+    // (with `s`, `v`, `c`, `w`, `o` already in the set) splits, closes and cycles windows over the one
+    // buffer, so the walker sees several views of it (#906).
+    for c in ['o', 'v', '^', 'w'] {
         v.push(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
     }
     if include_history_ops {
@@ -48,10 +56,30 @@ fn alphabet(include_history_ops: bool) -> Vec<KeyEvent> {
     v
 }
 
-/// A small random UTF-8 starting buffer (incl. multibyte chars — the cursor-boundary stressor).
+/// Pieces of hard text for the starting buffer (#909): wide CJK and Hangul, a combining sequence, a ZWJ
+/// emoji family, a flag pair, tabs mixed with wide chars, and line breaks.
+const HARD: &[&str] = &[
+    "가",
+    "漢字",
+    "e\u{301}",
+    "a\u{301}\u{302}",
+    "👨\u{200d}👩\u{200d}👧",
+    "🇰🇷",
+    "\t",
+    "\t가\t",
+    "\n",
+    "a",
+    " ",
+];
+
+/// A small random UTF-8 starting buffer: arbitrary scalars mixed with [`HARD`] pieces, so the cursor-
+/// boundary and cluster cases come up often rather than by luck.
 fn text() -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec(any::<char>(), 0..24)
-        .prop_map(|cs| cs.into_iter().collect::<String>().into_bytes())
+    let piece = prop_oneof![
+        any::<char>().prop_map(String::from),
+        proptest::sample::select(HARD).prop_map(String::from),
+    ];
+    prop::collection::vec(piece, 0..24).prop_map(|ps| ps.concat().into_bytes())
 }
 
 /// Is `k` one of the count digits (`1`/`2`/`3`) the alphabet offers?
@@ -79,26 +107,6 @@ fn clamp_count_runs(mut keys: Vec<KeyEvent>) -> Vec<KeyEvent> {
     keys
 }
 
-/// Apply whatever the engine emitted, exactly as `main.rs::run` routes it (minus the frontend-only
-/// ex/window commands, which this single-window fuzzer does not drive).
-fn apply_feed(st: &mut EditorState, out: Feed) {
-    match out {
-        Feed::Cmd(cmd) => {
-            apply_command(st, &cmd);
-        }
-        Feed::Replay(cmds) => {
-            for c in &cmds {
-                apply_command(st, c);
-            }
-        }
-        Feed::ExecuteEx(_)
-        | Feed::CmdlineInsertUnder { .. }
-        | Feed::FilterMotion { .. }
-        | Feed::Pending
-        | Feed::Ignored => {}
-    }
-}
-
 /// Upper bound on the fuzzed buffer size, enforced by `run_session`. Yank-whole-buffer -> paste is
 /// legitimate, unbounded Vim behavior (`ggVGyp` / `ggyGp` doubles the buffer every repeat), so a random
 /// session that happens to compose it repeatedly grows the buffer *exponentially* — reaching multiple GB
@@ -111,45 +119,189 @@ fn apply_feed(st: &mut EditorState, out: Feed) {
 /// suite fast and seed-independent (a larger cap lets rare seeds spend seconds memcpying multi-MB buffers).
 const MAX_FUZZ_BUFFER_BYTES: usize = 256 * 1024;
 
-/// Drive `keys` through a fresh engine+state, asserting the per-keystroke UTF-8 / cursor-boundary
-/// invariants along the way, and return the final state (Normal mode, any insert session closed).
-fn run_session(init: &[u8], keys: &[KeyEvent]) -> Result<EditorState, TestCaseError> {
-    let mut engine = InputEngine::new();
-    let mut st = EditorState::new(init.to_vec());
+/// Drive `keys` through a fresh headless session, asserting the per-keystroke UTF-8 / cursor-boundary
+/// invariants along the way, and return the final session (Normal mode, any insert session closed). A
+/// random `ZZ`/`ZQ` may end the session early; the keys after it are then ignored, as in the binary.
+fn run_session(init: &[u8], keys: &[KeyEvent]) -> Result<Headless, TestCaseError> {
+    let init = std::str::from_utf8(init).expect("the generator builds UTF-8");
+    let mut h = Headless::vim(init);
     for key in keys {
-        let out = engine.feed(*key, st.mode());
-        apply_feed(&mut st, out);
+        h.key(*key);
+        let ws = h.workspace();
+        let (bytes, cursor) = (ws.focused().doc.bytes(), ws.focused().view.cursor().0);
 
-        let s = std::str::from_utf8(st.bytes());
+        let s = std::str::from_utf8(bytes);
         prop_assert!(s.is_ok(), "buffer became invalid UTF-8 after {key:?}");
         let s = s.expect("just checked ok");
         prop_assert!(
-            st.cursor() <= s.len(),
+            cursor <= s.len(),
             "cursor {} past end {} after {key:?}",
-            st.cursor(),
+            cursor,
             s.len()
         );
         prop_assert!(
-            s.is_char_boundary(st.cursor()),
+            s.is_char_boundary(cursor),
             "cursor {} off a char boundary after {key:?} (buffer {s:?})",
-            st.cursor()
+            cursor
         );
+
+        // The whole-state walker (#906): undo tree, anchors, marks, windows and buffers stay consistent,
+        // and so do the folds and their anchors.
+        h.assert_invariants();
 
         // Bound exponential yank+paste growth (see `MAX_FUZZ_BUFFER_BYTES`): the invariants above have been
         // checked for this key; once the buffer is huge we stop feeding further keys rather than let a
         // doubling session balloon to gigabytes. The round-trip is still exercised over every applied op.
-        if st.bytes().len() > MAX_FUZZ_BUFFER_BYTES {
+        if bytes.len() > MAX_FUZZ_BUFFER_BYTES {
             break;
         }
     }
     // Close any open insert/visual session so a dangling change is committed to undo history.
-    let esc = engine.feed(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), st.mode());
-    apply_feed(&mut st, esc);
-    Ok(st)
+    h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    Ok(h)
+}
+
+/// Apply `cmd` to the core until `more` says the history is exhausted; `None` if it does not terminate.
+fn exhaust(ws: &mut Workspace, cmd: &Command, more: fn(&Workspace) -> bool) -> Option<()> {
+    for _ in 0..100_000 {
+        if !more(ws) {
+            return Some(());
+        }
+        ws.apply(cmd);
+    }
+    None
+}
+
+fn can_undo(ws: &Workspace) -> bool {
+    ws.focused().doc.can_undo()
+}
+
+fn can_redo(ws: &Workspace) -> bool {
+    ws.focused().doc.can_redo()
+}
+
+/// `n` cases, scaled by `RUSE_PROPTEST_SCALE` for the scheduled deep tier (#920), with the reject budget
+/// scaled alike so a filtering test does not abort a long run.
+fn cases(n: u32) -> ProptestConfig {
+    let scale = std::env::var("RUSE_PROPTEST_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let base = ProptestConfig::default();
+    ProptestConfig {
+        cases: n.saturating_mul(scale),
+        max_global_rejects: base.max_global_rejects.saturating_mul(scale),
+        ..base
+    }
+}
+
+/// One line edit of the fold model property.
+#[derive(Clone, Copy, Debug)]
+enum LineOp {
+    Down,
+    Up,
+    DeleteLine,
+    OpenBelow,
+    OpenAbove,
+    PutBelow,
+    PutAbove,
+    Join,
+}
+
+impl LineOp {
+    fn keys(self) -> &'static str {
+        match self {
+            LineOp::Down => "j",
+            LineOp::Up => "k",
+            LineOp::DeleteLine => "dd",
+            LineOp::OpenBelow => "onew<Esc>",
+            LineOp::OpenAbove => "Onew<Esc>",
+            LineOp::PutBelow => "yyp",
+            LineOp::PutAbove => "yyP",
+            LineOp::Join => "J",
+        }
+    }
+
+    /// Apply this op at `cur` (the cursor line before it) to the model: per line, whether it is in the
+    /// fold. A line made below a fold line joins the fold unless that is the fold's last line, one made
+    /// above unless it is the first (nvim: `o` on the last line and `O` on the first open outside it); a
+    /// joined-in line is gone.
+    fn apply(self, inside: &mut Vec<bool>, cur: usize) {
+        let first = inside.iter().position(|&x| x);
+        let last = inside.iter().rposition(|&x| x);
+        match self {
+            LineOp::Down | LineOp::Up => {}
+            LineOp::DeleteLine => {
+                inside.remove(cur);
+                if inside.is_empty() {
+                    inside.push(false);
+                }
+            }
+            LineOp::OpenBelow | LineOp::PutBelow => {
+                inside.insert(cur + 1, inside[cur] && last != Some(cur));
+            }
+            LineOp::OpenAbove | LineOp::PutAbove => {
+                inside.insert(cur, inside[cur] && first != Some(cur));
+            }
+            LineOp::Join => {
+                if cur + 1 < inside.len() {
+                    inside.remove(cur + 1);
+                }
+            }
+        }
+    }
+}
+
+fn line_op() -> impl Strategy<Value = LineOp> {
+    proptest::sample::select(vec![
+        LineOp::Down,
+        LineOp::Up,
+        LineOp::DeleteLine,
+        LineOp::OpenBelow,
+        LineOp::OpenAbove,
+        LineOp::PutBelow,
+        LineOp::PutAbove,
+        LineOp::Join,
+    ])
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(600))]
+    #![proptest_config(cases(200))]
+
+    /// The fold model property (#819, #903): a manual fold follows line edits as nvim's `foldMarkAdjust`
+    /// moves it. The model marks the lines in the fold (see [`LineOp::apply`]); the fold must run from
+    /// the first marked line to the last, and be gone once no line is marked. The fold is open, so each
+    /// edit acts on one line.
+    #[test]
+    fn a_manual_fold_follows_line_edits(
+        n in 4usize..10,
+        a in 0usize..10,
+        len in 1usize..5,
+        ops in prop::collection::vec(line_op(), 0..24),
+    ) {
+        let a = a % (n - 1);
+        let b = (a + len).min(n - 1);
+        let text: String = (0..n).map(|i| format!("a{i}\n")).collect();
+        let mut h = Headless::vim(&text);
+        h.keys(&format!("{}Gzf{}jzo", a + 1, b - a));
+        let mut inside: Vec<bool> = (0..n).map(|i| a <= i && i <= b).collect();
+        for op in ops {
+            let cur = h.cursor_row_col().0 - 1;
+            h.keys(op.keys());
+            op.apply(&mut inside, cur);
+            h.assert_invariants();
+            let first = inside.iter().position(|&x| x);
+            let want = first.zip(inside.iter().rposition(|&x| x));
+            let got = h.folds().first().map(|f| (f.start, f.end));
+            prop_assert_eq!(got, want, "after {:?} on line {} ({:?})", op, cur, h.text());
+            prop_assert!(h.folds().len() <= 1);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(cases(600))]
 
     /// ANY session (including `u`/CTRL-R): per-key UTF-8 + cursor-boundary, and a full undo terminates
     /// and restores the initial buffer. `undo-all -> root` is valid however the session branched history.
@@ -159,16 +311,12 @@ proptest! {
         keys in prop::collection::vec(proptest::sample::select(alphabet(true)), 0..140)
             .prop_map(clamp_count_runs),
     ) {
-        let mut st = run_session(&init, &keys)?;
+        let mut h = run_session(&init, &keys)?;
+        let ws = h.workspace_mut();
 
-        let mut guard = 0u32;
-        while st.doc.can_undo() {
-            apply_command(&mut st, &Command::Undo);
-            guard += 1;
-            prop_assert!(guard < 100_000, "undo did not terminate");
-        }
+        prop_assert!(exhaust(ws, &Command::Undo, can_undo).is_some(), "undo did not terminate");
         prop_assert_eq!(
-            st.bytes(),
+            ws.focused().doc.bytes(),
             init.as_slice(),
             "full undo of a keystroke session must restore the initial buffer"
         );
@@ -183,23 +331,43 @@ proptest! {
         keys in prop::collection::vec(proptest::sample::select(alphabet(false)), 0..140)
             .prop_map(clamp_count_runs),
     ) {
-        let mut st = run_session(&init, &keys)?;
-        let edited = st.bytes().to_vec();
+        let mut h = run_session(&init, &keys)?;
+        let ws = h.workspace_mut();
+        let edited = ws.focused().doc.bytes().to_vec();
 
-        let mut guard = 0u32;
-        while st.doc.can_undo() {
-            apply_command(&mut st, &Command::Undo);
-            guard += 1;
-            prop_assert!(guard < 100_000, "undo did not terminate");
-        }
-        prop_assert_eq!(st.bytes(), init.as_slice(), "full undo must restore the initial buffer");
+        prop_assert!(exhaust(ws, &Command::Undo, can_undo).is_some(), "undo did not terminate");
+        prop_assert_eq!(ws.focused().doc.bytes(), init.as_slice(), "full undo must restore the initial buffer");
 
-        guard = 0;
-        while st.doc.can_redo() {
-            apply_command(&mut st, &Command::Redo);
-            guard += 1;
-            prop_assert!(guard < 100_000, "redo did not terminate");
-        }
-        prop_assert_eq!(st.bytes(), edited.as_slice(), "full redo must restore the edited buffer");
+        prop_assert!(exhaust(ws, &Command::Redo, can_redo).is_some(), "redo did not terminate");
+        prop_assert_eq!(ws.focused().doc.bytes(), edited.as_slice(), "full redo must restore the edited buffer");
     }
+}
+
+/// #1296, the fuzzer's minimal repro: a one-line fold on a last line with no newline, whose only char `x`
+/// deletes (`\nh` to `\n`). nvim v0.12.6 keeps the line, empty, with its fold (`['', '']`, `foldlevel(2)`
+/// 1). This buffer cannot hold an empty last line without a newline (the slot after a final newline is no
+/// line), so the fold goes with its line instead of pointing past the buffer.
+#[test]
+fn a_fold_on_a_last_line_emptied_by_x_goes_with_the_line() {
+    let mut h = Headless::vim("");
+    for k in ["h", "h", "h", "i", "<CR>", "h", "<Esc>", "z", "f", "0", "x"] {
+        h.keys(k);
+        h.assert_invariants();
+    }
+    assert_eq!(h.text(), "\n");
+    assert_eq!(h.folds(), &[]);
+}
+
+/// #1296, the regression the fuzzer then found (`session_fuzz.proptest-regressions`): a linewise `P` into
+/// the buffer emptied under a one-line fold. nvim v0.12.6 ends with `['¡', '']` and no fold; here too the
+/// fold goes, rather than landing on the slot after the put line's newline.
+#[test]
+fn a_fold_left_on_an_emptied_buffer_does_not_outlive_a_put_above() {
+    let mut h = Headless::vim("\u{a1}");
+    for k in ["z", "f", "0", "v", "h", ";", "X", ";", "P"] {
+        h.keys(k);
+        h.assert_invariants();
+    }
+    assert_eq!(h.text(), "\u{a1}\n");
+    assert_eq!(h.folds(), &[]);
 }

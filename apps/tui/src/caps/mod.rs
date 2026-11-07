@@ -13,6 +13,7 @@
 pub mod ledger;
 pub mod probe;
 pub mod sequences;
+pub mod typeahead;
 
 use ledger::{
     CapValue, Capability, Confidence, Entry, GraphicsProtocol, KeyEncoding, Ledger, Source,
@@ -33,16 +34,15 @@ pub fn seed_env(ledger: &mut Ledger, term: &str, _colorterm: &str, term_program:
         confidence: Confidence::Assumed,
     };
 
+    // No hint for xterm modifyOtherKeys (#772): a terminal in that mode (xterm, or tmux with `extended-keys
+    // on`) sends Ctrl chords as `CSI 27 ; mods ; code ~`, which crossterm cannot decode, so every Ctrl key
+    // would be dropped. nvim decodes that form and asks for it; ruse stays on the legacy encoding until its
+    // input parser can. The `CSI code ; mods u` form needs no request: crossterm decodes it.
     let looks_kitty = term.contains("kitty") || term_program.eq_ignore_ascii_case("kitty");
     if looks_kitty {
         ledger.record(
             Capability::KeyEncoding,
             hint(CapValue::Encoding(KeyEncoding::Kitty)),
-        );
-    } else if term.starts_with("xterm") || term.contains("256color") {
-        ledger.record(
-            Capability::KeyEncoding,
-            hint(CapValue::Encoding(KeyEncoding::Xterm)),
         );
     }
 
@@ -55,6 +55,15 @@ pub fn seed_env(ledger: &mut Ledger, term: &str, _colorterm: &str, term_program:
         || term.contains("256color");
     if modern {
         ledger.record(Capability::BracketedPaste, hint(CapValue::Bool(true)));
+    }
+
+    // Focus reporting (mode 1004, #1220): the same emulators, plus rxvt, which reports focus but answers no
+    // DECRQM. nvim sets 1004 on every terminal unasked; ruse leaves a dumb/linux/vt100 console alone unless
+    // the probe confirms it, and a fenced "not recognised" turns the hint off. A terminal that ignores the
+    // mode ignores the set (an unknown DEC private mode is a no-op); tmux passes the reports on only with
+    // `set -g focus-events on`.
+    if modern || term.starts_with("rxvt") {
+        ledger.record(Capability::FocusEvents, hint(CapValue::Bool(true)));
     }
 
     // Inline graphics (F-031 slice 3b / D-053): env HINTS. The Kitty graphics protocol is spoken by more
@@ -89,11 +98,13 @@ pub fn seed_env(ledger: &mut Ledger, term: &str, _colorterm: &str, term_program:
 /// * `no_kitty` — `$RUSE_NO_KITTY`: force the legacy keyboard encoding (disable kitty/xterm).
 /// * `no_mouse` — `$RUSE_NO_MOUSE`: force SGR mouse off.
 /// * `no_paste` — `$RUSE_NO_PASTE`: force bracketed paste off.
+/// * `no_focus` — `$RUSE_NO_FOCUS`: force focus reporting (mode 1004) off.
 pub fn apply_overrides(
     ledger: &mut Ledger,
     no_kitty: &str,
     no_mouse: &str,
     no_paste: &str,
+    no_focus: &str,
     graphics: &str,
 ) {
     let truthy = |v: &str| matches!(v.trim(), "1" | "true" | "yes" | "on");
@@ -108,6 +119,9 @@ pub fn apply_overrides(
     }
     if truthy(no_paste) {
         ledger.set_override(Capability::BracketedPaste, CapValue::Bool(false));
+    }
+    if truthy(no_focus) {
+        ledger.set_override(Capability::FocusEvents, CapValue::Bool(false));
     }
     // `$RUSE_GRAPHICS` forces the inline-graphics protocol (F-031 / D-053) — the escape hatch to test real
     // images on a Kitty-capable terminal we don't auto-detect, or to disable them: off|kitty|sixel|iterm2.
@@ -154,7 +168,7 @@ mod tests {
     fn ruse_graphics_override_forces_the_protocol() {
         // Force Kitty on a terminal env gave nothing — the test-anywhere escape hatch.
         let mut l = Ledger::with_defaults();
-        apply_overrides(&mut l, "", "", "", "kitty");
+        apply_overrides(&mut l, "", "", "", "", "kitty");
         assert_eq!(l.graphics(), GraphicsProtocol::Kitty);
         assert_eq!(
             l.get(Capability::InlineGraphics).unwrap().source,
@@ -163,7 +177,7 @@ mod tests {
         // …and force it off over a hint.
         let mut o = Ledger::with_defaults();
         seed_env(&mut o, "xterm-ghostty", "", "");
-        apply_overrides(&mut o, "", "", "", "off");
+        apply_overrides(&mut o, "", "", "", "", "off");
         assert_eq!(o.graphics(), GraphicsProtocol::None);
     }
 
@@ -180,7 +194,7 @@ mod tests {
             },
         );
         // …the user forces it off, and wins.
-        apply_overrides(&mut l, "1", "", "", "");
+        apply_overrides(&mut l, "1", "", "", "", "");
         assert_eq!(l.key_encoding(), KeyEncoding::Legacy);
         assert_eq!(
             l.get(Capability::KeyEncoding).unwrap().source,
@@ -199,7 +213,7 @@ mod tests {
                 confidence: Confidence::Confirmed,
             },
         );
-        apply_overrides(&mut l, "", "0", "no", ""); // none truthy
+        apply_overrides(&mut l, "", "0", "no", "off", ""); // none truthy
         assert!(l.enabled(Capability::BracketedPaste));
     }
 
@@ -215,10 +229,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_xterm_hints_xterm_not_kitty() {
+    fn plain_xterm_stays_on_the_legacy_encoding() {
+        // Not modifyOtherKeys: its `CSI 27 ; mods ; code ~` replies cannot be decoded (#772).
         let mut l = Ledger::with_defaults();
         seed_env(&mut l, "xterm-256color", "", "");
-        assert_eq!(l.key_encoding(), KeyEncoding::Xterm);
+        assert_eq!(l.key_encoding(), KeyEncoding::Legacy);
         assert!(l.enabled(Capability::BracketedPaste)); // hinted on
     }
 

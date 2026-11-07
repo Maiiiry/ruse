@@ -12,7 +12,9 @@
 #                   REM-SERVICE-*/ECO-*/NAT-*), defined in ../docs/parity/*.md (index: ../docs/parity/README.md).
 #                   Omitted when a feature genuinely has no external parity target.
 #   trace.design  = 1-3 design/architecture docs that specify it (../docs/architecture/* | ../docs/design/*).
-#   trace.verify  = planned test fixture path(s)/method that will prove it (../tests/...).
+#   trace.verify  = test path(s) that prove it. For `status: done` they are real files (crate tests, inline
+#                   test modules, the parity corpus) and spec-validate fails one that does not resolve
+#                   (#886); for other statuses they may name where the proof will live (../tests/...).
 # `acceptance:` lists 2-4 concrete, testable pass criteria.
 # Feature <-> capability links are NOT stored here: they live in spec/capabilities.yaml as `prd:` on CAP-*
 # entries (one fact, one home). Do not add a `capability` field to features.
@@ -22,7 +24,7 @@ version: 1
 product:
   name: ruse
   goal: >
-    A terminal-first, remote-first, extensible editor with Vim/Neovim/Emacs feature parity,
+    A terminal-based modal editor with Vim/Neovim/Emacs feature parity,
     designed as a specification with a reference implementation.
   target_users:
     - terminal-first developers
@@ -36,9 +38,9 @@ mvp:
 # depend on a later stage (checked by spec validate). `depends_on` makes build order machine-verifiable.  # D-036
 
 components:
-  # kernel (stage 1: editor-core, includes Command per ARCH-LAYER-001)
-  C-DOCUMENT:   { title: Document model, build_stage: kernel, depends_on: [], status: planned, ref: ../docs/rfc/proposed/RFC-0008-document-model.md }
-  C-TRANSACTION: { title: Transaction engine, build_stage: kernel, depends_on: [C-DOCUMENT], status: planned, ref: ../docs/rfc/proposed/RFC-0007-transaction-engine.md }
+  # kernel (stage 1: ruse-core, includes Command per ARCH-LAYER-001)
+  C-DOCUMENT:   { title: Document model, build_stage: kernel, depends_on: [], status: planned, ref: ../docs/rfc/accepted/RFC-0008-document-model.md }
+  C-TRANSACTION: { title: Transaction engine, build_stage: kernel, depends_on: [C-DOCUMENT], status: planned, ref: ../docs/rfc/accepted/RFC-0007-transaction-engine.md }
   C-ANCHOR:     { title: Anchor/position model, build_stage: kernel, depends_on: [C-DOCUMENT], status: planned, ref: ../docs/design/anchor-store.md }   # D-023
   C-UNDO:       { title: Undo history, build_stage: kernel, depends_on: [C-TRANSACTION], status: planned, ref: ../docs/design/persistence-and-recovery.md }
   C-REGISTER:   { title: Register/kill-ring model, build_stage: kernel, depends_on: [C-DOCUMENT], status: planned, ref: ../docs/design/register-model.md }   # D-026
@@ -63,7 +65,7 @@ components:
   C-LSPHOST:    { title: Language Service host (LSP mgmt + normalized model), build_stage: workspace, depends_on: [C-WORKSPACE, C-QUERY], status: planned, ref: ../docs/design/remote-runtime.md }
   C-DEBUG:      { title: Debug service (DAP/GDB, location model), build_stage: workspace, depends_on: [C-WORKSPACE], status: planned, ref: ../docs/design/remote-runtime.md }  # D-032
   # plugin (stage 5) / remote (stage 6)
-  C-PLUGIN:     { title: Plugin protocol/host, build_stage: plugin, depends_on: [C-COMMAND, C-RENDER, C-WORKSPACE], status: planned, ref: ../docs/rfc/proposed/RFC-0003-plugin-api.md }
+  C-PLUGIN:     { title: Plugin protocol/host, build_stage: plugin, depends_on: [C-COMMAND, C-RENDER, C-WORKSPACE], status: planned, ref: ../docs/rfc/accepted/RFC-0003-plugin-api.md }
   C-AGENT:      { title: Remote workspace agent (headless service supervisor), build_stage: remote, depends_on: [C-WORKSPACE, C-LSPHOST, C-DEBUG], status: planned, ref: ../docs/design/remote-runtime.md }  # D-029/D-030/D-031
   C-REMOTE:     { title: Remote client/runtime boundary, build_stage: remote, depends_on: [C-WORKSPACE, C-PLUGIN, C-AGENT], status: planned, ref: ../docs/design/remote-runtime.md }
 
@@ -79,7 +81,7 @@ features:
     trace:
       parity: [COM-7, VIM-UNDO-1, EMACS-EDIT-1]
       design: [../docs/architecture/architecture.md#3]
-      verify: [../tests/property/undo-roundtrip, ../tests/unit/transaction-revision]
+      verify: [../crates/core/tests/properties.rs, ../crates/core/tests/reference_model.rs, ../crates/core/tests/change_log.rs, ../crates/core/src/document.rs]
     acceptance:
       - Undo after an edit restores the byte-identical original document.
       - Every change records an origin and a revision.
@@ -96,7 +98,10 @@ features:
     # types, each REAL now: pos.rs byte_to_grapheme/grapheme_to_byte (UAX#29, unicode-segmentation) +
     # byte_to_cell (wcwidth, unicode-width, tab-aware). #2 the CURSOR moves by GRAPHEME CLUSTER
     # (motion::next_grapheme/prev_grapheme via GraphemeCursor; MoveLeft/MoveRight) so emoji/ZWJ/
-    # combining never desync it — tested (editor_spine::cursor_moves_by_grapheme_cluster + combining;
+    # combining never desync it (a byte that is not UTF-8 is a cell of its own and the valid text around
+    # it keeps its clusters, as nvim, #1232; it is one char with the class of its Latin-1 char for
+    # words, keywords, columns and search, #1243; it is drawn `<ff>` and is four cells in the virtual
+    # columns too, the renderer and the core sharing one width model, cells.rs, #1251) — tested (editor_spine::cursor_moves_by_grapheme_cluster + combining;
     # pos::tests). This relaxed the dep-free-core rule (approach A, decided 2026-08-10): core now
     # carries unicode-segmentation + unicode-width. Display-cell CURSOR PLACEMENT (rendering wide
     # chars at the right column) is F-006's job; #2 here is the LOGICAL cursor staying on clusters.
@@ -109,12 +114,12 @@ features:
     trace:
       parity: []
       design: [../docs/architecture/architecture.md#3, ../docs/design/positions-history.md]
-      verify: [../tests/property/anchor-stability, ../tests/unit/coordinate-widths]
+      verify: [../crates/core/src/anchor.rs, ../crates/core/tests/long_line_columns.rs, ../crates/core/tests/grapheme_conformance.rs, ../crates/core/tests/no_usize_coords.rs]
     acceptance:
       - Cursor/decoration positions survive edits via anchors, not raw offsets.
       - Wide/emoji/combining/ZWJ clusters do not desync the cursor from logical text.
       - Anchor gravity (left/right) is honored when an edit lands exactly at the anchor.
-      - Byte, char, grapheme, and screen-cell coordinates are distinct types, not interchanged.
+      - Byte, char, grapheme, and screen-cell positions that cross the core's public API are distinct types, not interchanged (D-063).
 
   # --- Vim input profile (F-003 + F-023..F-027) ------------------------------------------------
   # F-003 used to be ONE feature carrying 43 parity IDs — every mode, operator, motion, register and
@@ -130,7 +135,7 @@ features:
     priority: must
     # done (#104 namespaces + #105 layer-owned state + #106 return-address): the keymap layer router
     # (crates/core/src/keymap.rs LayerStack: rank-ordered resolve, sealed-stops-walk, DuplicateRank,
-    # collapse) + the Vim profile as eight addressable depth-1 SEALED namespaces (apps/tui/src/input.rs
+    # collapse) + the Vim profile as eight addressable depth-1 SEALED namespaces (apps/tui/src/input/
     # VimProfile), each declaring its census unmatched-key policy (KL-OBL-1/2/3). The five open policies
     # are exercised through the router — insert/replace-selection/overwrite live, append via feed_cmdline,
     # forward/translate declared (#4). Operator-pending is a namespace that ABORTS (#5, PR-1). Layer state
@@ -153,7 +158,7 @@ features:
       parity: [nvim.mapmode.norm, nvim.mapmode.opr]   # was VIM-MODE-1/6 — repointed onto the map_mode census (D-043)
       contract: [../spec/parity/contracts/keymap-layers.yaml, ../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/input-engine.md, ../docs/design/editing-language.md]
-      verify: [../tests/parity/vim/namespaces.yaml, ../tests/parity/vim/mode-stack.yaml]
+      verify: [../crates/core/src/keymap.rs, ../apps/tui/tests/vim_pending_grammar.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "Resolution walks an ordered layer stack highest-rank-first until a layer binds; a `sealed` layer stops the walk whether or not it bound (KL-OBL-1..3). The Vim profile declares depth 1 and sealed — depth is an OBLIGATION of the profile, not an accident of having one layer active, or `closed/ignore` starts leaking into a lower layer."
       - "The same router at depth 9, unsealed and buffer-selected, resolves an Emacs-style stack, and a depth-2 `[override, base]` resolves a derived mode; neither needs a code path of its own. Build-time collapse of a derived layer is observably identical to consulting it at dispatch (KL-OBL-6)."
@@ -183,16 +188,40 @@ features:
     # belong to F-009; the C-INPUT LANG-ARG re-dispatch and the full C-POSHIST position history
     # (marks/jumplist) are pending-concept carve-outs (READY-WITH-SCOPE), like F-025.
     # Census gap logged: `>>`/`>{motion}` have no upstream-extracted row (only `<<`/`<{motion}` present).
+    # #605 (oracle-verified vs nvim v0.12.6): `X` was listed above but had no binding until #605; it now
+    # deletes before the cursor without leaving the line, and `h`/`l` (with a count or under an operator)
+    # no longer cross lines either. Also bound: `<Del>` (= `x`; `{count}<Del>` drops a count digit),
+    # `<Space>`/`<BS>` (wrap across lines, nvim's default 'whichwrap' b,s), `<Home>`/`<End>` (`0`/`$`;
+    # `{count}$` now reaches the end of the line count-1 below), `<Insert>` (= `i`), and `ZZ`/`ZQ` (= `:x`
+    # / `:q!`, sharing F-007's quit policy). Page scroll (#605): CTRL-F/CTRL-B, <PageDown>/<PageUp>,
+    # <S-Down>/<S-Up>, <S-CR> (counted pages, Normal + Visual) and CTRL-D/CTRL-U with the window 'scroll' a
+    # count sets; under the Native profile CTRL-F/CTRL-B stay the file / buffer pickers. Modified cursor keys:
+    # <S-Left>/<C-Left> = b, <S-Right>/<C-Right> = w, <C-Home> = gg, <C-End>, g<Down>/g<Up>/g<Home>/g<End>.
+    # `U` (#605) undoes the latest changes on the last changed line as one undoable change (a second `U`
+    # redoes, `.` does not repeat it); see crates/core/src/line_undo.rs for the save/drop rules and the one
+    # deliberate divergence (the saved line follows lines added or deleted above it). `u`/CTRL-R/`g-`/`g+`
+    # (#1063) put the cursor where the change began, as nvim's `u_undoredo` does (crates/core/src/
+    # undo_cursor.rs). Also #605: `{count}:`
+    # opens the line on the count's lines, CTRL-\ CTRL-N / CTRL-\ CTRL-G go to Normal, 'tildeop' (`:set
+    # top`) makes `~` an operator, `z+`/`z^` scroll past the window's ends, `g8` prints the UTF-8 bytes,
+    # `q`/`@` take the numbered and unnamed registers, and `zp`/`zP`/`zy` paste and yank a block without
+    # trailing spaces (a block `p`/`P` now pads short rows to the block width when text follows, as nvim).
+    # #618 (oracle-verified vs nvim v0.12.6): gq/gw run nvim's format_lines (paragraphs end at blank lines,
+    # a change of 'comments' leader and, under fo n, a 'formatlistpat' item; fo q 2 n honoured), J/gJ add
+    # 'joinspaces' and drop a comment leader under fo j (M/B too), gc{motion}/gcc/{Visual}gc toggle
+    # 'commentstring' comments (the `gc` comment text object is not modelled: `gcgc` cancels), and a set
+    # 'formatprg' makes gq filter its lines through that program (gw never does). #1159: `{count}>>`/`<<`
+    # with a count above 1 on the last line fails, shifting nothing, as `3dd` there.
     status: done
     depends_on: [C-INPUT, C-EDITLANG, C-POSHIST]
     summary: Operator x count x motion composition and dot-repeat (census surface mode_key.normal + operator_pending).
     trace:
       # repointed off legacy VIM-OP-*/VIM-MOT-*/VIM-REPEAT-DOT onto the mode_key.normal + operator_pending
       # census (D-043); only implemented+accepted grammar cited (see status carve-outs). vim.md rows retired.
-      parity: [nvim.key.normal.x5bx22xx5ddx7bmotionx7d, nvim.key.normal.x5bx22xx5ddd, nvim.key.normal.x5bx22xx5dcx7bmotionx7d, nvim.key.normal.x5bx22xx5dcc, nvim.key.normal.x5bx22xx5dyx7bmotionx7d, nvim.key.normal.x5bx22xx5dyy, nvim.key.normal.x5bx22xx5dx, nvim.key.normal.x5bx22xx5dD, nvim.key.normal.x5bx22xx5dC, nvim.key.normal.x5bx22xx5dY, nvim.key.normal.x5bx22xx5dS, nvim.key.normal.empty, nvim.key.normal.h, nvim.key.normal.l, nvim.key.normal.0, nvim.key.normal.x24, nvim.key.normal.w, nvim.key.normal.W, nvim.key.normal.b, nvim.key.normal.B, nvim.key.normal.e, nvim.key.normal.E, nvim.key.normal.fx7bcharx7d, nvim.key.normal.Fx7bcharx7d, nvim.key.normal.tx7bcharx7d, nvim.key.normal.Tx7bcharx7d, nvim.key.normal.x3b, nvim.key.normal.x2c, nvim.key.normal.G, nvim.key.normal.x25, nvim.key.normal.x7b, nvim.key.normal.x7d, nvim.key.normal.j, nvim.key.normal.k, nvim.key.normal.1, nvim.key.normal.2, nvim.key.normal.3, nvim.key.normal.4, nvim.key.normal.5, nvim.key.normal.6, nvim.key.normal.7, nvim.key.normal.8, nvim.key.normal.9, nvim.key.normal.., nvim.key.operator_pending.v, nvim.key.operator_pending.V, nvim.key.operator_pending.c_V]
+      parity: [nvim.key.normal.x5bx22xx5ddx7bmotionx7d, nvim.key.normal.x5bx22xx5ddd, nvim.key.normal.x5bx22xx5dcx7bmotionx7d, nvim.key.normal.x5bx22xx5dcc, nvim.key.normal.x5bx22xx5dyx7bmotionx7d, nvim.key.normal.x5bx22xx5dyy, nvim.key.normal.x5bx22xx5dx, nvim.key.normal.x5bx22xx5dD, nvim.key.normal.x5bx22xx5dC, nvim.key.normal.x5bx22xx5dY, nvim.key.normal.x5bx22xx5dS, nvim.key.normal.empty, nvim.key.normal.h, nvim.key.normal.l, nvim.key.normal.0, nvim.key.normal.x24, nvim.key.normal.w, nvim.key.normal.W, nvim.key.normal.b, nvim.key.normal.B, nvim.key.normal.e, nvim.key.normal.E, nvim.key.normal.fx7bcharx7d, nvim.key.normal.Fx7bcharx7d, nvim.key.normal.tx7bcharx7d, nvim.key.normal.Tx7bcharx7d, nvim.key.normal.x3b, nvim.key.normal.x2c, nvim.key.normal.G, nvim.key.normal.x25, nvim.key.normal.x7b, nvim.key.normal.x7d, nvim.key.normal.j, nvim.key.normal.k, nvim.key.normal.1, nvim.key.normal.2, nvim.key.normal.3, nvim.key.normal.4, nvim.key.normal.5, nvim.key.normal.6, nvim.key.normal.7, nvim.key.normal.8, nvim.key.normal.9, nvim.key.normal.., nvim.key.normal.x5bx22xx5dX, nvim.key.normal.x5bx22xx5dDel, nvim.key.normal.x7bcountx7dDel, nvim.key.normal.Space, nvim.key.normal.BS, nvim.key.normal.Home, nvim.key.normal.End, nvim.key.normal.Insert, nvim.key.normal.ZZ, nvim.key.normal.ZQ, nvim.key.normal.U, nvim.key.normal.x7bcountx7dx3a, nvim.key.normal.x7ex7bmotionx7d, nvim.key.normal.c_x5cx20c_N, nvim.key.normal.c_x5cx20c_G, nvim.key.operator_pending.v, nvim.key.operator_pending.V, nvim.key.operator_pending.c_V]
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/editing-language.md, ../docs/design/positions-history.md]
-      verify: [../tests/parity/vim/operator-motion.yaml]
+      verify: [../crates/core/src/motion.rs, ../apps/tui/tests/dot_repeat.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "Operator+motion composes with count multiplication (2d3w deletes 6 words) and doubling goes linewise (dd/yy)."
       - "Exclusive->inclusive->linewise motion promotion (VIM-MOT-PROMOTE) matches the vim.md checklist item 1."
@@ -202,7 +231,7 @@ features:
     title: Text objects — inner/around targets
     stage: mvp
     priority: must
-    # done (#95): text objects implemented in apps/tui/src/input.rs (`text_object()` maps
+    # done (#95): text objects implemented in apps/tui/src/input/ (`text_object()` maps
     # iw/aw/i(/a"/it/... to Motions, Vim alias collapse b/B/[/]). Both acceptance criteria are
     # oracle-verified in tests/parity/vim/fixtures/corpus.yaml: operator operand (daw_a_word,
     # diw_inner_word, di(, f(di(), visual extend (viwd_visual_inner_word, viwc_visual_change_text,
@@ -218,7 +247,7 @@ features:
       parity: [nvim.key.text_object.aw, nvim.key.text_object.aW, nvim.key.text_object.iw, nvim.key.text_object.iW, nvim.key.text_object.ap, nvim.key.text_object.ip, nvim.key.text_object.as, nvim.key.text_object.is, nvim.key.text_object.at, nvim.key.text_object.it, nvim.key.text_object.ab, nvim.key.text_object.aB, nvim.key.text_object.ib, nvim.key.text_object.iB, nvim.key.text_object.ax28, nvim.key.text_object.ax29, nvim.key.text_object.ix28, nvim.key.text_object.ix29, nvim.key.text_object.ax7b, nvim.key.text_object.ax7d, nvim.key.text_object.ix7b, nvim.key.text_object.ix7d, nvim.key.text_object.ax5b, nvim.key.text_object.ax5d, nvim.key.text_object.ix5b, nvim.key.text_object.ix5d, nvim.key.text_object.a, nvim.key.text_object.i, nvim.key.text_object.ax22, nvim.key.text_object.ix22, nvim.key.text_object.ax27, nvim.key.text_object.ix27, nvim.key.text_object.ax60, nvim.key.text_object.ix60]
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/editing-language.md]
-      verify: [../tests/parity/vim/text-objects.yaml]
+      verify: [../crates/core/src/textobj.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "diw / daw / di( / da\" select the inner/around span; usable as an operator operand (diw) and to extend a visual selection."
       - "Inner vs around differ by the surrounding whitespace/delimiters per the vim.md L2 checklist."
@@ -233,21 +262,27 @@ features:
     # selection key + p/P within mode_key.normal (the operators that WRITE registers stay under F-023).
     # NOW IMPLEMENTED (register.rs; unit-tested — census-tracing/formal acceptance is a follow-up): the
     # numbered ring `"1`-`"9`, small-delete `"-`, and black-hole `"_` registers, plus `:registers`/`:reg`
-    # (F-026 command engine + a picker). Still carve-outs (NOT modelled): expression `"=`, clipboard `"+`/`"*`.
-    # MACROS (q record / @ replay) are DESIGNED as D-055: recording captures RAW KEYSTROKES and stores them as
-    # bytes in these same a-z registers, replayed by re-feeding the input engine (so `"ap` shows a macro and
-    # yanked text runs as one). This is a distinct mechanism from dot-repeat/trace (which record resolved
-    # Commands). Implementation is a follow-up slice — NOT yet an F-029 acceptance criterion. See macros.md.
+    # (F-026 command engine + a picker). Also implemented: expression `"=` (crates/core/src/expr.rs) and
+    # clipboard `"+`/`"*` (crates/core/src/clipboard.rs); open register bugs include #708 and #796 (#749, #816
+    # and #1022 fixed: ring rules, "1p. walking the ring, read-only and unknown names).
+    # Visual `p`/`P` shapes the put by the selection and register kinds, as nvim does (#704).
+    # MACROS (q record / @ replay) ship per D-055, with open bug #812 (#787 fixed: the recursion cap now
+    # always ends a self-invoking macro, and CTRL-C interrupts a replay, #898): recording
+    # captures RAW KEYSTROKES and stores them as bytes in these same a-z registers, replayed by re-feeding the
+    # input engine (so `"ap` shows a macro and yanked text runs as one). This is a distinct mechanism from
+    # dot-repeat/trace (which record resolved Commands), and not an F-029 acceptance criterion. See macros.md.
+    # #1068: `q`, `@{reg}` and `Q` also work from Visual; in linewise Visual `@{reg}`/`Q` run once per
+    # selected line from column 0 (nvim's `v_@-default`, `:'<,'>normal! @{reg}`), ignoring the count.
     status: done
     depends_on: [C-EDITLANG, C-REGISTER]
-    summary: Named/unnamed/yank-only registers via the `"{register}` prefix + p/P; entries carry a shape that survives round-trip. Census anchor = the `"` selection key (registers are a prefix, not a dedicated surface); numbered ring/black-hole/clipboard are carve-outs. Macros (q/@) are a designed carve-out reusing these registers (D-055).
+    summary: Named/unnamed/yank-only registers via the `"{register}` prefix + p/P; entries carry a shape that survives round-trip. Census anchor = the `"` selection key (registers are a prefix, not a dedicated surface); numbered ring, black-hole, expression and clipboard registers ship beyond these criteria. Macros (q/@) reuse these registers (D-055).
     trace:
       # repointed off legacy VIM-REG-* onto the mode_key.normal census (D-043): the `"{register}` selection
       # prefix + put p/P. Numbered/other register semantics are documented carve-outs. vim.md rows retired.
       parity: [nvim.key.normal.x22x7bregisterx7d, nvim.key.normal.x5bx22xx5dp, nvim.key.normal.x5bx22xx5dP]
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/register-model.md, ../docs/design/macros.md]
-      verify: [../tests/parity/vim/registers.yaml]
+      verify: [../crates/core/src/register.rs, ../apps/tui/tests/register_model.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "The unnamed and yank-only (reg 0) registers behave per the L2 checklist; `\"ayy` / `\"ap` address a named register."
       - "Register entries carry a SHAPE (charwise/linewise/blockwise) that survives round-trip (CONCEPT-REGISTER-STORE); dd then p opens a line."
@@ -259,6 +294,54 @@ features:
     # done: printable-insert (AC1), i_CTRL-O one-shot return (#79, AC2), i_CTRL-G u undo-break
     # (#79, AC3), and the overwrite policy R (#77) + Virtual Replace gR (#89, tab-aware) with
     # <BS> restore (AC4) are all implemented + oracle-verified (corpus 143/143, 0 divergent).
+    # #607: the unmodified cursor keys <Left>/<Right>/<Up>/<Down>/<Home>/<End> move without leaving
+    # Insert (never wrapping sideways), break the undo sequence and restart the `.` record, as in nvim;
+    # <Del> deletes under the caret (joining at end of line) inside the insert; <Insert> toggles
+    # Insert<->Replace. The mode_key.insert census surface stays unclassified (namespace-id backing
+    # above). Also #607: <PageDown>/<PageUp>/<S-Down>/<S-Up> page-scroll from Insert, <S-Left>/<C-Left>
+    # and <S-Right>/<C-Right> move a word (across lines), <C-Home>/<C-End> jump to the file ends, CTRL-G j/k
+    # (and <Down>/<Up>, CTRL-J/CTRL-K after CTRL-G) go to the insert-start column, CTRL-G U keeps the next
+    # <Left>/<Right> in the undo group and `.` record, `0 CTRL-D`/`^ CTRL-D` delete all indent, and `.`
+    # replays an insert that <Insert> toggled into Replace. CTRL-U deletes the text entered before the caret
+    # on the line, then back to the first non-blank, then the indent, and joins lines at the line start
+    # (nvim's default 'backspace' indent,eol,start).
+    # #617 (oracle-verified vs nvim v0.12.6): the insert-time indent options. 'autoindent' (on, as nvim)
+    # gives o/O/<CR> the source line's indent, drops the blanks after a split, empties a line holding only
+    # an untouched indent on <Esc>/<CR>, and keeps the indent through cc/S; 'smartindent' adds nvim's
+    # C-like rules (extra shiftwidth after `{` or a default 'cinwords' keyword, `}`/`{`/`#` typed first
+    # realigned); 'copyindent'/'preserveindent' reuse existing indent characters; 'shiftround' rounds
+    # >/</:>/:<; 'softtabstop' and 'smarttab' (on) step <Tab> and <BS>. Vim profile only.
+    # #617 follow-up (#618 PR): <Up>/<Down> off an untouched autoindent now removes it, `^ CTRL-D` restores
+    # the deleted indent on the next <CR>, `=` keeps indent characters under 'preserveindent', 'cinwords'
+    # is settable, and 'equalprg' makes `=` filter through a program. Not implemented: cindent, cinkeys,
+    # cinoptions, cinscopedecls, indentkeys, lisp, lispoptions, lispwords, vartabstop, varsofttabstop.
+    # #1163 (oracle-verified vs nvim v0.12.6): 'lisp' and 'lispwords' are built — `=` re-indents by nvim's
+    # get_lisp_indent (the first line of a multi-line range kept, as Vi), and under 'autoindent' so do
+    # o/O/<CR> and cc/S, with the Lisp bracket search (`;` comments, `#\(`, strings by quote count).
+    # 'lisp' wins over the tree indent. Not built: 'lispoptions' (only matters with an 'indentexpr', which
+    # ruse has none of), the Lisp rules of `%` and showmatch, cindent and 'vartabstop'/'varsofttabstop'.
+    # #1163 (oracle-verified vs nvim v0.12.6, `cin_*`): 'cindent', 'cinoptions' (every flag), 'cinkeys' and
+    # 'cinscopedecls' are built — `crates/core/src/editor/cindent.rs` ports nvim's get_c_indent. `=` runs
+    # it whenever no other indenter applies (as nvim's `=` with an empty 'indentexpr'); o/O/<CR>, cc/S and
+    # the 'cinkeys' keys run it in a C buffer (nvim's indent/c.vim sets 'cindent') and, under 'cindent', in a
+    # buffer without an indenter. Not built: `*`/`!` keys other than `!^F`, :set nocindent in a C buffer
+    # (still C rules), 'indentkeys' as an option (docs/design/indent-engines.md).
+    # #1163 (oracle-verified vs nvim v0.12.6, `vts_*`, `pct_*`): 'vartabstop' and 'varsofttabstop' are built.
+    # One tab-stop model (`crates/core/src/cells.rs` Tabs: nvim's tabstop_padding/at/start/fromto) lays out
+    # rendering, cursor columns, blockwise Visual, indents built with tabs, `:retab [N,N...]` (which then
+    # sets 'vartabstop' or 'tabstop' as nvim does), Insert <Tab>/<BS> ('varsofttabstop' wins over
+    # 'softtabstop') and `>>`/`<<` with sw=0 (stop to stop). `%` follows nvim's findmatchlimit: brackets in
+    # quotes and 'x' literals are skipped, escapes count, `/* */` and `#if`/`#else`/`#endif` chains match,
+    # and under 'lisp' `;` comments and `#\(` characters are skipped. Not built: 'showmatch' (no option at
+    # all, so no Lisp rules for it), 'matchpairs' (the three ASCII pairs), more than 64 stops in a list.
+    # #1206: no 'indentkeys'/'cinkeys' OPTION, but the keys nvim's defaults re-indent on are built in per
+    # language (F-015): Python's `<:>`, `=elif`, `=except`, `e`, `0#`, `0{`/`0}`/`0)`/`0]`, `o`, `O`, the
+    # C/JavaScript/Go/sh/Rust/CSS keys listed under F-015, and `i_CTRL-F` (`!^F`) re-indents the line from
+    # the buffer's indenter (a no-op without one).
+    # #618 (oracle-verified vs nvim v0.12.6): auto-wrap while typing past 'textwidth' / the 'wrapmargin'
+    # width (the counted insert `8ia b<Esc>` wraps too), with the 'formatoptions' flags t c l 1 p and the
+    # 'comments' leaders; fo r/o continue a comment leader on <CR>/o/O (a three-part comment's middle and
+    # its auto-end `x`). Not modelled: fo a w v b m ] (accepted, not honoured).
     status: done
     depends_on: [C-INPUT, C-UNDO]
     summary: The open/insert namespace — a printable key is text — with one-shot return and undo-group ownership.
@@ -273,7 +356,7 @@ features:
       parity: [nvim.mapmode.ins]
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/input-engine.md, ../docs/design/persistence-and-recovery.md]
-      verify: [../tests/parity/vim/insert.yaml]
+      verify: [../apps/tui/tests/vim_special_keys.rs, ../apps/tui/tests/paste.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "An unmatched printable key inserts literally; the control-key table is the exception, not the default path."
       - "`CTRL-O` runs exactly one Normal command and resumes Insert at the same position (the shared one-shot-return construct)."
@@ -288,6 +371,10 @@ features:
     # `gv` depth-1 restore of the previous selection's anchor AND shape, and the Select open/replace policy
     # are all implemented + oracle/unit tested. The full C-ANCHOR position history (mark ring/jumplist/
     # multi-selection) is a carve-out (READY-WITH-SCOPE), not an F-025 acceptance criterion.
+    # #606/#792: Select is entered by `gh`/`gH`/`g CTRL-H` too; every printable key (incl. the keys Visual
+    # binds) replaces the selection, `<BS>`/`CTRL-H`/`<Del>` delete it, `CTRL-O` borrows one Visual command;
+    # Visual gained `:`/`!` on `'<,'>`, the linewise `D`/`X`/`Y`/`C`/`S`/`R`, `>`/`<`/`=`/`J`/`gJ`/`gq`, block `O`.
+    # Census rows stay unclassified (the mode_key.visual whole-surface lock); Visual `K`/`CTRL-]` remain open.
     status: done
     depends_on: [C-INPUT, C-ANCHOR]
     summary: Two namespaces over one selection state, separated by opposite unmatched-key policies.
@@ -295,7 +382,7 @@ features:
       parity: [nvim.mapmode.vis, nvim.mapmode.sel]   # was VIM-MODE-4/5 — repointed onto the map_mode census (D-043)
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/input-engine.md, ../docs/design/view-window-workspace.md]
-      verify: [../tests/parity/vim/visual.yaml]
+      verify: [../apps/tui/tests/scenarios.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "Selection shape (charwise/linewise/blockwise) is namespace state, not a boolean; `v`/`V`/`CTRL-V` switch shape or leave the namespace."
       - "`o` moves to the other corner and `gv` restores the PREVIOUS selection — anchor and shape outlive the namespace."
@@ -308,10 +395,65 @@ features:
     # done (#97): the command-line is now an engine-owned namespace, not an ad-hoc UI buffer.
     # InputEngine.cmdline (CmdLine{prefix,buffer,cursor,ex_mode}) owns the line; `:`/`/` open it via
     # feed(), printable keys append, <BS> deletes, <Esc> aborts, <CR> finalises (search folds through
-    # submit_search -> Feed::Cmd, `:` -> Feed::ExecuteEx). main.rs deleted its `cmd_line` and renders
+    # submit_search -> Feed::Cmd, `:` -> Feed::ExecuteEx). The session holds no `cmd_line` of its own and renders
     # engine.cmdline(). `gQ` (only) enters Ex mode (re-prompts until `:visual`); bare `Q` does not.
     # 6 namespace tests + property no-leak updated + oracle comparator simplified (still green).
     # VIM-MODE-8 (Ex mode, Adapted, gQ-only) has no map_mode census home -> backlogged.
+    # #612/#811: the line editor (caret motion by char/word, <Home>/<End>, <BS>/<Del>/C-u/C-w around the
+    # caret, <Insert> overstrike, C-v/C-q literal + numeric codes, C-k digraphs, C-r {reg}/C-r C-l) lives in
+    # input/cmdline.rs; <BS>/<Del> on an empty line abandon it. #609: Ex command words resolve through one
+    # abbreviation table (input/ex_cmd.rs, nvim's fullcommand() minima) and :silent[!]/:unsilent/:verbose/
+    # :noautocmd modifiers precede a command. Census rows stay unclassified (whole-surface lock).
+    # #609 (v0.1.5; input/ex_extra.rs, app/ex_print.rs, app/ex_more.rs): the print family :p/:l/:nu/:#
+    # with [count] [flags], :z[!][+-^.=][count], :=, :g/pat/p, and the :s p/#/l flags show their lines
+    # the way nvim's print_line does (one line on the status line, more in the view-only listing overlay);
+    # :put!, :retab[!] [N], :startinsert[!]/:startreplace[!]/:startgreplace/:stopinsert, and the
+    # :keepjumps/:keeppatterns/:keepalt/:filter[!] modifiers. #1104: :sort x/o/b/f/l, the full :s flag
+    # grammar (& first, g/c/e toggle, r, p/#/l, [count], E488 on anything else), and an inner :s in :g sets
+    # the last pattern even when it changes nothing. Ex commands that end with Vim's beginline() reset the
+    # wanted column. Not yet: :earlier {N}s/m/h/f (needs undo timestamps), :append/:insert/:change,
+    # :lockmarks, :confirm, and :filter on the listing pickers (:ls, :marks, :jumps, :reg).
+    # #1234: a command name is the whole run of letters (`:nosuch`, `:sefoo`, `:wqq` are E492, never a
+    # prefix match); the one exception is `:k{a-z}` with its argument glued on (`:kfoo` is E488), except
+    # `:kee…`, which is `:keepmarks` (accepted with no effect). Oracle fixtures `exn_*`.
+    # #1240: a digit after a count-taking command (`:d`, `:y`, `:j`, `:>`, `:<`, `:p`, `:l`, `:nu`, `:#`) is a
+    # count, glued on or not (`:d2`, `:j2`), never a register, and a `"` starts a comment. #1241: `:dl`/`:dp`
+    # (and `:dell` … `:deletep`) delete then show the new line; `:mark`/`:k` set `0`-`9`, `'`, `[`, `]`, `<`
+    # and `>` too (E191 for any other mark), on the line's first non-blank. Oracle fixtures `exc_*`, `exd_*`,
+    # `exk_*`. #1245: `:g/pat/{cmd}` runs any Ex command line (`|` included) once per marked line through the
+    # one Ex dispatch, cursor at the line's start (`:g/b/d 2`, `:g/^/m0`, `:g/b/j`); the first failing command
+    # stops it, a nested `:g` runs on the current line (E147 with a range), the whole `:g` is one undo step
+    # and one trace group. A bare `d` and a plain `s///` keep core's one-pass. #1246: `:d #`/`:y #` write
+    # `"0`. Oracle fixtures `gex_*`, `exa_register_hash_*`.
+    # #613: `:` completion at nvim's defaults (wildmode=full, wildoptions=pum): <Tab>/<S-Tab> complete
+    # (input/complete.rs: Ex command names, file/directory names with %/# and escaping, buffer names,
+    # :set option names and values), the wildmenu cycles with <Tab>/CTRL-N/<Right> and back, CTRL-E/CTRL-Y
+    # cancel/accept, <Up>/<Down> walk directories, CTRL-D lists, CTRL-L/CTRL-A insert; a popup menu above
+    # the line. Sources are pluggable (Completer::register). The `/` line completes nothing (as nvim).
+    # #614: the full :set grammar (input/set_cmd.rs, app/set_exec.rs) at nvim v0.12.6: many options per
+    # command, opt / noopt / invopt / opt! / opt? / opt& / opt&vim / opt< / opt=v / opt:v / += / -= / ^=,
+    # :set all, all&, bare :set (options that differ from ruse's default), :setlocal / :setglobal (local
+    # per View for ts/sw/et/tw with the Workspace's global copy; ic/scs are global and reach every window),
+    # nvim's messages (E474/E487/E488/E518/E521) and its stop-at-the-first-error order; 'scrolloff' is
+    # settable. `&` restores ruse's default, `&vim` Vim's. #614 part 2: the config loader (config.rs; machine / user ~/.config/ruse/config.toml / trusted workspace .ruse/config.toml) installs ts sw et tw so ic scs hls is top fixeol and input.profile, `:verbose set opt?` names the file and line, `:inspect config [key]` lists layers, sources and diagnostics, and `:trust` / `:untrust` write and delete the content-bound trust record (D-062).
+    # #1152: a layer file may name its schema version (`version = N`); keys under an old name migrate by the
+    # CFG-MIG-001 table (rename = auto-conversion with a config.migrated note, removal = manual warning, the
+    # value inert; the file is never rewritten). The table is empty at schema version 1 (no key renamed yet).
+    # render.conceal is read from the config (F-031).
+    # #1152: safe mode (CFG-SAFE-001): `ruse --safe-mode`, or after 3 starts in a row that read user config and
+    # died before their first frame (config/boot.rs record in the state dir), only the machine layer loads;
+    # `[Config: safe-mode]` on the status line, `:inspect config` and a `:checkhealth` config row say so, and
+    # `:config-reload` leaves it. Live reload: a changed layer file (polled with the [disk changed] checks) or
+    # `:config-reload` re-applies only the changed keys; a file that stops parsing keeps the previous config;
+    # input.profile and security-locked keys wait for the next start.
+    # #1151: 'history' (both rings, 0..10000), 'showmode' (the status line's mode word) and 'verbose' (above 0,
+    # `:set opt?` adds `Last set from`) are options; 'cpoptions' reads nvim's default aABceFs_ and 'verbosefile'
+    # reads empty, and any other value is refused as not supported (documented divergence: ruse behaves as the
+    # default flags and writes no message log); 'scrollback' stays unsupported (a terminal's scrollback cannot
+    # be viewed yet); `:options` lists the options as `:set all` does instead of opening nvim's option window.
+    # 'scrolloff' is global-local: :setlocal gives a window its own value, :set drops it, a split copies it.
+    # The user config's keymap.lang installs into the Lang-Arg map; the other keymap.* namespaces are read
+    # and checked but not installed (no user mappings yet), and the fold options stay per buffer.
     status: done
     depends_on: [C-INPUT, C-COMMAND]
     summary: A real namespace with its own line editor, not an ad-hoc text buffer on the UI.
@@ -319,18 +461,18 @@ features:
       parity: [nvim.mapmode.cmd]   # Cmd namespace onto the map_mode census (D-043); VIM-MODE-8 (Ex mode) backlogged in #97 — gQ-only, Adapted, not a map_mode namespace
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/input-engine.md, ../docs/design/command-engine.md]
-      verify: [../tests/parity/vim/command-line.yaml]
+      verify: [../apps/tui/src/input/cmdline.rs, ../apps/tui/tests/cmdline_completion.rs, ../apps/tui/tests/ex_messages.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "':' / '/' enter the namespace, <CR> executes and <Esc> aborts; it is engine-routed with a single mode owner, not an ad-hoc text buffer (anti-patterns command-line P2)."
-      - "An unmatched printable key appends to the line buffer (open/append); the namespace owns line buffer, cursor and history index."
-      - "Ex mode is entered by `gQ` only — `Q` is not an Ex-mode key at the pinned Neovim revision (see vim-style.yaml census_corrections). Command-line & search history shipped (#452: separate `:`/`/` rings, prefix-filtered <Up> vs raw <C-p> recall). The command-line window `q:`/`q/`/`q?` (`:help cmdwin`) shipped as a REDUCED list-overlay slice (#455): a navigable read-only list of the ex/search history with Vim's trailing empty line, `<CR>` runs the selected line through the same ex/search dispatch the `:`/`/` prompt uses, `<Esc>`/`<C-c>` close; full in-window EDITING (a real editable scratch buffer) is deferred pending a hostable secondary editable buffer (the same multi-buffer arena the buffer/file pickers wait on). wildmenu / incsearch-UX remain deferred."
+      - "An unmatched printable key is typed at the caret (open/append); the namespace owns line buffer, cursor and history index, and edits mid-line (#612)."
+      - "Ex mode is entered by `gQ` only — `Q` is not an Ex-mode key at the pinned Neovim revision (see vim-style.yaml census_corrections). Command-line & search history shipped (#452: separate `:`/`/` rings, prefix-filtered <Up> vs raw <C-p> recall). The command-line window `q:`/`q/`/`q?` (`:help cmdwin`) shipped as a REDUCED list-overlay slice (#455): a navigable read-only list of the ex/search history with Vim's trailing empty line, `<CR>` runs the selected line through the same ex/search dispatch the `:`/`/` prompt uses, `<Esc>`/`<C-c>` close; full in-window EDITING (a real editable scratch buffer) is deferred pending a hostable secondary editable buffer (the same multi-buffer arena the buffer/file pickers wait on). Command-line completion shipped (#613): `<Tab>`/`<S-Tab>` and the wildmenu at nvim's `wildmode=full` + `wildoptions=pum` defaults, `CTRL-D`/`CTRL-L`/`CTRL-A`, from pluggable sources. The `wildmode`/`wildoptions`/`wildignore` options and the incsearch `CTRL-G`/`CTRL-T` steps remain deferred."
 
   F-027:
     title: Lang-Arg namespace
     stage: mvp
     priority: must
     # done (#118): CONCEPT-LANG-ARG resolved by D-048 (accepting RFC-0013) — Lang-Arg is a PRE-DISPATCH
-    # translation stage (apps/tui/src/input.rs `translate_lang`, called at the top of `feed` ABOVE the
+    # translation stage (apps/tui/src/input/mod.rs `translate_lang`, called at the top of `feed` ABOVE the
     # D-045 layer stack), NOT a resolution layer. It rewrites a decoded key through the active language
     # map in exactly the three Lang-Arg contexts — Insert, Command-line, and a command reading a single
     # character (f/t/F/T/r) — and nowhere else (#2), applying ONE substitution then dispatching the
@@ -338,7 +480,8 @@ features:
     # cannot loop). #1 = the stage exists (translate_lang). #3 = terminal-IME interaction is DEFINED:
     # composed text arrives on the no-keymap paste/IME path and bypasses the stage, so lmap and the
     # terminal IME are disjoint by construction. Runtime population is `:lmap`/`:lunmap`; `i_CTRL-^`
-    # toggles the map (one boolean; per-context iminsert/imsearch is post-MVP). All three acceptance
+    # toggles the map (one Insert state, which `/`/`?` lines share as nvim's 'imsearch' -1 does; a `:`
+    # line starts unmapped and `c_CTRL-^` flips it for that line, #810). All three acceptance
     # criteria met + tested (7 tests: insert/one-substitution, inert-outside, single-char-arg, toggle,
     # command-line, map-maintenance, parse). keymap.lang is the persistent form (config-schema); no
     # config-file loader is built — none exists for any keymap.* key yet (matches every other namespace).
@@ -349,7 +492,7 @@ features:
       parity: [nvim.mapmode.lang]   # the 8th namespace, realised on the pre-dispatch stage (D-048 answering KL-Q-LANG-ARG)
       contract: [../spec/parity/contracts/vim-style.yaml]
       design: [../docs/design/input-engine.md]
-      verify: [../tests/parity/vim/lang-arg.yaml]
+      verify: [../apps/tui/tests/lang_arg_e2e.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "A translation stage exists in the input pipeline where a language map can rewrite a key before dispatch."
       - "The stage applies to the Insert and Command-line namespaces and to commands reading a single character, and to nothing else."
@@ -364,8 +507,10 @@ features:
     # namespaced commands invocable by STABLE id independent of any key (#1); metadata (typed ArgSchema,
     # category, when) is introspectable (#3); the frontend palette (C-P) lists context-appropriate
     # commands filtered by the minimal C-CONTEXT (When over Context{mode,has_selection}) and shows each
-    # command's static keymap-layer binding via LayerStack::key_for/InputEngine::binding_label (#2). All
-    # three acceptance criteria met + tested (registry 5, keymap key_for 1, binding_label 1, palette 2).
+    # command's current binding in the active profile and mode, found by feeding one- and two-key
+    # sequences to a fresh engine (InputEngine::binding_labels, #956; the static-layer lookup it replaced
+    # left u/CTRL-R/J/0/$ blank and always read Vim) (#2). All three acceptance criteria met + tested
+    # (registry 5, keymap key_for 1, binding_labels 1, palette 2).
     # MVP-minimal per ruse-mvp-minimal-slice: the full CommandSpec ecosystem fields (capabilities/trust/
     # declared side-effects/undoable/exec/repeatable/api_since), the when-expression DSL + full Context
     # Key registry, typed-argument commands, macros, and grammar-command binding reverse-lookup are the
@@ -387,7 +532,7 @@ features:
       # command-registry/palette this feature ships, so it is READY-WITH-SCOPE (carve-out), not a blocker.
       parity: []
       design: [../docs/design/command-engine.md, ../docs/architecture/architecture.md#2, ../docs/design/render-and-frontends.md]
-      verify: [../tests/unit/command-registry, ../tests/integration/palette-context]
+      verify: [../crates/core/src/registry.rs, ../crates/core/src/command.rs, ../apps/tui/src/ui/palette.rs]
     acceptance:
       - Commands are invocable by stable namespaced ID independent of any key binding.
       - The palette lists only context-appropriate commands and shows each command's current binding.
@@ -414,7 +559,7 @@ features:
     trace:
       parity: []
       design: [../docs/architecture/architecture.md#3, ../docs/design/editing-language.md, ../docs/design/persistence-and-recovery.md]
-      verify: [../tests/parity/vim/undo-tree.yaml, ../tests/unit/undo-grouping]
+      verify: [../crates/core/src/undo.rs, ../apps/tui/tests/vim_line_undo.rs, ../apps/tui/tests/filter_undo.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - "An i…<Esc> insert session is a single undo step, not one step per keystroke."
       - Formatter/LSP edits group as separate undo units from user edits.
@@ -432,17 +577,38 @@ features:
     # synchronized output: the diff batch is fenced in ?2026h/l when the F-010 ledger confirms it
     # (tested). #2 profile pinned: F-010 probes once in TermGuard; sync_output read once + held
     # (INV-RENDER-PROFILE). The full semantic Render-Tree IR (render-and-frontends.md §1-7) + enhanced
-    # tier (kitty graphics/inline images, TERM-GFX) + horizontal scroll stay post-MVP.
+    # tier (kitty graphics/inline images, TERM-GFX) stay post-MVP.
+    # #615/#616 (v0.1.7): soft wrap with 'linebreak'/'showbreak'/'breakindent', 'display', the wrapped
+    # viewport (nvim's update_topline, 'scrolljump'), horizontal scroll ('sidescroll', 'sidescrolloff',
+    # zh/zl/zH/zL/zs/ze) and the screen-line motions gj/gk/g0/g^/gm/g$ (ui/line_layout.rs,
+    # ui/window_view.rs); the number/sign gutter and 'list'/'listchars'. #615/#616 rest: the scroll keys
+    # CTRL-E/CTRL-Y/CTRL-D/CTRL-U/CTRL-F/CTRL-B count screen rows (scroll.rs, nvim's move.c), 'scroll',
+    # 'smoothscroll' (the top line's skipped columns on the View), 'cursorline'/'cursorlineopt',
+    # 'cursorcolumn', 'colorcolumn', 'fillchars' (the `~` rows past the end), 'foldcolumn'; control
+    # characters show as ^X / <xx> and never reach the terminal raw (#1181). 'statuscolumn' is not
+    # supported (an expression language; running Vimscript is a non-goal).
+    # #1222: a message too long for the status bar is wrapped above nvim's hit-enter prompt
+    # (ui/message.rs), a file message cut at its start with `<` ('shortmess' t). #1235: messages carry a kind
+    # where they are set (app/messages.rs); :[count]messages [clear] shows/trims the history nvim keeps (errors,
+    # warnings, reports; not echoes, option replies, file messages or :silent output), sized by 'messagesopt'
+    # history: (500); output taller than the screen pages with -- More -- (ui/message.rs Pager).
+    # #1276: the line-count reports follow nvim's wording and the 'report' option (global, default 2, E487
+    # below 0; app/report.rs): `3 fewer lines`/`1 line less`/`3 more lines` after d, c, p, gq, :d, :t, :pu,
+    # :sort u and :g; `3 lines yanked [into "x]`/`block of 3 lines yanked`; `3 lines moved`; `3 lines >ed 2
+    # times`; `3 substitutions on 2 lines` (counted by substitutions); only past 'report', for Normal, Visual,
+    # `.` and Ex alike (the :s///n count always shows); :j and x give none; E486 reads `Pattern not found`.
+    # Not yet: the undo/redo report (`1 more line; before #2  0 seconds ago`) and the `N lines changed` /
+    # `indented` / `filtered` reports of g~, =, !.
     # Repoint (D-043): TERM-SYNC-1 -> census nvim.termmode.synchronizedoutput (from #91); the render-
     # architecture / heuristic / post-MVP-graphics ids (TERM-COLOR-1 truecolor, TERM-WIDTH-1 width,
     # TERM-GFX-1/2/3 images) are backlogged; NVIM-UI-2 stays derived via its other UI citer.
     status: done
     depends_on: [C-RENDER, C-TERMINAL]
-    summary: Render-diff output on the compatibility path; grapheme-correct widths.
+    summary: Render-diff output on the compatibility path; grapheme-correct widths; soft wrap, horizontal and screen-row scrolling, the line-number and fold gutter, cursor/colour columns.
     trace:
       parity: [nvim.termmode.synchronizedoutput]
       design: [../docs/design/render-and-frontends.md, ../docs/architecture/architecture.md#6]
-      verify: [../tests/unit/render-diff, ../tests/integration/render-profile-pin]
+      verify: [../apps/tui/src/ui/render.rs, ../apps/tui/tests/screen_lines.rs, ../apps/tui/tests/screen_scroll.rs, ../apps/tui/tests/pty_wrap.rs]
     acceptance:
       - Only changed cells are emitted (no full-screen redraw).
       - Render profile/tier is pinned per session and not flipped on probe noise.
@@ -463,6 +629,23 @@ features:
     # (6 core Workspace tests + 3 tiling tests, #102). MVP-minimal per ruse-mvp-minimal-slice: the
     # full recursive layout tree / tab pages / resize / folds / session persistence / global-registers-
     # across-views are the post-MVP C-WORKSPACE elaboration (design-code-ack in view-window-workspace.md).
+    # #611 quit semantics (nvim v0.12.6, 'hidden' on): `:q`/`:q!`/`:wq`/`:x`/`ZZ`/`ZQ`/`C-w q` close the
+    # focused window and end the editor only on the last one; there a modified buffer refuses (E37 for
+    # the focused one, E162 for a hidden one — also under `:q!`); `:qa[ll]`/`:quita[ll]` quit from any
+    # layout (`!` abandons every change), `:cq [N]` exits with status N, `:hide` and the `!` forms of
+    # `:close`/`:only` are accepted. A buffer is never unloaded by a window close, so `:q!` in a split
+    # keeps a hidden buffer's changes (nvim discards them) — the conservative side of #736.
+    # #1068: `{count}C-w w` / `C-w {count}w` / `{count}C-w W` go to window `count` (the last one when there
+    # are fewer); `C-w C-w` = `C-w w`, `C-w W` steps back.
+    # #1141 folds (view-local, frontend; apps/tui/src/folds.rs, nvim v0.12.6 `fold_*` fixtures): manual
+    # folds nest (`zf` inside a fold, or around one, as nvim's foldCreate), with one-line folds; `zo`/`zc`/
+    # `za`/`zO`/`zC`/`zA`/`zv`/`zx`/`zX`/`zr`/`zm` walk the nesting, `zd`/`zD`/`zE` delete over it,
+    # `[z`/`]z`/`zj`/`zk` move over it. An Ex range grows to the closed folds it starts or ends in (two
+    # addresses or a whole-fold command, not inside `:g`). `:[range]fo[ld]`, `:foldo[pen][!]`,
+    # `:foldc[lose][!]`, `:foldd[oopen] {cmd}` and `:folddoc[losed] {cmd}` (run per line as `:g` does).
+    # `'foldopen'` (editor.foldopen, nvim's items and default) applies to typed keys only, not to a macro
+    # or `:normal` (nvim's KeyTyped); a shift and Insert open the fold always. `zz`/`zb` and `H`/`M`/`L`
+    # count a closed fold as one row, as `C-e`/`C-y`/`C-d`/`C-u`/`C-f`/`C-b`/`zt` and 'scrolloff' do.
     status: done
     depends_on: [C-VIEW, C-WORKSPACE]
     summary: Same buffer openable in multiple views; view-local state stays in the view.
@@ -481,7 +664,7 @@ features:
       # F-002/005/008). Chain closes via parity_na (gov implementable F-007 = READY).
       parity: []
       design: [../docs/design/view-window-workspace.md, ../docs/architecture/architecture.md#7, ../docs/design/render-and-frontends.md]
-      verify: [../tests/integration/split-independent-cursors, ../tests/unit/view-local-state]
+      verify: [../crates/core/src/workspace.rs, ../apps/tui/src/ui/window_view.rs, ../apps/tui/tests/session_intercepts.rs, ../apps/tui/tests/scenarios.rs]
     acceptance:
       - Splitting shows two views of one document with independent cursors and scroll.
       - View-local state (cursor, folds, selection) stays in the view, not the buffer.
@@ -494,13 +677,101 @@ features:
     priority: must
     # done (#94): apps/tui/src/persist/ — atomic::save (temp+fsync+rename+dir-fsync, #1),
     # encoding::FileFormat (detect+preserve BOM/CRLF, #2), journal (append-only framed records,
-    # torn-tail-tolerant replay, #4), assess_recovery + prompt_recovery (open-time 3-way, never
-    # auto-overwrites, #3/#4). MVP-minimal per ruse-mvp-minimal-slice: the full four-state /
+    # torn-tail-tolerant replay, #4), the open-time recovery prompt (never auto-overwrites, #3/#4). MVP-minimal per ruse-mvp-minimal-slice: the full four-state /
     # inverse-edit / incremental journal in persistence-and-recovery.md is the post-MVP C-PERSIST
     # elaboration. 20 unit + 3 integration (tests/persist_roundtrip.rs) tests; all 4 acceptance met.
+    # #610 Ex file commands (nvim v0.12.6; apps/tui/src/app/file_cmds.rs, tests/file_commands.rs):
+    # `:[range]w[!] [++ff] [file]`, `:w >> [file]` (append in place), `:w !cmd`, `:up`, `:wq[!] [file]`,
+    # `:x[!]`, `:sav[!] {file}`, `:wa`/`:wqa`/`:xa`, `:e[!] [++ff] [+cmd] [file]` (a missing file opens as
+    # a new buffer), and `%`/`#`/`#n` with the `:p :~ :. :h :t :r :e` modifiers. Replacing writes keep the
+    # atomic save and its non-regular-file refusal; E13/E17/E139/E140/E141/E172/E212/E502 as nvim.
+    # v0.1.8 (#864/#865/#868/#935/#936): every fsync counts (E667 keeps the buffer modified), unique temp
+    # names, in-place write for hard links / unreproducible owner or xattrs / non-writable directory (nvim's
+    # backupcopy=auto; E514 on a partial write), E505 for a read-only file without `!`.
+    # v0.1.8 RFC-0023 slice 2 (D-064, #932/#1192/#1196): the journal is per-transaction RJ01 (persist/rj01.rs:
+    # schema 1.0, CRC32C, Header/Checkpoint/Edit with inverse/Meta/Marker) in $XDG_STATE_HOME/ruse/journal/
+    # (0700/0600, `<basename>.<path hash>.rj`, unnamed buffer by pid + start time), synced after 4 s idle,
+    # 200 changes or before `:!`/filters/`:terminal`; compaction past 1 MiB; a DiskBase above 32 MiB; legacy
+    # RJS0 sidecars read once and archived. Replaces the snapshot throttle.
+    # v0.1.8 RFC-0023 slice 3 (#933/#1193/#1194/#1197; ui/recovery.rs, persist/diff.rs, tests/pty_recovery.rs):
+    # acceptance 3 is now three-way: [r] recover (disk text + one undoable change, always: a non-UTF-8 change
+    # goes through a line filter, or a read into an empty file, plus a final-newline edit in one undo group)
+    # / [d] show diff (bounded line Myers, read-only view) / [e] edit the disk file /
+    # [k] discard (both archive the journal, never delete) / [q] quit, no other key. A journal whose owner
+    # is still running on this host (pid + start time) gives E325's [o] read-only (E45 on `:w`) / [e] edit
+    # anyway / [q] quit; a second session journals beside it as `<name>.<pid>.rj` and never deletes another
+    # session's journal. #1210: when such a second session crashed, the in-use prompt names its work and
+    # adds [r] recover its changes (the recovery prompt for that journal). A save removes temp files a
+    # crashed save left (`.<name>.ruse-tmp-<pid>-<hex>`).
+    # #934 (RFC-0023 §9; persist/retention.rs): at startup, at most once a day (stamp `journal/archive-sweep`),
+    # archives older than 14 days (counted from the archiving) are removed and at most 20 are kept per
+    # document path, newest first; archives are `<name>@<unix ms>` (the `@` written only by archiving, so a
+    # shortened long name is swept too); only those names, regular files, no symlink followed; live
+    # journals are never touched. `:checkhealth` shows the archive's count, size and last sweep.
+    # #938 (RFC-0023 slice 4, first part): `[journal!]` after `[+]` while the last journal write failed;
+    # the first failure's E303 names the journal.
+    # v0.1.5 (#610; app/ex_more.rs): the alternate file name a `:w {file}`, `:sav` or `:file {name}` leaves
+    # (`#`, `"#`, `:e #`, `:b#`), `:f[ile] [{name}]`/`:0file`, `:fin[d]`/`:sf[ind]` over the default
+    # `'path'` (`.,,`), `:dr[op]`, `:vi[sual]`, `:pw[d]`, `:cd`/`:chd[ir]` (`-`, `~`; buffer paths follow).
+    # v0.1.8 (#1211; app/dispatch.rs ReadOnly, tests/pty_readonly.rs): the per-buffer 'readonly' option
+    # (`:set ro`/`noro`/`ro?`, no config key: it is buffer state), `ruse -R` (nvim's readonly mode: every
+    # file the session opens is read-only until a `:set noro`), `[RO]` after `[+]` on the status line
+    # (`f.txt [+][RO]`, nvim's `%m%r`), W10 on the first change or Insert start of an unmodified read-only
+    # buffer (once until 'readonly' is set again, no 1 s pause), and `:w!` resetting 'readonly'.
+    # Not modeled yet: `:view`/`:sview`, `:lcd`/`:tcd` (no window-local directory),
+    # `:oldfiles`/`#<n` (no viminfo/shada), and `:file`'s `[Not edited]` state.
+    # #938 (RFC-0023 slice 4, second part; persist/disk.rs, tests/pty_disk_changed.rs): `[disk changed]`
+    # when the file differs from what ruse read or saved (stat, confirmed by a content hash), checked on
+    # the 4000 ms idle timer, after a shell command, on `:checkt[ime]` and before a save; W11/W12 once
+    # per change (no reload offer); a save without `!` into a changed file is refused. #1221: a deleted
+    # file gives nvim's E211 once (no flag), and `:w >> %` is ruse's own write, not a disk change.
+    # v0.1.9 #619 write path (persist/backup.rs, app/write_opts.rs, tests/pty_backup.rs, tests/write_options.rs):
+    # one backup engine under both profiles. Vim/Native (nvim v0.12.6): 'backup', 'writebackup' (guards an
+    # in-place write; a rename needs none), 'backupdir' (`.`, `//` whole-path names, created 0700),
+    # 'backupext', 'backupskip' (temp dirs), 'patchmode', 'backupcopy' (auto/yes/no, breaksymlink,
+    # breakhardlink), 'write' (E142), 'writeany' (no E13), 'fsync', E509/E510/E589, and the per-buffer
+    # 'endofline'/'endoffile' (a DOS file's CTRL-Z)/'bomb' (`:set bomb` modifies). Emacs profile (Emacs 31.1,
+    # config keys emacs.*): make-backup-files (first save of a visit), backup-directory-alist, version-control,
+    # kept-new/old-versions, delete-old-versions, backup-by-copying(-when-linked/-mismatch/-privileged-mismatch),
+    # file-precious-flag, break-hardlink-on-save, file-preserve-symlinks-on-save, (mode-)require-final-newline,
+    # (small-)temporary-file-directory. Emacs C-x C-s and the palette's save now honour the same options as
+    # `:w` (they ignored `:set fixeol` before). Divergences: no Lisp make-backup-file-name-function, no prompt
+    # inside a save (delete-old-versions nil keeps versions, require-final-newline ask adds none), no
+    # M-x set-variable (config keys + :config-reload).
+    # v0.1.9 #619 buffer state and quit policy (app/abandon.rs, tests/buffer_state.rs, tests/pty_quit_policy.rs,
+    # tests/pty_disk_changed.rs): 'modifiable' (E21 for every change and undo, enforced at the editor's entry
+    # points), 'modified', 'hidden' (default on as nvim; off: E37 on :e/:enew/:b/:bn/:bp/:q/:close, E445 on
+    # :only), 'autowrite' (:b family, before :!/:r !/filters), 'autowriteall' (+ :e, :enew, :q, :qa),
+    # 'confirm' and :confirm (nvim's Yes/No/Save All/Discard All/Cancel dialog, then the command again),
+    # 'autoread' (default on as nvim: an unmodified buffer whose file changed is re-read as one undoable
+    # change; W11 only with noautoread). CTRL-W q / CTRL-W c run as :quit / :close through the same gate;
+    # 'modifiable'/'modified' are trace tokens (ex_modifiable, ex_modified). The Emacs-profile counterparts (view-read-only, confirm-kill-*,
+    # buffer-offer-save, revert-*, query-about-changed-file, save-some-buffers-default-predicate) come next.
+    # v0.1.9 #619 Emacs profile (Emacs 31.1; app/session/emacs_files.rs, tests/emacs_files.rs,
+    # tests/pty_emacs_files.rs): C-x C-c save-buffers-kill-terminal (save-some-buffers, "Modified buffers
+    # exist; exit anyway?", confirm-kill-processes, confirm-kill-emacs), C-x s save-some-buffers (y n ! . q M-~,
+    # save-some-buffers-default-predicate, buffer-offer-save), M-x revert-buffer and C-x x g
+    # revert-buffer-quick (revert-without-query, revert-buffer-quick-short-answers), C-x C-f find-file with
+    # query-about-changed-file, C-x C-q read-only-mode with view-read-only's View mode; yes-or-no-p /
+    # y-or-n-p / C-g as Emacs. The Emacs profile drops nvim's W11/W12 announcements and 'autoread'.
+    # v0.1.9 #619 formats (persist/encoding.rs, tests/file_formats.rs, tests/pty_large_file.rs): 'fileformat'
+    # unix/dos/mac per buffer (modifies; [dos]/[mac] in the write report), 'fileformats' read detection as nvim,
+    # ++ff=mac, 'binary' (:set bin, ++bin, ruse -b: no conversion, tw/wm/et zeroed and restored); Emacs
+    # large-file-warning-threshold (y/n/l) and out-of-memory-warning-percentage; the degraded large-file
+    # profile past 32 MiB (no highlighting, [large]); bounded undo / streaming search still to come.
+    # v0.1.9 #619 journal as swap/auto-save (tests/pty_autosave.rs): 'swapfile' / Emacs auto-save-default (no
+    # journal when off), 'updatecount' (sync count; 0 = none), 'directory' shown read-only; Emacs
+    # auto-save-visited-mode / -interval save the visited file after the idle interval. Divergences:
+    # auto-save-file-name-transforms, lock-file-name-transforms (the journal owner is the lock),
+    # auto-save-visited-predicate. editor.line_endings documented as superseded by files.fileformats.
+    # v0.1.9 #619 Emacs visiting (tests/emacs_files.rs, tests/pty_emacs_visit.rs): find-file-wildcards,
+    # find-file-visit-truename, the same-file message (find-file-suppress-same-file-warnings), (New file),
+    # confirm-nonexistent-file-or-buffer, directory-abbrev-alist, auto-mode-case-fold, C-x C-w write-file with
+    # change-major-mode-with-file-name, M-x find-sibling-file with find-sibling-rules. Divergences:
+    # major-mode-remap-alist, mounted-file-systems, remote-shell-program, save-abbrevs, existing-other-name nil.
     status: done
     depends_on: [C-DOCUMENT, C-WORKSPACE, C-PERSIST]
-    summary: Atomic save preserving encoding/line-endings; append-only recovery journal.
+    summary: Atomic save preserving encoding/line-endings; append-only per-transaction recovery journal.
     trace:
       # Census-N/A (#93, D-043). F-008 is ruse PERSISTENCE ARCHITECTURE (C-PERSIST), not an
       # enumerable upstream surface: no editor's source tree TABULATES "atomic write / fsync
@@ -515,7 +786,7 @@ features:
       # statefulness) is a vim.md prose bullet, never a catalog row — demoted to this annotation.
       parity: []
       design: [../docs/design/persistence-and-recovery.md]
-      verify: [../tests/fault-injection/truncated-journal, ../tests/unit/save-atomic]
+      verify: [../apps/tui/tests/journal_torn_write.rs, ../apps/tui/tests/journal_roundtrip.rs, ../apps/tui/tests/fs_faults.rs, ../apps/tui/src/persist/atomic.rs, ../apps/tui/tests/pty_recovery.rs]
     acceptance:
       - 'The "Saved" UI reflects a durable write (fsync), not just a successful syscall.'
       - Save preserves the file's original encoding and line-ending style.
@@ -554,7 +825,7 @@ features:
       # as F-003/F-025 shipped done.
       parity: []
       design: [../docs/design/vim-regex.md]
-      verify: [../tests/parity/vim/search-substitute.yaml]
+      verify: [../crates/core/src/editor/search.rs, ../crates/core/tests/pattern_oracle.rs, ../tests/parity/vim/fixtures/corpus.yaml, ../apps/tui/tests/parity_compare.rs]
     acceptance:
       - Incremental highlight of matches with smartcase (case-smart) search.
       - "Range :s///[flags] substitutes with g/c/i flags and honors gdefault inversion."
@@ -568,7 +839,7 @@ features:
     # done (#92): apps/tui/src/caps/ — a DA1-fenced probe (probe.rs: query_batch ends with the DA1
     # fence, ProbeParser stops at it, no per-cap timeout) feeding the {value,source,confidence}
     # ledger (ledger.rs: Source precedence Default<EnvHint<Probed<UserOverride, override always
-    # wins) with enter/exit push-pop (sequences.rs: exit reverses enter). Wired in main.rs TermGuard
+    # wins) with enter/exit push-pop (sequences.rs: exit reverses enter). Wired in the session's TermGuard
     # (poll() is a liveness net only; is_terminal-guarded; env hints + RUSE_NO_* overrides). All 3
     # acceptance criteria met + tested: 12 unit + 7 integration (tests/caps_probe.rs) over canned
     # DA1-fenced streams (modern/bare/split/stray-input/not-recognised).
@@ -585,14 +856,14 @@ features:
       # button/any probe pair. Six concerns have NO DA1-probe census home and are tracked in
       # spec/parity-backlog.yaml, not silently dropped: TERM-PROBE-2 (confidence ledger — ruse-ADAPTED,
       # F-010 acceptance #2, no upstream denominator), TERM-PROBE-3 (tmux/screen passthrough, L2),
-      # TERM-MOUSE-2 (focus 1004 — SET-only, never DA1-queried), TERM-GFX-4 (cell-pixel CSI 14/16 t),
+      # TERM-MOUSE-2 (focus 1004 — SET-only, never DA1-queried; ruse sets it from the ledger, #1220), TERM-GFX-4 (cell-pixel CSI 14/16 t),
       # TERM-OSC52-1 (clipboard write — a runtime provider, not a TUI probe). TERM-COLOR-1 (truecolor)
       # is NOT F-010's — it is a render concern already derived by F-006's trace.parity.
       parity: [nvim.termmode.bracketedpaste, nvim.termmode.mousesgrext, nvim.termmode.mousebuttonevent,
                nvim.termmode.mouseanyevent, nvim.termmode.synchronizedoutput, nvim.termmode.resizeevents,
                nvim.keyenc.kitty, nvim.keyenc.xterm, nvim.keyenc.legacy]
       design: [../docs/architecture/architecture.md#6]
-      verify: [../tests/unit/capability-ledger, ../tests/integration/da1-probe]
+      verify: [../apps/tui/src/caps/ledger.rs, ../apps/tui/src/caps/probe.rs, ../apps/tui/tests/caps_probe.rs]
     acceptance:
       - Capabilities are probed via queries fenced by DA1 (no arbitrary timeouts), not judged by TERM alone.
       - Each ledger entry carries {value, source, confidence}; a user override always wins.
@@ -608,8 +879,9 @@ features:
     # determinism boundary honored. Slice 2: a real VT screen — `term_grid::Grid` driven by the `vte` parser
     # (colors incl. truecolor, cursor addressing, erase, alt-screen, resize via TIOCSWINSZ), so full-screen
     # TUIs (vim/htop) render. Slice 2b (partial): scroll regions (DECSTBM) + IL/DL/ICH/DCH/ECH, so region-
-    # scrolling apps (less/vim/git-log/tmux) render correctly. REMAINING: scrollback paging UI + mouse +
-    # bracketed paste (slice 2b), Windows ConPTY (slice 3), C-SCHEDULER integration (slice 4). Stays `planned`
+    # scrolling apps (less/vim/git-log/tmux) render correctly. Bracketed paste into the child landed with #600
+    # (bracketed when the child set ?2004h, ESC/C1 dropped). REMAINING: scrollback paging UI + mouse (slice
+    # 2b), Windows ConPTY (slice 3), C-SCHEDULER integration (slice 4). Stays `planned`
     # — unix VT emulator, not yet cross-platform + scheduler-integrated. See docs/design/terminal.md.
     status: planned
     depends_on: [C-TERMINAL, C-WORKSPACE, C-SCHEDULER]
@@ -628,12 +900,12 @@ features:
     title: Emacs input profile
     stage: post-mvp
     priority: should
-    # progress (#139): the profile SEAM is in — InputProfile{Vim,Emacs} on the engine; `feed` branches to
-    # the non-modal `feed_emacs` BEFORE any Vim modal handling (Emacs has no Normal/Insert grammar). Minimal
-    # global-map: C-f/C-b/C-n/C-p/C-a/C-e motions + self-insert; `d` is literal, not the Vim operator.
-    # `RUSE_PROFILE=emacs` selects it (no config loader yet). Motions work in one state because Move* keeps
-    # the mode. REMAINING: 9-tier stack, C-x/C-c prefix maps, prefix-arg channel (D-049), kill-ring view
-    # (D-026), mark-ring (D-027), M-x (C-COMMAND). Stays `planned` — this is the seam, not the profile.
+    # progress: InputProfile{Vim,Emacs,..} on the engine; `feed` branches to the non-modal `feed_emacs` BEFORE
+    # any Vim modal handling (Emacs has no Normal/Insert grammar). apps/tui/src/input/emacs.rs holds the keymap
+    # layer stack, the C-x prefix map, a numeric C-u path, M-x and the kill commands. `RUSE_PROFILE=
+    # emacs` or the config key `input.profile = "emacs"` selects it (#614). REMAINING includes the raw prefix argument and the other prefix
+    # maps (D-049, #650), the command model (#651), Vim-frontend interception (#604), the yank-pop kill-ring view
+    # (D-026, #653), the mark ring (D-027, #654) and keyboard macros (#657).
     status: planned
     depends_on: [C-INPUT, C-COMMAND, C-POSHIST]
     summary: Prefix keys, M-x, mark/region, kill ring, universal argument, major/minor modes.
@@ -700,7 +972,7 @@ features:
     # diag+hover+format+rename+completion pipeline is verified end-to-end vs real rust-analyzer (live_lsp_pipeline
     # ignored smoke). Slice 6 (#304): references (:references/:refs/:ref) — textDocument/references → a
     # references picker (Picker<(uri,line,char)>, reusing the F-004/F-013 overlay) → Enter jumps (same/cross
-    # file). Slice 7 (#307): code-actions (:codeaction/:ca) — textDocument/codeAction w/ reconstructed
+    # file). Slice 7 (#307): code-actions (:codeaction; :ca is nvim's :cabbrev, #609) — textDocument/codeAction w/ reconstructed
     # context.diagnostics → an action picker → Enter applies the WorkspaceEdit (shared multi-file apply w/
     # rename). ORCHESTRATION now lives in app/lsp_coordinator.rs (#306); apply_edits is provenance-agnostic
     # (#305, origin param). #308: fast RA-independent contract tests (mock JSON-RPC round-trip + undo). #309:
@@ -754,6 +1026,28 @@ features:
     # exist: manual folds in apps/tui/src/folds.rs and node-depth auto-indent in apps/tui/src/indent.rs are
     # built, wired, and unit-tested — they are just not yet DRIVEN by tree-sitter queries.) The parity chain
     # (legacy NVIM-TS-*) is also not yet repointed.
+    # #1205/#1206 (oracle-verified vs nvim v0.12.6 with `filetype indent on`): a Python buffer is indented
+    # as nvim's `python#GetIndent` does, not by node depth — `=`, `o`/`O`/`<CR>`, `cc`/`S` and the Python
+    # 'indentkeys' (`else`, `elif`, `except`, `:`, a closer or `#` typed first, `i_CTRL-F`) dedent after
+    # `return`/`pass`/`break`/`continue`/`raise`, align a bracket continuation (or `shiftwidth() * 2` after
+    # a bracket ending its line), and line up `elif`/`else`/`except`/`finally`. Strings and comments come
+    # from the tree, as nvim's with `syntax on`. In brace languages a closer typed first lines up with its
+    # opener. C buffers are indented by the cindent port, not node depth (#1163).
+    # #1214 (oracle-verified, `unc_*`): a block not closed yet indents by the depth it will have: a window
+    # from the top-level line above (at most 1000 rows) is parsed with the closers of its open brackets (and
+    # sh `fi`/`done`/`esac`) appended (<= 2 ms a key on any file size, release), and where it
+    # is still broken around the line `o`/`O`/`<CR>` keep the line's indent (autoindent). #1206 (`ik_*`):
+    # the other node-depth languages' 'indentkeys' re-indent the line by its depth after the key: sh
+    # `then`/`do`/`else`/`elif`/`fi`/`done`/`esac`/`end`/`;;`/`;&` (and `fin`... undoing `fi`), C `0#` (column
+    # 0) and `e`, JavaScript `e`, `:` after `case`/`default` in C/JavaScript/Go; Go `case`/`default` line up
+    # with `switch`. #1206 rest (`ik_*`): `0{` in C/JavaScript/Rust/CSS/sh (Go has none) lines an Allman
+    # `{` up with the statement whose body it opens (in that line's columns), and `=`/`o` lay Allman bodies
+    # one level under both; sh `)` (case patterns) re-indents by depth; C `:` after a jump label puts it in
+    # column 0 when the line above ends a statement (`=` too; its statement keeps the label's level, in
+    # JavaScript and Go as well); a typed C `case`/`default` lines up with the previous label of its
+    # switch. JSON's `e` is not built (no JSON line starts with `else`). #1163: C moved to the cindent port
+    # (its continuation indent and hand-placed lines now match); JavaScript's operator continuation
+    # (GetJavascriptIndent) is not modelled.
     status: planned
     depends_on: [C-DOCUMENT, C-RENDER, C-SCHEDULER]
     summary: Incremental structural highlighting from snapshots; injections; TS folds/indent.
@@ -908,7 +1202,7 @@ features:
     summary: A `:checkhealth` command reporting the running editor's health — active input profile +
       caret gravity, detected terminal capabilities, syntax-grammar availability for the current buffer,
       open-buffer count, and trace/replay status — the Neovim `:checkhealth` analogue, so a user can
-      diagnose "why isn't X working" without reading the ntic log.
+      diagnose "why isn't X working" without reading the log.
     trace:
       parity: []
       design: [../docs/design/health-check.md]
@@ -917,8 +1211,11 @@ features:
       - '`:checkhealth` renders a report covering input profile, terminal capabilities, syntax-grammar
         availability, buffer count, and trace/replay status.'
       - The report is produced by a PURE, unit-tested builder (frontend snapshot in -> report out); the
-        command is a thin wiring over it, so the core stays IO-free and the logic is covered off main.rs.
+        command is a thin wiring over it, so the core stays IO-free and the logic is covered off the session loop.
       - Each row reports OK / WARN / absent with a one-line reason (the Neovim checkhealth ok/warn shape).
+    # v0.1.8 (#938, RFC-0023 §8; health.rs, tests/fs_faults.rs): `:checkhealth` lists every row in the
+    # view-only listing with the summary on the status line, and adds the recovery-journal rows (journal
+    # directory; per file buffer size, last sync age, waiting changes, failed writes and path).
 
   F-022:
     title: Command traces & deterministic replay
@@ -937,11 +1234,15 @@ features:
       no external-editor parity). Deterministic replay is the contract and the substrate for the test corpus.
     trace:
       parity: []
-      design: [../docs/rfc/proposed/RFC-0012-collapse-to-two-crate-editor.md]
-      verify: [../crates/core/tests/editor_spine.rs, ../crates/core/tests/properties.rs]
+      design: [../docs/rfc/accepted/RFC-0012-collapse-to-two-crate-editor.md, ../docs/rfc/accepted/RFC-0020-ex-edits-in-the-trace.md]
+      verify: [../crates/core/tests/editor_spine.rs, ../crates/core/tests/properties.rs, ../apps/tui/tests/trace_replay_ex.rs, ../apps/tui/tests/trace_save_check.rs, ../apps/tui/tests/pty_trace_replay.rs]
     acceptance:
       - Same initial document + same command trace → byte-identical final state (determinism is the contract).
       - "`:trace save` writes the session's command list; `ruse --replay <trace> <file>` reproduces the edits."
+      - "Ex edits (`:s` and its repeats `&`/`g&`/`:&&`, `:s///c` with its answers, `:g`, `:normal`, `:sort`, `:m`, `:t`, `:d`, `:r`, `:{range}!`) are recorded as resolved commands (D-061); replay reproduces them without reading a file or running a command."
+      - "Core state the session writes outside a command is recorded too (RFC-0020 R6): a language server's edits as the resolved edit list (`ex_edits`), the `:keepjumps` switch (`ex_keepjumps`), and register values no recorded command produced (`ex_register`: the read-only `\"/ \": \". \"% \"#`, clipboard reads, a macro's keys, and the registers filled when the trace began); `:trace save` says registers and clipboard text are included."
+      - "`:trace save` writes a trace only if it replays to the buffer it follows (#690): it replays the trace first, and a session it cannot follow (the file re-read by `:e!`, commands run in another buffer, the start buffer closed) is refused with the reason and nothing is written. A switch to another window on the buffer records that window's cursor and wanted column (`ex_place`, `ex_want`, #1272)."
+      - "`ruse --replay <trace> <file>` reads the file as the editor opens it (BOM dropped, CRLF as LF) and prints the result as `:w` writes it back (BOM, line endings, final newline), so a trace saved on a CRLF or BOM file replays onto that file and prints the bytes the session wrote."
       - A trace round-trips through its text form (to_text/from_text) without changing what it replays to.
       - The trace records semantic Commands (not keystrokes), so it survives keymap changes.
 
@@ -971,7 +1272,7 @@ features:
       - A fenced `![alt](img.png)` shows a real image on a graphics-capable terminal (Kitty first) and a
         bordered `alt`+dimensions placeholder on a plain terminal — same buffer, two render profiles
         (INV-CAP-DEGRADE, D-053).
-      - With `render.conceal = off`, rendering is byte-for-byte identical to plain syntax highlighting (no
+      - With `render.conceal = false`, rendering is byte-for-byte identical to plain syntax highlighting (no
         column drift; caret and paint agree — the layout-pass identity guard, P6).
       - Markdown and Org both render headings, emphasis, links (URL concealed, label faced), and checkboxes.
       - Selecting and yanking across concealed markup copies the RAW markup bytes — conceal is
@@ -990,6 +1291,12 @@ features:
       add buffer Disposition (Listed/Unlisted/Hidden) + BufferKind (Ordinary/Scratch/NoFile/Interactive). This
       is the cross-buffer layer over the existing F-007 arena; it unblocks global marks, buffer/file pickers,
       an editable q:, the "# register, and the "other buffers" completion source (D-057).
+    # done (#944, D-057 slice 2): the register store is Workspace-owned, so a yank reaches every buffer and
+    # split (core unit tests in workspace.rs). "# reads the alternate file name (#1022). A buffer whose last
+    # window closes stays loaded and hidden (#1044); uppercase marks work within their own buffer (#1103); marks,
+    # the jumplist and the change list follow edits as line anchors (#1124). Remaining (RFC-0018 accepted
+    # 2026-11-03): cross-buffer `A, (DocumentId, Anchor) jumplist entries with degrade-to-(path, line, col) on
+    # retirement, buffer disposition/kind, the retirement Effect, editable q:, other-buffers completion.
     trace:
       # Census-N/A (like F-007, D-043): this is ruse WORKSPACE ARCHITECTURE (C-WORKSPACE/C-VIEW ownership +
       # C-POSHIST/C-REGISTER scope) — "where editor-global state is owned" is an INV-DOC-VIEW/INV-NO-GLOBAL-STATE

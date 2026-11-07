@@ -3,9 +3,10 @@
 //! (no buffer mutation); the frontend resolves the keyword (like `*`/`gd`) and renders the echo / list.
 //!
 //! Scope is the current buffer only. Vim's `#include`-following forms (`:checkpath`, searching included
-//! files) are OUT (they need a cross-file include graph). ruse has no `iskeyword` option, so a "whole
-//! word" here means the keyword bounded by non-Word bytes, where Word = alnum + `_` + non-ASCII — the
-//! same class `*`/`#`/`gd`/word-motions use (a documented divergence from Vim's `iskeyword`-driven match).
+//! files) are OUT (they need a cross-file include graph). A "whole word" is what nvim's `\<word\>` finds:
+//! the occurrence starts and ends where Vim's character class changes ([`crate::charclass`], #745), the
+//! same classes `*`/`#`/`gd` resolve the keyword with. ruse has no `iskeyword` option; the classes use
+//! Vim's default.
 //!
 //! Semantics VERIFIED against nvim v0.12.4 (headless):
 //!   - `[i` / `N[i` — the N-th (default 1) whole-word match scanning from the TOP of the file. If that
@@ -18,48 +19,33 @@
 //!   - `]I` — list the matching lines strictly below the cursor; if there are none, list the current
 //!     line (nvim's fallback when the cursor sits on the last / only match).
 
-use crate::pos::{line_end, nth_line_start};
+use crate::pos::raw::{line_end, nth_line_start};
 
-/// A Word-class byte (alnum + `_` + non-ASCII), mirroring `motion::class`'s `Class::Word`. ruse has no
-/// `iskeyword`; keyword boundaries follow this class everywhere (`*`/`#`/`gd`), so `[i`/`]i` do too.
-fn is_keyword_byte(c: u8) -> bool {
-    c == b'_' || c.is_ascii_alphanumeric() || c >= 0x80
+/// Whether `line` contains `kw` as a whole word: an occurrence where Vim's `\<` and `\>` hold
+/// ([`crate::charclass::at_word_start`] / [`crate::charclass::at_word_end`]). `kw` is spelled as a
+/// pattern ([`crate::pattern::spell`]), and so is the line: a byte that is not UTF-8 is one char with the
+/// class of its Latin-1 char (#1243).
+fn line_has_keyword(line: &[u8], kw: &str) -> bool {
+    let line = crate::pattern::spell(line);
+    !kw.is_empty()
+        && line.match_indices(kw).any(|(i, m)| {
+            crate::charclass::at_word_start(&line, i)
+                && crate::charclass::at_word_end(&line, i + m.len())
+        })
 }
 
-/// Whether `line` contains `kw` as a whole word — an occurrence bounded on BOTH sides by a non-Word byte
-/// (or the line edge). `kw` is the raw keyword bytes; it is itself a Word run (resolved from the buffer),
-/// so this is a byte substring search with keyword-boundary guards.
-fn line_has_keyword(line: &[u8], kw: &[u8]) -> bool {
-    if kw.is_empty() || kw.len() > line.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i + kw.len() <= line.len() {
-        if &line[i..i + kw.len()] == kw {
-            let before_ok = i == 0 || !is_keyword_byte(line[i - 1]);
-            let after = i + kw.len();
-            let after_ok = after == line.len() || !is_keyword_byte(line[after]);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-/// The 1-based line numbers (file order) whose line contains `keyword` as a whole word. Empty `keyword`
+/// The 1-based line numbers (file order) whose line contains `keyword` (spelled as a pattern, as
+/// [`crate::Workspace::word_under_cursor`] gives it) as a whole word. Empty `keyword`
 /// yields an empty list. A trailing `\n` does not create a spurious final match (the empty tail can't
 /// match a non-empty keyword).
 pub fn keyword_line_numbers(bytes: &[u8], keyword: &str) -> Vec<usize> {
-    let kw = keyword.as_bytes();
-    if kw.is_empty() {
+    if keyword.is_empty() {
         return Vec::new();
     }
     bytes
         .split(|&b| b == b'\n')
         .enumerate()
-        .filter(|(_, line)| line_has_keyword(line, kw))
+        .filter(|(_, line)| line_has_keyword(line, keyword))
         .map(|(idx, _)| idx + 1)
         .collect()
 }
@@ -180,6 +166,20 @@ mod tests {
         assert_eq!(keyword_line_numbers(b"foo_bar\nfoo\n", "foo"), vec![2]);
         // Non-ASCII (Hangul) is a Word byte: `가` inside `가나` is not a whole-word `가`.
         assert_eq!(keyword_line_numbers("가나\n가\n".as_bytes(), "가"), vec![2]);
+        // #745: a change of script is a word edge, as for nvim's `\<API\>`.
+        assert_eq!(
+            keyword_line_numbers("x API를\nxAPI\n漢API\n".as_bytes(), "API"),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn a_byte_that_is_not_utf8_has_its_latin1_class() {
+        // #1243: 0xFF is a keyword char, so `foo<ff>` is no whole-word `foo`; 0x80 is punctuation.
+        let b = b"foo\xff\nfoo\x80\nx\xffy\n";
+        assert_eq!(keyword_line_numbers(b, "foo"), vec![2]);
+        let kw = crate::pattern::spell(b"x\xffy");
+        assert_eq!(keyword_line_numbers(b, &kw), vec![3]);
     }
 
     #[test]

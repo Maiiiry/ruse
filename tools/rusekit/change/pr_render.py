@@ -22,6 +22,13 @@ AI_BLOCK = """### AI assistance
   - Human verification performed: <how you verified — tests run, manual review, reasoning checked>"""
 
 
+def _migration(value) -> str:
+    """`artifacts.migration`: the reference `change set --migration` recorded, else "—"."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return "—" if value in (None, False) else str(value)
+
+
 def _fmt_list(items, empty="_none_"):
     items = items or []
     return ", ".join(str(i) for i in items) if items else empty
@@ -33,7 +40,7 @@ GATE_MARKER = "ruse-gate:v1"
 def _machine_block(c: dict) -> str:
     """A machine-readable gate block for CI. It carries the author's DECLARATION only — CI re-derives the
     observed kind + blast radius from the actual diff and re-runs verify, so this block is never trusted as
-    evidence (`.ruse/` stays untrusted). Generated, not hand-authored (D-021 permits generated JSON)."""
+    evidence (the local work dir stays untrusted). Generated, not hand-authored (D-021 permits generated JSON)."""
     gate = {
         "v": 1,
         "kind": c.get("kind"),
@@ -75,7 +82,7 @@ def build(issue: str, base: str | None, files: list[str] | None) -> str:
 
     # impact summary
     ip_path = os.path.join(repo.work_dir(issue), "impact.json")
-    impact_line = "_run `ruse impact --issue %s --out .ruse/work/%s/impact.json`_" % (issue, issue)
+    impact_line = "_run `ruse impact --issue %s --out %s`_" % (issue, repo.show(ip_path))
     if os.path.isfile(ip_path):
         try:
             ip = json.load(open(ip_path)) or {}
@@ -116,7 +123,7 @@ def build(issue: str, base: str | None, files: list[str] | None) -> str:
     L.append(f"- Public API: {con.get('public_api', False)} · "
              f"Protocol: {con.get('protocol', False)} · "
              f"Persistent format: {con.get('persistent_format', False)} · "
-             f"Migration: {art.get('migration', False)}")
+             f"Migration: {_migration(art.get('migration'))}")
     L.append("")
     L.append("### Evidence")
     L.extend(ev_lines or ["- _no recorded evidence — run `ruse verify` before merge_"])

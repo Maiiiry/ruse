@@ -4,6 +4,10 @@
 //! register `"-`, and the blackhole `"_`. The Emacs kill-ring (bounded ordered ring, coalescing, yank-pop)
 //! is still **deferred** (see `docs/design/register-model.md`).
 
+/// The most bytes a register value may hold in a trace record (RFC-0020 R6): nvim's `INT_MAX`, past which
+/// a put fails with E1240 ("Resulting text too long").
+pub const MAX_REGISTER_BYTES: usize = i32::MAX as usize;
+
 /// The paste GEOMETRY a register carries — the one dimension that governs how a paste lands.
 /// Charwise splices inline; linewise opens whole lines; blockwise drops a rectangle, one stored row per
 /// buffer line at a fixed column. This is the typed SHAPE of F-029 (`:help quote_bar`, blockwise via
@@ -27,6 +31,11 @@ pub enum RegKind {
 pub struct Register {
     text: Vec<u8>,
     kind: RegKind,
+    /// A block's width in screen cells (Vim's `y_width + 1`): a paste pads short rows to it. 0 otherwise.
+    width: usize,
+    /// The register was written, maybe with nothing (`qaq` leaves `a` set but empty, #1091). A default
+    /// register was never written: a put from it is E353.
+    set: bool,
 }
 
 impl Register {
@@ -36,6 +45,8 @@ impl Register {
         Register {
             text,
             kind: RegKind::Charwise,
+            width: 0,
+            set: true,
         }
     }
 
@@ -49,17 +60,41 @@ impl Register {
         Register {
             text,
             kind: RegKind::Linewise,
+            width: 0,
+            set: true,
         }
     }
 
     /// A blockwise register (`CTRL-V` yank/delete): the per-row slices already joined by `\n`. Stored
-    /// verbatim (ragged rows, no trailing newline); the paste path pads short target lines.
+    /// verbatim (ragged rows, no trailing newline); the paste path pads short target lines. Its width is
+    /// the widest row in screen cells, a `<Tab>` counting to Vim's default tabstop of 8; the editor's own
+    /// block ops know the real block and use [`Register::blockwise_width`].
     #[must_use]
     pub fn blockwise(text: Vec<u8>) -> Register {
+        let width = text
+            .split(|&c| c == b'\n')
+            .map(|row| crate::editor::text_cells(row, crate::cells::Tabs::uniform(8)))
+            .max()
+            .unwrap_or(0);
+        Register::blockwise_width(text, width)
+    }
+
+    /// A blockwise register whose block is `width` columns wide, wider than its rows when their trailing
+    /// white space was dropped (`zy`).
+    #[must_use]
+    pub fn blockwise_width(text: Vec<u8>, width: usize) -> Register {
         Register {
             text,
             kind: RegKind::Blockwise,
+            width,
+            set: true,
         }
+    }
+
+    /// A block's width in columns (0 for a charwise or linewise register).
+    #[must_use]
+    pub fn block_width(&self) -> usize {
+        self.width
     }
 
     /// The stored bytes.
@@ -86,6 +121,12 @@ impl Register {
         self.kind == RegKind::Blockwise
     }
 
+    /// Whether the register was ever written, even with nothing (`qaq`).
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.set
+    }
+
     /// Whether the register is empty (nothing has been yanked or deleted yet — paste is a no-op).
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -102,16 +143,20 @@ impl Register {
 /// UPPERCASE name (`"A`–`"Z`) APPENDS to the lowercase slot instead of replacing it, and the unnamed slot
 /// then mirrors the full appended content. The yank register `"0` holds the text of the most recent YANK
 /// (`:help quote0`) — but ONLY when the yank named no other register; a delete/change never touches it, so
-/// `"0` survives intervening deletes. `"0` is read-only from the edit path (you paste from it, `"0p`).
+/// `"0` survives intervening deletes. A yank or delete that names `"0` writes it (`"0yy`).
 ///
-/// Delete rings (`:help quote_number`, `:help quote-`): an UNNAMED delete/change of a whole line or more
-/// (linewise, or any span crossing a `\n`) shifts the numbered ring — `"1`→`"2`…→`"9` (the old `"9` is
-/// lost) — and lands in `"1`. An unnamed delete of LESS than one line goes to the small-delete register
-/// `"-` instead, leaving the numbered ring untouched. A delete that NAMES a register touches neither ring
-/// (Vim), and yanks never touch either. All are read-only from the edit path (`"1p`…`"9p`, `"-p`).
+/// Delete rings (`:help quote_number`, `:help quote-`, nvim `op_delete`): a delete/change of a whole line
+/// or more (linewise, or any span crossing a `\n`), or one over a motion that always uses `"1` (`%`, `(`,
+/// `)`, `{`, `}`, `` ` ``, `/`, `?`, `n`, `N`, `*`, `#`), shifts the numbered ring — `"1`→`"2`…→`"9` (the old
+/// `"9` is lost) — and lands in `"1`, whatever register was named. A delete of LESS than one line with no
+/// register named also goes to the small-delete register `"-`. Yanks never touch either ring. `"0`, `"1`–`"9`
+/// and `"-` can also be written by name (`"0yy`, `"-dw`); a delete names its register first, then shifts.
 #[derive(Clone, Debug)]
 pub struct RegisterStore {
     unnamed: Register,
+    /// The letter slot the unnamed register last took its content from (`"ayy`): nvim's unnamed register
+    /// points at that register, so re-recording it (`qaq`) changes what `p` puts (#1091).
+    unnamed_from: Option<usize>,
     /// Slots for `a`–`z`, indexed by `letter - 'a'`. Uppercase names append into the same 26 slots.
     named: [Register; 26],
     /// The yank register `"0`: the last unregistered yank, untouched by deletes/changes.
@@ -134,14 +179,15 @@ pub struct RegisterStore {
     /// deleted text but the (already-evaluated) result of an expression. The frontend collects the
     /// expression string via a prompt, the editor evaluates it (`crate::expr`) and stores the formatted
     /// result here with [`RegisterStore::set_expr`]; a following paste/insert reads it via `get(Some('='))`.
-    /// Always charwise (a computed value has no line geometry). Empty when evaluation failed (Vim's degrade).
+    /// Linewise when the result ends in a newline (nvim `"="x\n"`), else charwise. Empty when evaluation
+    /// failed (Vim's degrade).
     expr: Register,
     /// The four READ-ONLY special registers (`:help quote_/`, `quote_:`, `quote_.`, `quote%`): `"/` = the
     /// last search pattern, `":` = the last executed Ex command-line (no leading `:`), `".` = the last
     /// inserted text, `"%` = the current file name. Their DATA lives frontend-side (the search ring, the ex
     /// plumbing, the last-insert record, the focused buffer's path), so the [`Workspace`](crate::Workspace)
     /// syncs it into these slots via [`RegisterStore::set_special`] before dispatching a register-reading
-    /// command; `get` then returns them. Always charwise. A yank/delete NAMING one is swallowed (read-only).
+    /// command; `get` then returns them. Always charwise. An operator naming one fails in the editor (#1022).
     special: SpecialRegisters,
 }
 
@@ -153,12 +199,15 @@ struct SpecialRegisters {
     last_ex: Register,
     inserted: Register,
     file: Register,
+    /// `"#` — the alternate file name (`:help quote#`), synced by [`RegisterStore::set_alternate`].
+    alternate: Register,
 }
 
 impl Default for RegisterStore {
     fn default() -> RegisterStore {
         RegisterStore {
             unnamed: Register::default(),
+            unnamed_from: None,
             named: std::array::from_fn(|_| Register::default()),
             yank0: Register::default(),
             numbered: std::array::from_fn(|_| Register::default()),
@@ -182,6 +231,16 @@ impl RegisterStore {
     #[must_use]
     pub fn unnamed(&self) -> &Register {
         &self.unnamed
+    }
+
+    /// Whether a yank/delete may name `name` (nvim `valid_yank_reg(_, true)`): the unnamed register, a
+    /// letter, a digit, `"-`, `"_`, `"#`, and the clipboard. The read-only `"/ ": ". "% "=`, the drop
+    /// register `"~` and unknown names cannot be written: an operator naming one fails (#1022).
+    #[must_use]
+    pub fn is_writable(name: Option<char>) -> bool {
+        name.is_none_or(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '"' | '-' | '_' | '#' | '+' | '*')
+        })
     }
 
     /// The slot index for an `a`–`z`/`A`–`Z` name, or `None` for any other char (an unsupported register).
@@ -221,6 +280,54 @@ impl RegisterStore {
         };
     }
 
+    /// Set exactly one slot to `reg`, with none of the mirroring, appending or ring shifting a yank, delete
+    /// or macro store does: the trace's `ex_register` record (RFC-0020 R6), which carries a value the
+    /// session wrote. `None`/`"` is the unnamed slot, then `"0`–`"9`, `"a`–`"z`, `"-`, `"+`/`"*`, and the
+    /// read-only `"/ ": ". "% "#`. Returns `false` (nothing changed) for any other name.
+    pub fn set_slot(&mut self, name: Option<char>, reg: Register) -> bool {
+        let slot = match name {
+            None | Some('"') => &mut self.unnamed,
+            Some('0') => &mut self.yank0,
+            Some(c @ '1'..='9') => &mut self.numbered[c as usize - '1' as usize],
+            Some(c @ 'a'..='z') => &mut self.named[c as usize - 'a' as usize],
+            Some('-') => &mut self.small_delete,
+            Some('+' | '*') => &mut self.clipboard,
+            Some('/') => &mut self.special.search,
+            Some(':') => &mut self.special.last_ex,
+            Some('.') => &mut self.special.inserted,
+            Some('%') => &mut self.special.file,
+            Some('#') => &mut self.special.alternate,
+            Some(_) => return false,
+        };
+        *slot = reg;
+        true
+    }
+
+    /// Whether [`RegisterStore::set_slot`] accepts `name`.
+    #[must_use]
+    pub fn is_slot(name: Option<char>) -> bool {
+        name.is_none_or(|c| {
+            c.is_ascii_digit()
+                || c.is_ascii_lowercase()
+                || matches!(c, '"' | '-' | '+' | '*' | '/' | ':' | '.' | '%' | '#')
+        })
+    }
+
+    /// The registers a trace starts by writing (RFC-0020 R6): the unnamed register, `"0`–`"9`, `"a`–`"z`
+    /// and `"-`, each that holds a value, in `:registers` order. The clipboard is not among them; it is
+    /// recorded when it is read.
+    #[must_use]
+    pub fn filled(&self) -> Vec<(Option<char>, Register)> {
+        std::iter::once((None, &self.unnamed))
+            .chain(std::iter::once((Some('0'), &self.yank0)))
+            .chain(('1'..='9').zip(&self.numbered).map(|(c, r)| (Some(c), r)))
+            .chain(std::iter::once((Some('-'), &self.small_delete)))
+            .chain(('a'..='z').zip(&self.named).map(|(c, r)| (Some(c), r)))
+            .filter(|(_, r)| r.is_set())
+            .map(|(n, r)| (n, r.clone()))
+            .collect()
+    }
+
     /// The yank register `"0` (the last unregistered yank).
     #[must_use]
     pub fn yank0(&self) -> &Register {
@@ -233,18 +340,17 @@ impl RegisterStore {
         &self.expr
     }
 
-    /// Store an evaluated expression result into the `"=` register (always charwise). `result` is the
-    /// already-formatted output of [`crate::expr::eval`] — an EMPTY string when evaluation failed, so a
-    /// following paste/insert does nothing (Vim's degrade). This never touches any other slot.
+    /// Store an evaluated expression result into the `"=` register: linewise when it ends in a newline, as
+    /// nvim puts `"="x\n"` on a line of its own (#1022), else charwise. `result` is the already-formatted
+    /// output of [`crate::expr::eval`] — an EMPTY string when evaluation failed, so a following paste/insert
+    /// does nothing (Vim's degrade). This never touches any other slot.
     pub fn set_expr(&mut self, result: String) {
-        self.expr = Register::charwise(result.into_bytes());
-    }
-
-    /// Whether `name` selects one of the READ-ONLY special registers (`"/ ": ". "%`). Their content is
-    /// synced from the frontend via [`RegisterStore::set_special`]; a yank/delete naming one is swallowed.
-    #[must_use]
-    pub fn is_readonly_special(name: Option<char>) -> bool {
-        matches!(name, Some('/') | Some(':') | Some('.') | Some('%'))
+        let bytes = result.into_bytes();
+        self.expr = if bytes.last() == Some(&b'\n') {
+            Register::linewise(bytes)
+        } else {
+            Register::charwise(bytes)
+        };
     }
 
     /// Sync the four read-only special registers (`:help quote_/`, `quote_:`, `quote_.`, `quote%`) from the
@@ -270,11 +376,17 @@ impl RegisterStore {
         self.special.file = charwise(file);
     }
 
+    /// Sync `"#`, the alternate file name (`:help quote#`); `None` when there is no alternate file, so a
+    /// `"#p` fails with E23.
+    pub fn set_alternate(&mut self, name: Option<String>) {
+        self.special.alternate = Register::charwise(name.unwrap_or_default().into_bytes());
+    }
+
     /// Read a register for a paste. `None` → unnamed; `'0'` → the yank register; `'1'`–`'9'` → the numbered
     /// delete-ring; `'-'` → the small-delete register; `'/'`/`':'`/`'.'`/`'%'` → the read-only special
-    /// registers (last search / last Ex line / last insert / file name, synced by [`set_special`]); a named
-    /// letter (case-insensitive) → its slot; any unsupported name falls back to the unnamed register rather
-    /// than inventing an empty one.
+    /// registers (last search / last Ex line / last insert / file name, synced by [`set_special`]); `'#'` →
+    /// the alternate file name; a named letter (case-insensitive) → its slot. The drop register `"~` and any
+    /// unknown name read as an empty, never-written register (#1022), not as the unnamed one.
     ///
     /// [`set_special`]: RegisterStore::set_special
     #[must_use]
@@ -291,11 +403,12 @@ impl RegisterStore {
             Some(':') => &self.special.last_ex,
             Some('.') => &self.special.inserted,
             Some('%') => &self.special.file,
+            Some('#') => &self.special.alternate,
+            Some('"') | None => &self.unnamed,
             Some(c) => match Self::index(c) {
                 Some(i) => &self.named[i],
-                None => &self.unnamed,
+                None => &self.blackhole,
             },
-            None => &self.unnamed,
         }
     }
 
@@ -311,27 +424,39 @@ impl RegisterStore {
         &self.small_delete
     }
 
-    /// Write a captured value on a delete/change (NOT a yank — see [`RegisterStore::yank`]). `None` writes
-    /// the unnamed slot only. A named letter writes (lowercase) or appends (uppercase) into its slot, and
-    /// mirrors the resulting content into the unnamed slot (Vim's "unnamed reflects the last write"). An
-    /// unsupported name (including `'0'`, which is read-only from the edit path) degrades to unnamed-only.
+    /// Write a captured value into the named slot and mirror it into the unnamed one (Vim's "unnamed
+    /// reflects the last write"); no ring bookkeeping (see [`RegisterStore::delete`]). `None` writes the
+    /// unnamed slot only. A letter writes (lowercase) or appends (uppercase) into its slot; `"0`, `"1`–`"9`
+    /// and `"-` take the value as is, and `"#` writes `"0`, as nvim does (#749). A name that cannot be
+    /// written ([`RegisterStore::is_writable`]) leaves every slot alone.
     pub fn write(&mut self, name: Option<char>, reg: Register) {
+        if !Self::is_writable(name) || name == Some('_') {
+            return;
+        }
+        self.unnamed_from = name.and_then(Self::index);
         match name {
-            None => self.unnamed = reg,
-            // The blackhole `"_` swallows the write — the unnamed slot and every other register are untouched.
-            Some('_') => {}
-            // The read-only special registers (`"/ ": ". "%`) can't be written from the edit path: a
-            // yank/delete naming one is a no-op that leaves every slot (including unnamed) untouched. Their
-            // content is owned by the frontend and refreshed via `set_special` (`:help quote_/`).
-            Some('/') | Some(':') | Some('.') | Some('%') => {}
+            None | Some('"') => self.unnamed = reg,
+            Some('0' | '#') => {
+                self.yank0 = reg;
+                self.unnamed = self.yank0.clone();
+            }
+            Some(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                self.numbered[i] = reg;
+                self.unnamed = self.numbered[i].clone();
+            }
+            Some('-') => {
+                self.small_delete = reg;
+                self.unnamed = self.small_delete.clone();
+            }
             // `"+`/`"*` write the clipboard mirror; like a named write they also mirror the unnamed slot
             // (Vim: a yank/delete fills the unnamed register regardless of which register was named).
             Some('+') | Some('*') => {
                 self.clipboard = reg;
                 self.unnamed = self.clipboard.clone();
             }
-            Some(c) => match Self::index(c) {
-                Some(i) => {
+            Some(c) => {
+                if let Some(i) = Self::index(c) {
                     self.named[i] = if c.is_ascii_uppercase() {
                         append(&self.named[i], &reg)
                     } else {
@@ -339,33 +464,73 @@ impl RegisterStore {
                     };
                     self.unnamed = self.named[i].clone();
                 }
-                None => self.unnamed = reg,
-            },
+            }
         }
     }
 
     /// Route a DELETE/CHANGE capture: the same slot write as [`RegisterStore::write`], plus the Vim
-    /// delete-ring bookkeeping. Only an UNNAMED delete touches a ring (a named delete affects only its slot
-    /// and unnamed, per Vim): a whole-line-or-more span (linewise, or any span containing a `\n`) shifts the
-    /// numbered ring `"1`→…→`"9` and lands in `"1`; a smaller span lands in the small-delete register `"-`.
+    /// delete-ring bookkeeping (nvim `op_delete`). See [`RegisterStore::delete_ring`].
     pub fn delete(&mut self, name: Option<char>, reg: Register) {
-        if name.is_none() {
-            if reg.is_linewise() || reg.text().contains(&b'\n') {
-                // Shift "1→"2 … "8→"9 (dropping the old "9), then write the new delete into "1.
-                self.numbered.rotate_right(1);
-                self.numbered[0] = reg.clone();
-            } else {
-                self.small_delete = reg.clone();
+        self.delete_ring(name, reg, false);
+    }
+
+    /// [`RegisterStore::delete`] with `ring_one` set for the motions that always use `"1` (`d%`, `d}`,
+    /// `d/pat`, … — nvim's `use_reg_one`). In nvim's order: the named register takes the text first; then
+    /// a span of a whole line or more, or a `ring_one` span, shifts the numbered ring `"1`→…→`"9` into `"1`
+    /// whatever register was named (`"add` and `"+dd` too, #749); then a span within one line with no
+    /// register named also lands in `"-`. The unnamed register follows `"1` after a shift, except after an
+    /// append (`"Add`), where it keeps the whole appended register. The black hole and the registers a
+    /// delete cannot name leave everything alone.
+    pub fn delete_ring(&mut self, name: Option<char>, reg: Register, ring_one: bool) {
+        if !Self::is_writable(name) || name == Some('_') {
+            return;
+        }
+        let multiline = reg.is_linewise() || reg.text().contains(&b'\n');
+        let small = name.is_none() && !multiline;
+        if name.is_some() {
+            self.write(name, reg.clone());
+        }
+        if multiline || ring_one {
+            // Shift "1→"2 … "8→"9 (dropping the old "9), then write the new delete into "1.
+            self.numbered.rotate_right(1);
+            self.numbered[0] = reg.clone();
+            if !name.is_some_and(|c| c.is_ascii_uppercase()) {
+                self.unnamed = self.numbered[0].clone();
+                self.unnamed_from = None;
             }
         }
-        self.write(name, reg);
+        if small {
+            self.small_delete = reg.clone();
+        }
+        if name.is_none() {
+            self.unnamed = reg;
+            self.unnamed_from = None;
+        }
     }
 
     /// Store a MACRO into a named register (D-055): a lowercase name OVERWRITES its slot, an uppercase name
     /// APPENDS to it (`qA` extends macro `a`). Unlike [`RegisterStore::write`], this does NOT mirror into the
-    /// unnamed slot — recording a macro must not clobber the paste register (Vim behaviour). A non-letter
-    /// name is ignored (a macro must name `a`-`z`/`A`-`Z`).
+    /// unnamed slot — recording a macro must not clobber the paste register (Vim behaviour). A digit names a
+    /// numbered register and `"` the unnamed one (`q{0-9a-zA-Z"}`); any other name is ignored.
     pub fn set_macro(&mut self, name: Option<char>, reg: Register) {
+        match name {
+            // `q"` records into `"0`, which the unnamed register then names (nvim v0.12.6: `q"lqP` puts `l`).
+            Some('"') => {
+                self.yank0 = reg.clone();
+                self.unnamed = reg;
+                self.unnamed_from = None;
+                return;
+            }
+            Some('0') => {
+                self.yank0 = reg;
+                return;
+            }
+            Some(c @ '1'..='9') => {
+                self.numbered[c as usize - '1' as usize] = reg;
+                return;
+            }
+            _ => {}
+        }
         if let Some(c) = name {
             if let Some(i) = Self::index(c) {
                 self.named[i] = if c.is_ascii_uppercase() {
@@ -373,6 +538,9 @@ impl RegisterStore {
                 } else {
                     reg
                 };
+                if self.unnamed_from == Some(i) {
+                    self.unnamed = self.named[i].clone();
+                }
             }
         }
     }
@@ -657,16 +825,74 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_delete_spares_the_numbered_ring() {
-        // `"+dd` is a NAMED delete: it fills the clipboard slot (and unnamed) but never the delete ring.
+    fn clipboard_delete_feeds_the_numbered_ring() {
+        // `"+dd` fills the clipboard slot and, being a whole line, `"1` too (nvim v0.12.6, #749); a
+        // charwise `"+dw` is named, so it spares `"-`.
         let mut s = RegisterStore::new();
         s.delete(Some('+'), Register::linewise(b"gone".to_vec()));
         assert_eq!(s.get(Some('+')).text(), b"gone\n");
-        assert!(
-            s.get(Some('1')).is_empty(),
-            "a clipboard delete does not shift the ring"
-        );
+        assert_eq!(s.get(Some('1')).text(), b"gone\n");
+        s.delete(Some('+'), Register::charwise(b"w".to_vec()));
         assert!(s.small_delete().is_empty());
+        assert_eq!(s.get(Some('1')).text(), b"gone\n");
+    }
+
+    #[test]
+    fn explicit_ring_names_are_written_and_unknown_names_read_empty() {
+        // `"0yy`, `"1dw`, `"-dw` write those slots (#749); `"#yy` writes `"0` as nvim does.
+        let mut s = RegisterStore::new();
+        s.yank(Some('0'), Register::charwise(b"z".to_vec()));
+        assert_eq!(s.yank0().text(), b"z");
+        s.delete(Some('1'), Register::charwise(b"one".to_vec()));
+        assert_eq!(s.get(Some('1')).text(), b"one");
+        s.delete(Some('-'), Register::charwise(b"dash".to_vec()));
+        assert_eq!(s.small_delete().text(), b"dash");
+        assert_eq!(s.unnamed().text(), b"dash");
+        s.yank(Some('#'), Register::charwise(b"h".to_vec()));
+        assert_eq!(s.yank0().text(), b"h");
+        // The ring-one motions shift "1 even within a line, and an unnamed one fills "- too.
+        s.delete_ring(None, Register::charwise(b"(x)".to_vec()), true);
+        assert_eq!(s.get(Some('1')).text(), b"(x)");
+        assert_eq!(s.get(Some('2')).text(), b"one");
+        assert_eq!(s.small_delete().text(), b"(x)");
+        // `"~`, `"!` and `"#` with no alternate file read as empty, never as the unnamed register (#1022).
+        for c in ['~', '!', '?', '#'] {
+            assert!(s.get(Some(c)).is_empty() && !s.get(Some(c)).is_set(), "{c}");
+        }
+        s.set_alternate(Some("other.txt".into()));
+        assert_eq!(s.get(Some('#')).text(), b"other.txt");
+        // A write naming a read-only or unknown register touches nothing.
+        let before = s.unnamed().clone();
+        for c in ['/', ':', '.', '%', '=', '~', '!'] {
+            assert!(!RegisterStore::is_writable(Some(c)), "{c}");
+            s.delete(Some(c), Register::linewise(b"no".to_vec()));
+        }
+        assert_eq!(s.unnamed(), &before);
+        assert_eq!(s.get(Some('1')).text(), b"(x)");
+    }
+
+    #[test]
+    fn named_delete_then_shift_points_unnamed_at_reg1_unless_appending() {
+        // `"addqaq` still puts the deleted line: the unnamed register names "1, not "a (nvim).
+        let mut s = RegisterStore::new();
+        s.delete(Some('a'), Register::linewise(b"a".to_vec()));
+        s.set_macro(Some('a'), Register::charwise(Vec::new()));
+        assert_eq!(s.unnamed().text(), b"a\n");
+        // `"ayy` then `"Add`: the unnamed register holds the whole appended "a.
+        let mut s = RegisterStore::new();
+        s.yank(Some('a'), Register::linewise(b"a".to_vec()));
+        s.delete(Some('A'), Register::linewise(b"b".to_vec()));
+        assert_eq!(s.unnamed().text(), b"a\nb\n");
+        assert_eq!(s.get(Some('1')).text(), b"b\n");
+    }
+
+    #[test]
+    fn expr_result_ending_in_newline_is_linewise() {
+        let mut s = RegisterStore::new();
+        s.set_expr("x\n".into());
+        assert!(s.expr().is_linewise());
+        s.set_expr("x".into());
+        assert!(!s.expr().is_linewise());
     }
 
     #[test]
@@ -748,20 +974,45 @@ mod tests {
         assert_eq!(s.get(Some('0')).text(), b"keep", "nor \"0");
         assert!(s.get(Some('1')).is_empty(), "nor the numbered ring");
         assert!(s.small_delete().is_empty(), "nor the small-delete register");
-        assert!(RegisterStore::is_readonly_special(Some('/')));
-        assert!(!RegisterStore::is_readonly_special(Some('a')));
+        for name in ['/', ':', '.', '%'] {
+            assert!(
+                !RegisterStore::is_writable(Some(name)),
+                "\"{name} is read-only"
+            );
+        }
+        assert!(RegisterStore::is_writable(Some('a')));
     }
 
     #[test]
-    fn named_delete_leaves_both_rings_alone() {
+    fn named_delete_shifts_the_ring_but_spares_small_delete() {
         let mut s = RegisterStore::new();
-        // `"add`: a named delete affects only its slot (and unnamed), never the numbered ring or "-.
+        // `"add` also lands in "1 (nvim `op_delete`, #1091); a named small delete never fills "-.
+        s.delete(None, Register::linewise(b"old".to_vec()));
         s.delete(Some('a'), Register::linewise(b"kept".to_vec()));
         assert_eq!(s.get(Some('a')).text(), b"kept\n");
-        assert!(
-            s.get(Some('1')).is_empty(),
-            "a named delete does not shift the ring"
-        );
+        assert_eq!(s.get(Some('1')).text(), b"kept\n");
+        assert_eq!(s.get(Some('2')).text(), b"old\n");
+        s.delete(Some('b'), Register::charwise(b"w".to_vec()));
         assert!(s.small_delete().is_empty());
+        assert_eq!(
+            s.get(Some('1')).text(),
+            b"kept\n",
+            "a small named delete spares the ring"
+        );
+    }
+
+    #[test]
+    fn an_empty_recording_empties_the_register_the_unnamed_one_names() {
+        let mut s = RegisterStore::new();
+        // `"ayy` then `qaq`: the unnamed register still names `a`, now empty but set (#1091).
+        s.yank(Some('a'), Register::linewise(b"abc".to_vec()));
+        s.set_macro(Some('a'), Register::charwise(Vec::new()));
+        assert!(s.get(Some('a')).is_empty() && s.get(Some('a')).is_set());
+        assert!(s.unnamed().is_empty() && s.unnamed().is_set());
+        // After an unnamed yank the unnamed register no longer follows `a`.
+        s.yank(None, Register::charwise(b"x".to_vec()));
+        s.set_macro(Some('a'), Register::charwise(b"q".to_vec()));
+        assert_eq!(s.unnamed().text(), b"x");
+        assert!(!Register::default().is_set());
     }
 }

@@ -13,9 +13,9 @@ summary: >
 audience: [maintainers, contributors, llm-agents, implementers-in-any-language]
 status: draft
 related:
-  - architecture.md
+  - ../architecture/architecture.md
   - stability-and-observability.md
-  - design-requirements.md
+  - ../architecture/design-requirements.md
   - ../parity/common.md
   - ../parity/vim.md
   - ../parity/workspace.md
@@ -24,9 +24,26 @@ related:
 ---
 
 <!-- code-blocks: illustrative — the concrete types shown are NOT normative; the canonical home is code (internal types) or spec/contracts/ (cross-boundary), per D-038. -->
-<!-- design-code-ack: UndoNode — design ahead of code: the first vertical slice stores forward/inverse/origin per undo node (in-memory undo/redo) and tracks the saved point via Document.saved_node, with the node id being its slot index; the persistent-undo `id`/`saved_here` fields land with F-008. -->
+<!-- design-code-ack: UndoNode — design ahead of code: the first vertical slice stores forward/inverse/origin per undo node (in-memory undo/redo) and tracks the saved point via Document.saved_node, with the node id being its slot index; the persistent-undo `id`/`saved_here` fields land with persistent undo (#639). -->
 
 # ruse Persistence, Crash Recovery & the Undo Journal
+
+> **Shipped (RFC-0023 slice 2, D-064).** The journal is the per-transaction `RJ01` stream of §2
+> (`apps/tui/src/persist/rj01.rs`) in `$XDG_STATE_HOME/ruse/journal/`, written by
+> `apps/tui/src/persist/journal.rs` after 4 s idle, 200 changes or before a risky operation; a crash path appends
+> a Checkpoint of the exact text. A legacy `<file>.ruse-journal` (`RJS0` whole-buffer snapshots) is read once and
+> archived. Undo is in-memory (`crates/core/src/undo.rs`). Still the target: the three-way recovery of §4, the
+> `InUse` owner check, archive retention and the status flags (RFC-0023 slices 3-4); the status of each save and
+> recovery surface is in [PRD.yaml](../../spec/PRD.yaml) F-008.
+>
+> **Journal lifecycle** (#862, #863, #869, #873, #1191). A journal exists only while it holds work that differs from
+> disk. It is deleted by a durable save; by the recovery prompt's discard; when the buffer becomes clean without a
+> save (undo back to the saved text, `:e!`); by `:bd[!]`; and on every normal exit (`:q`, `:q!`, `:qa!`, `:cq`,
+> `ZQ`), as nvim deletes its swap file on these. It is kept by a fatal signal or a panic (which write it), by the
+> prompt's quit choice, and when it could not be read (never offered, so never deleted). A recovered buffer starts
+> as the disk text with the recovery applied as one edit: it is modified, `u` returns to disk, and a saved trace
+> starts from the disk text. Only a regular file is ever opened as a journal (a FIFO or device is reported, not
+> read). A record over 4 GiB is refused with an error, not truncated into an unreadable one.
 
 > This doc **resolves [D-005](../../spec/DECISIONS.md)** (was `open`): journal format details, incremental-
 > journal thresholds for large files, and undo-grouping boundaries. It is the normative specification behind
@@ -176,6 +193,11 @@ magnitude**. (Vim's `[+]` behaves the same via `undofile` seq.)
 
 ### 2. Append-only transaction journal
 
+> **Decided details (D-064, [RFC-0023](../rfc/accepted/RFC-0023-per-transaction-journal.md)):** the core change
+> log the journal drains, the state-dir location and naming, the sync policy, the 32 MiB `DiskBase` mode, the
+> legacy `RJS0` migration, and SHA-256 (not BLAKE3) for content hashes. Where this section and the RFC differ, the
+> RFC wins.
+
 One journal file per editable Document, path derived deterministically and namespaced by workspace + a hash of
 the absolute file path (so two files with the same basename don't collide), stored under the recovery dir
 (§ *Recovery files*). Opened `O_APPEND` (POSIX) / `FILE_APPEND_DATA` (Windows); a single writer (the
@@ -275,6 +297,20 @@ the long-line guard — tuned on real workloads, see Open questions). In this mo
 - Compaction rewrites the journal as `new base Checkpoint (= current text) + empty tail` via the same atomic
   temp+rename discipline as §3, never in place.
 
+**Swap files, auto-save files and locks (v0.1.9, #619).** The RJ01 journal is ruse's swap file (Vim) and
+auto-save file (Emacs); the options that steer those map onto it:
+
+| Option | Mapping |
+| --- | --- |
+| Vim `'swapfile'` (per buffer; `:set` also sets the default for buffers opened later), Emacs `auto-save-default` | off: the buffer keeps no journal, and an existing one is discarded |
+| Vim `'updatecount'` | the change count that syncs the journal (default 200, the old `SYNC_EVERY`); 0 keeps no journal, as nvim keeps no swap file |
+| Vim `'directory'` | read-only: `:set dir?` shows the journal directory with `//`; another value is "option not supported", since a moved journal would hide unsaved work from the next session's recovery |
+| Emacs `auto-save-file-name-transforms` | divergence: the journal's name and place are fixed (`<name>.<path hash>.rj`), for the same reason |
+| Emacs `lock-file-name-transforms` (and lock files) | divergence: no `.#name` lock file; a live journal's owner (pid + start time) is the lock, and a second session gets the in-use prompt (E325's choices, #1208) |
+| Emacs `auto-save-visited-mode` / `auto-save-visited-interval` | built: after the interval idle, every modified buffer visiting a writable file is saved to it, once per idle period; `auto-save-visited-predicate` (a Lisp function) is not offered |
+
+The idle sync time stays 4 s (`'updatetime'` is not an option yet).
+
 ### 3. Atomic save
 
 Save is **durable-or-nothing**. "Saved" in the UI reflects a durable write (fsync of data *and* the containing
@@ -283,28 +319,82 @@ directory), not a returned `write()`.
 **POSIX algorithm:**
 
 ```
-1. dir ← parent dir of target; open dir fd.
-2. stat target → capture mode, uid/gid, ACL/xattr, and EOL/encoding decision (from Meta / open-time detection).
+1. dir ← parent dir of target (`.` for a bare relative name).
+2. stat target → refuse a non-regular file (FIFO, socket, device, directory); refuse a file the user cannot
+      write with E505 unless forced (`:w!`); a file with more than one hard link is written IN PLACE (below).
 3. create temp in the SAME directory (same filesystem so rename is atomic): ".<name>.ruse-tmp-<rand>"
-      O_WRONLY|O_CREAT|O_EXCL, mode 0600 initially.
+      (<name> shortened to keep the whole within NAME_MAX), O_WRONLY|O_CREAT|O_EXCL, mode 0600 initially,
+      a fresh <rand> on EEXIST; a user's file of any name is never removed. EACCES/EROFS on an existing
+      target → IN PLACE.
 4. write encoded bytes (apply fileencoding + fileformat/EOL + optional BOM — TEXT-19, VIM-STATE); handle
       no-trailing-newline ('binary'/'noeol') exactly.
-5. fdatasync(temp)                          # data durable before it becomes the file
-6. fchmod/fchown temp to captured mode/owner; copy xattr/ACL. (best-effort ownership; see platform notes)
+5. fchown temp to the captured uid/gid when they differ (EPERM → IN PLACE); fchmod to the captured mode;
+      copy every xattr (on Linux this includes the POSIX ACL; a value that cannot be set → IN PLACE).
+6. fsync(temp)                              # data and metadata durable before it becomes the file
 7. rename(temp, target)                     # atomic replace on POSIX
-8. fsync(dir fd)                            # make the rename itself durable
+8. open + fsync(dir)                        # make the rename itself durable; a failure here is E667,
+      except EINVAL/ENOTSUP/EOPNOTSUPP/EISDIR (the filesystem does not support it), which saves with
+      the note "directory sync not supported here; rename durability not proven"
 9. close dir fd.
 10. On success: saved_revision ← document_revision; saved_node ← current_undo_node.seq; disk_observed ← OurSave{revision, new hash/stat};
       append a Meta(save-point) record; only THEN surface "Saved".
 ```
 
-If any step fails the temp file is unlinked and the original is untouched (INV-FAIL-BOUNDED, INV-ERR-CLASS);
-"Saved" is never shown. `saved_revision`/`disk_observed` advance **only after step 8**, so a crash between
-`rename` and `fsync(dir)` cannot leave us believing we saved when the directory entry might not survive.
+If any step before 7 fails the temp file is unlinked and the original is untouched (INV-FAIL-BOUNDED,
+INV-ERR-CLASS); "Saved" is never shown. `saved_revision`/`disk_observed` advance **only after step 8**, so a
+crash between `rename` and `fsync(dir)` cannot leave us believing we saved when the directory entry might not
+survive: a failed step 8 reports `E667` ("written but not proven durable"), the buffer stays modified and its
+journal stays. A filesystem that does not support a directory fsync at all (`EINVAL`, `ENOTSUP`/`EOPNOTSUPP`,
+`EISDIR` from opening or fsyncing the directory; some network and FUSE filesystems) is not a failure, as in
+SQLite and PostgreSQL: otherwise `:w` could never succeed there although the file's bytes are fsynced. The
+save then counts and the buffer is marked saved, but the report says `written (directory sync not supported
+here; rename durability not proven)` and makes no durability claim for the rename. A real I/O error (`EIO`,
+`ENOSPC`, `EROFS`, `EACCES`, ...) stays `E667`.
+
+**In place** (Neovim's `'backupcopy'` `auto`, Emacs's `backup-by-copying-when-linked`): when a rename would
+change the file's identity — other hard links would keep the old bytes, the owner/group or an xattr/ACL
+cannot be reproduced on a new inode — or the directory is not writable, the existing file is opened without
+truncation, overwritten, truncated to the new length and fsynced. This keeps links, owner, ACLs and xattrs
+and is durable, but not atomic: an error after the first byte is reported as `E514` ("may be partly
+written"), never as "written", and the buffer stays modified. A crash during the write can leave a partial
+file; the recovery journal (when its directory is writable) is one safety net and the `'writebackup'` copy
+(below) the other. With `:w!`, a file the owner has made read-only gets owner write permission for the
+duration of an in-place write, then its mode back.
+
+**Write policy and backups (#619; `persist/backup.rs`, `app/write_opts.rs`).** One engine serves both
+editors' option families; each profile reads its own editor's options with that editor's defaults (Vim and
+Native: nvim v0.12.6; Emacs: Emacs 31.1, config keys `emacs.*`):
+
+| Concern | Vim profile | Emacs profile |
+| --- | --- | --- |
+| Method | `'backupcopy'`: `auto` (above), `yes` in place, `no` rename even over hard links; `breakhardlink` / `breaksymlink` | `file-precious-flag` = `no`; `break-hardlink-on-save` = `breakhardlink`; precious without `file-preserve-symlinks-on-save` = `breaksymlink`; the save that makes the backup copies (in place) or renames by `backup-by-copying*` |
+| When a backup is made | every write with `'backup'`; a write backup for an in-place write with `'writebackup'` (removed after it, kept and named when the write fails) | the first save of a visit that finds the file on disk (`make-backup-files`; `buffer-backed-up`); a re-read (`:e!`) or a new name starts a new visit |
+| Name and place | `<name><'backupext'>` in the first `'backupdir'` entry that works (`.`, `./sub`, a `//` entry names it after the whole path with `%`); a missing directory is created 0700 | `<name>~`, or `<name>.~N~` under `version-control`; beside the file or in the `backup-directory-alist` directory (absolute: whole path with `!`) |
+| Exempt files | `'backupskip'` patterns (default: the temp directories) | under `temporary-file-directory` / `small-temporary-file-directory` |
+| Old versions | `'patchmode'`: `<name><pm>` beside the file, once (empty for a new file) | numbered versions pruned to `kept-old-versions` + `kept-new-versions` when `delete-old-versions` is `t` |
+
+A rename-path backup is a hard link to the file being replaced (exactly the old file), else a copy; an
+in-place write's backup is always a copy. A backup name never follows a symlink or replaces anything but a
+regular file. A backup that cannot be made stops the write (`E510`, or `E509` when copying) unless `:w!`
+forces it (event `save.backup_failed`). A write by rename needs no write backup: the original stays whole
+until the rename, so the temp file is the write backup. `'write'` off makes every write `E142`;
+`'writeany'` drops `E13` (not `E505`/`E45`/the changed-on-disk refusal, as nvim); `'nofsync'` skips steps 6
+and 8, so "written" no longer claims durability (the user's explicit choice). Divergences: Emacs's
+`make-backup-file-name-function` needs Lisp (the naming keys cover its default function); `delete-old-versions`
+`nil` and `require-final-newline` `ask` would prompt inside a save, so ruse keeps the versions (the report
+counts them) and adds no newline (`[noeol]` shows it); `visit` / `visit-save` add nothing at visit time
+(ruse never edits a buffer on open). There is no `M-x set-variable`: the Emacs variables are config keys
+(`:config-reload` applies a change).
+
+Known gap: macOS ACLs are not visible as xattrs, so the rename path does not carry them over.
+`com.apple.provenance` is attached by the kernel to every file a process creates, so it is neither copied
+nor a reason to write in place.
 
 **Preservation:** permissions, ownership (best-effort), ACL/xattr, encoding (`fileencoding`), line endings
-(`fileformat` unix/dos/mac), BOM (`bomb`), and trailing-newline policy are captured at open and re-applied on
-write — kept separate from document data ([TEXT-19 / VIM-STATE](../parity/vim.md)).
+(`fileformat` unix/dos/mac), BOM (`bomb`), a DOS file's final CTRL-Z (`endoffile`) and trailing-newline policy
+(`endofline`, `fixeol`, Emacs `require-final-newline`) are captured at open and re-applied on write — kept
+separate from document data ([TEXT-19 / VIM-STATE](../parity/vim.md)). `:set eol` / `eof` / `bomb` change them
+per buffer (a BOM change modifies the buffer, as nvim).
 
 **Per-platform notes:**
 
@@ -316,13 +406,48 @@ write — kept separate from document data ([TEXT-19 / VIM-STATE](../parity/vim.
 | Ownership | `fchown` (often needs privilege; best-effort, warn) | preserve owner/ACL via `ReplaceFileW`; SIDs not uid/gid |
 | Symlinks | write through the link target, don't replace the symlink itself (unless configured) | reparse points; resolve before replace |
 | Case / normalization | case-sensitive (usually) | case-insensitive; also macOS NFD normalization (XPLAT §13) |
-| Special files (`/dev`, FIFO, network FS) | detect; temp+rename may be impossible → fall back to in-place careful write, warn, and never claim durability we don't have |
+| Special files (`/dev`, FIFO, socket) | detect and refuse (`is not a regular file`, #907): never replaced by a regular file, never written into | n/a |
 
 Cross-device / same-directory: the temp **must** be in the target's directory (a `/tmp` temp cannot be
-`rename`d across filesystems atomically). If the directory isn't writable (read-only mount, permission), save
-fails cleanly rather than falling back to a non-atomic path silently.
+`rename`d across filesystems atomically). If the directory isn't writable (permission), an existing writable
+file is written in place as above (as Neovim does), and a new file fails cleanly; on a read-only mount both
+fail cleanly.
+
+**Line endings, `'binary'` and large files (v0.1.9, #619; `persist/encoding.rs`).** `'fileformat'` is per
+buffer (`unix`, `dos`, `mac`; `:set ff=` modifies the buffer and converts the file on the next write, whose
+report says `[dos]` / `[mac]` as nvim's `msg_add_fileformat`). `'fileformats'` decides a read as nvim v0.12.6:
+`dos` when listed and every line break is CRLF, else `unix` when listed and the file has a LF, else `mac` when
+listed and it has CR but no LF, else the first listed; one name forces it, an empty list takes the global
+`'fileformat'` (also the format of a buffer without a file). `++ff=unix|dos|mac` forces one read or write.
+`'binary'` (`:set bin`, `++bin`, `ruse -b`) reads and writes the bytes unconverted (no line endings, BOM or
+CTRL-Z, the final newline only as `'endofline'` says, whatever `'fixeol'`), and zeroes `'textwidth'` /
+`'wrapmargin'` and `'expandtab'` until it goes off. The Emacs profile asks before visiting a file over
+`large-file-warning-threshold` (`File f is large (10 MiB), really open? ([Y]es, [N]o, [L]iterally, [?])`,
+`l` reads it with `'binary'`) and warns past `out-of-memory-warning-percentage` of the free RAM and swap.
+
+A file read past the large-file threshold (32 MiB, `rj01::LARGE_FILE`, the incremental-journal one) enters
+the **degraded profile** (RFC-0008 §7): no syntax highlighting, and `[large]` on the status line. Still to
+come for the profile: bounded undo, streaming search and the long-line guard (the core has no undo-window
+bound yet). The journal's format byte carries neither `mac` nor `'binary'`: a recovered buffer of such a file
+comes back unix (with #1286's `'endoffile'`). The startup file is not asked about with the Emacs
+large-file question (the question needs the session, which starts after the file is read).
 
 ### 4. Three-way crash recovery
+
+> **Decided details (D-064, [RFC-0023](../rfc/accepted/RFC-0023-per-transaction-journal.md) §6-§9):** the prompt
+> keys, the live-owner case, when a journal is deleted versus archived, retention numbers, and the status flags.
+>
+> **As built (v0.1.8, RFC-0023 slice 3, #933):** `persist::Recovery` is `None` / `Available` / `InUse` /
+> `Unreplayable` and one prompt (`apps/tui/src/ui/recovery.rs`) serves the startup file and `:e`. Where the build
+> differs from the text below: (c) `KeepInMemory` (`e`) opens the disk file and moves the journal to the archive,
+> as `k` does; the two differ only in wording, and retention (#934) treats their archives alike. The diff is a full-screen
+> read-only view inside the prompt, not an editor buffer (the startup prompt runs before the editor exists).
+> There is no `<name>.ruse-recovered` side file. The ownership marker is the RJ01 Header's owner record; a live
+> owner is `kill(pid, 0)` plus a matching start time read from the system (`/proc/<pid>/stat`, `proc_pidinfo`),
+> and an unreadable start time counts as a crash. "Read-only" is the buffer's `'readonly'` option (#1216): `:w`,
+> `:wa` and `ZZ` refuse with E45 unless forced, and the first change warns W10. A session that edits anyway journals
+> to `<name>.<pid>.rj` beside the owner's and only ever deletes a journal whose Header names itself. The same
+> "beside, never over" rule holds for a journal from a newer major version and for one this process cannot read.
 
 On opening a file that has a recovery journal whose `saved_revision` point is *behind* recoverable records (a
 prior crash), recovery presents **three** materialized options and **never auto-applies** any of them
@@ -355,6 +480,18 @@ honored.
 - have a **retention window** (default 14 days) and a **count cap** per file; a GC sweep removes journals whose
   save-point is fully durable and older than the window, and archives (not deletes) journals with unrecovered
   tails until the user resolves them;
+
+  > **As built (#934, RFC-0023 §9, `apps/tui/src/persist/retention.rs`):** a journal with unrecovered work is
+  > never swept while live: it stays in `journal/` until the prompt resolves it, and `e`/`k` move it to
+  > `journal/archive/`. The sweep covers only that archive: on startup, at most once a day (the time in
+  > `journal/archive-sweep`), it removes archives older than 14 days, counted from the archiving (the move sets
+  > the file's modification time), and then keeps the newest 20 per document path (`<base>.<path hash>`; a
+  > second session's `<name>.<pid>.rj` counts with the owner's; unnamed buffers count as one path; a legacy
+  > sidecar by its basename; a name shortened to fit `NAME_MAX` by its shortened stem). Archives are named
+  > `<name>@<unix ms>`, and only archiving writes the `@`, so the sweep owns exactly those names (and the
+  > `<journal name>.<unix ms>` names of the first build) and no archive escapes it. It removes only regular
+  > files, follows no symlink, and does not sweep a symlinked archive directory. The numbers are fixed (no config key).
+  > `:checkhealth` shows the archive's file count, size and last sweep.
 - carry document *content*, so they are treated as sensitive (INV-TRUST-1): excluded from diagnostic bundles by
   default, redaction-preview before any export (D-017), never logged, and never synced off-box without consent.
   A path-redaction option stores only reversible-locally content for high-sensitivity workspaces (Open questions
@@ -381,6 +518,105 @@ using both the cheap hint and the authoritative hash:
   preflight** ([stability §13](stability-and-observability.md) — "file changed externally"): we never silently
   overwrite an externally-changed file; the user must acknowledge. This mirrors Vim's `W12`/`FileChangedShell`.
 
+> **As built (v0.1.8, #938, #1219, #1220):** the check runs after a shell command, on `:checktime`, before a save,
+> on the 4000 ms idle timer and on focus gain. There is no filesystem watcher. Focus gain needs focus reports
+> (DECSET 1004): the terminal guard asks for them when the F-010 capability ledger has them (an xterm-like
+> `$TERM` hint or a DECRQM `CSI ? 1004 $ p` reply; a "not recognised" reply or `RUSE_NO_FOCUS=1` turns them
+> off) and turns them off on every exit, the signal watchdog's included. nvim sets 1004 on every terminal; a
+> terminal that ignores the mode ignores the set. Inside tmux, focus reports reach ruse only with
+> `set -g focus-events on` in `tmux.conf`; without it a change is noticed by the other triggers.
+>
+> **`'autoread'` (v0.1.9, #619):** on by default, as nvim's. An unmodified buffer whose file changed is re-read
+> at the check, silently and as ONE undoable change (`Workspace::reload_undoable`; nvim keeps the reload in
+> undo while the file is under `'undoreload'`), with the file's new line endings and BOM. A modified buffer
+> keeps its text and gets W12; with `:set noar` an unmodified one gets W11 as before. A trace cannot record a
+> re-read, so a session that autoread refuses to save its trace, as after `:e!`.
+
+### 5a. Buffer state and leaving changed buffers (v0.1.9, #619)
+
+`'modifiable'` is buffer state on the `Document`; the editor's two entry points refuse a text change while it
+is off (`apply_command` for a planned edit or an undo step, `EditorState::apply_ex` for a resolved Ex edit)
+with nvim's `E21`, before any register, mark or mode change, so the Transaction layer never sees the edit. A
+reload is not such a command. `'modified'` reads the undo-saved state, `:set nomod` marks the buffer saved
+and `:set mod` marks it unsaved (`Document::mark_unsaved`, which `:set bomb` also uses).
+
+Leaving a changed buffer (`app/abandon.rs`) follows nvim's `check_changed` / `can_abandon` /
+`dialog_changed`: with `'hidden'` (on, as nvim) a buffer no window shows stays loaded with its changes; off,
+`:e {other}`, `:enew`, `:b`/`:bn`/`:bp` and `:q`/`:close` of a window are `E37` when no other window shows the
+buffer, and `:only` over another window's changes is `E445`. `'autowrite'` writes instead for the `:b`
+family and writes every changed buffer before `:!`, `:r !` and a filter; `'autowriteall'` adds `:e`,
+`:enew`, `:q` and `:qa`; neither writes a `'readonly'` buffer or one without a file. `'confirm'` (or
+`:confirm` on one command) asks with nvim's dialog on the status line (`[Y]es, (N)o, (C)ancel`, plus
+`Save (A)ll` / `(D)iscard All` when several buffers changed), then runs the command again, so `:qa` asks
+buffer by buffer. Divergences: the dialog is one status line (nvim's console dialog is two); `(N)o` marks the
+buffer unchanged and keeps it loaded (nvim may unload it, losing the text it kept); `(Y)es` on a buffer
+without a file is `E141` (nvim names it `Untitled` and writes that). The window keys run as the Ex commands
+they stand for (`CTRL-W q` / `CTRL-W CTRL-Q` = `:quit`, `CTRL-W c` = `:close`; `ZZ` / `ZQ` already were `:x` /
+`:q!`), so the gate covers them. `:set (no)ma` and `:set (no)mod` are recorded in the replay trace
+(`ex_modifiable`, `ex_modified`, RFC-0020), so a session with an `E21` refusal saves a trace that replays.
+
+**The Emacs profile (v0.1.9, #619; `app/session/emacs_files.rs`).** Emacs 31.1's questions, in the echo
+area, from the `emacs.*` config keys:
+
+- `C-x C-c` is `save-buffers-kill-terminal`: `save-some-buffers` over every modified buffer (PRED `t`, so a
+  non-file buffer `buffer-offer-save` offers too), then `Modified buffers exist; exit anyway?` when one is
+  left, `Active processes exist; kill them and exit anyway?` for a running terminal
+  (`confirm-kill-processes`), and `Really exit Emacs?` (`confirm-kill-emacs`, `yes-or-no-p` or `y-or-n-p`)
+  unless it already asked. The palette's Quit runs the same.
+- `C-x s` is `save-some-buffers` with `save-some-buffers-default-predicate` (`save-some-buffers-root`: the
+  buffers under the nearest `.git` directory above the working one). Its question is
+  `Save file /abs/f.txt? (y, n, !, ., q, M-~, C-r, C-f, d or C-h) `: `y`/`SPC` save, `n`/`DEL` skip, `!`
+  saves the rest, `.` saves this one and stops, `q`/`RET` stop, `M-~` skips and marks it unmodified.
+- `M-x revert-buffer` asks `Revert buffer from file X?` (`Discard edits and reread from X?` when modified)
+  unless `revert-without-query` matches an unmodified buffer; `C-x x g` (`revert-buffer-quick`) reverts an
+  unmodified buffer at once (`Reverted buffer`) and asks with `y-or-n-p` under
+  `revert-buffer-quick-short-answers`. A revert is one undoable change, as `Workspace::reload_undoable`.
+- `C-x C-f` reads `Find file: ` from the working directory. Visiting a file whose buffer is stale asks
+  `File f changed on disk.  Reread from disk?` (`Discard your edits?` when modified) under
+  `query-about-changed-file`, says `... C-x x g to load new contents` without it, and reverts silently
+  where `revert-without-query` matches an unmodified buffer.
+- `C-x C-q` is `read-only-mode`, on `'modifiable'`: a change says `Buffer is read-only: #<buffer f.txt>`.
+  With `view-read-only` it enters View mode: `SPC`/`DEL`/`S-SPC` page, `d`/`u` half a page, `RET` a line,
+  `<`/`>` the ends, `q` leaves it (writable again when View mode made it read-only), `e` leaves it
+  read-only, `E` makes it writable.
+- `yes-or-no-p` takes a typed word and `RET` (`Please answer yes or no.` otherwise), `y-or-n-p` one key;
+  `C-g` quits any question (`Quit`). A question is drawn on one row, its start cut when too wide, never
+  behind a hit-enter prompt.
+- Emacs announces nothing when a file changes under a buffer until it is visited or edited, and has no
+  auto-revert by default: in the Emacs profile the idle W11/W12/E211 messages are off and `'autoread'` is
+  off.
+
+Divergences: `C-r`, `C-f`, `d` and `C-h` in save-some-buffers (view, diff, help) are not offered (the key
+keeps the question); the page keys of View mode move the cursor a page rather than scrolling the window
+(the view follows); buffers are offered in buffer-number order, not Emacs's most-recently-selected order;
+`save-some-buffers-default-predicate` takes `nil` or `save-some-buffers-root`, no Lisp function.
+
+**Visiting files in the Emacs profile (v0.1.9, #619).** `C-x C-f` follows `find-file-noselect`:
+
+- `find-file-wildcards` visits every match of a last component with `*`, `?` or `[...]` (no leading-dot names
+  unless the pattern starts with a dot) and shows the first;
+- `directory-abbrev-alist` rewrites a name whose start matches FROM, and `find-file-visit-truename` visits
+  the true name;
+- a file another buffer visits under another name is visited in that buffer (`find-file-existing-other-name`
+  t), with `A and B are the same file` unless `find-file-suppress-same-file-warnings`;
+- a new file says `(New file)`; `confirm-nonexistent-file-or-buffer` t wants a second `RET` after `[Confirm]`;
+- `auto-mode-case-fold` retries an unknown extension in lower case;
+- `C-x C-w` (`write-file`) asks `File x exists; overwrite? (y or n)` and, under
+  `change-major-mode-with-file-name`, takes the new name's highlighting;
+- `M-x find-sibling-file` visits the first existing EXPANSION of the first matching `find-sibling-rules` rule.
+
+Divergences:
+- **Not built:**
+  - `find-file-existing-other-name` nil: ruse keeps one buffer per file, since two buffers on one file would
+    share a journal.
+  - Wildcards in directory components.
+  - An EXPANSION that is a regexp, and the choice among several siblings (the first wins).
+  - `major-mode-remap-alist`: ruse has no major modes; a file's type comes from its extension.
+- **Nothing for the variable to steer:**
+  - `mounted-file-systems`: ruse makes no temporary files outside a file's own directory.
+  - `remote-shell-program`: remote files are F-017's agent over ssh, not TRAMP.
+  - `save-abbrevs`: ruse has no abbrev tables.
+
 ### 6. Undo grouping boundaries (resolves the open D-005 part)
 
 Undo is recorded by **logical unit, not per keystroke** (INV-UNDO, [architecture §3.3](../architecture/architecture.md)). The
@@ -392,7 +628,7 @@ grouping rule keys off `TransactionOrigin` (INV-ORIGIN) plus an idle/gesture bou
 | --- | --- |
 | One insert session (`i … <Esc>`) | **one** undo group — all keystrokes between entering and leaving Insert coalesce (Vim semantics). |
 | A single operator (`dw`, `>}`, `ciw…<Esc>`) | one group (the whole change, including inserted text — [VIM-REPEAT-DOT](../parity/vim.md)). |
-| Consecutive same-origin `UserInput` edits with no intervening cursor-gesture/idle break | may coalesce within the session; a **mode change, cursor jump, or idle timeout closes the group**. |
+| Consecutive same-origin `UserInput` edits with no intervening cursor-gesture/idle break | may coalesce within the session; a **mode change, cursor jump, or idle timeout closes the group**. Under the Vim profile every TYPED command outside text entry (and every `i_CTRL-O` command, and the text typed after one) closes it first (Vim's `u_sync`, `Document::sync_undo`), so `xx` is two groups; a save closes it too. |
 | Formatter / `Lsp` edits (format-on-save, code action, rename) | grouped **separately** by their `correlation` — one code action = one undo group, distinct from surrounding typing, even if applied mid-session. |
 | `AiAgent` edits | always a **separate** group per proposal (INV-TRUST-1: reviewed before apply); never merged into user typing. |
 | `Macro` playback | the whole macro invocation is **one** group (so a single `u` undoes one `@a`), matching Vim. |
@@ -410,9 +646,10 @@ group.
 - `group_hint = JoinPrev` — merge this transaction into the previous group even across the normal boundary.
   Backs **`:undojoin`** (the next change joins the prior undo block; if the prior block was already undone,
   `:undojoin` is an error, matching Vim).
-- Line-level **`U`** (VIM-UNDO-1) is modeled as a synthesized inverse over "all changes to the current line
-  since the cursor last landed on it" — a derived group, not a tree node type; re-doable because it is itself an
-  undoable transaction.
+- Line-level **`U`** (VIM-UNDO-1, #605) keeps, per Document, a copy of the last changed line as it was
+  before its run of changes (nvim's `u_saveline`; `crates/core/src/line_undo.rs`). `U` swaps that copy in as
+  an ordinary transaction in its own group, so `u` undoes it and a second `U` redoes it. It is not a tree
+  node type, and undo/redo leave the copy alone; its line number follows lines added or deleted above it.
 
 Grouping lives in the in-memory undo history; the journal stores every transaction individually with its
 `group_hint`, so recovery reconstructs the same groups (grouping is metadata, replay is per-transaction).
@@ -595,8 +832,8 @@ disk-changed. Journal health (position, last fsync age, truncation events) is a 
 
 ## Migration strategy
 
-Formats are versioned from v1 (`magic RJ01`, `schema_ver`). No prior format exists (pre-F-008), so v1 is
-greenfield. Future changes: additive fields bump minor and are ignored by older readers per INV-ADDITIVE;
+The target format is versioned from v1 (`magic RJ01`, `schema_ver`). The shipped v0 frames have no header. How a v1 reader treats a headerless v0 journal is not decided; #932 should
+settle it. Later changes: additive fields bump minor and are ignored by older readers per INV-ADDITIVE;
 layout-breaking changes bump the record major and readers refuse unknown majors (halt-safe, §2). A journal
 written by a newer ruse is read by an older ruse only up to the first record it doesn't understand, and it
 never auto-overwrites — so cross-version open degrades to "recover as much as safely possible", never silent

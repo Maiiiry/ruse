@@ -1,0 +1,740 @@
+//! `line_layout` against nvim v0.12.6 screens.
+//!
+//! [`NVIM_ROWS`] was captured headless (`nvim --clean`, a window `columns` wide, the line alone in the
+//! buffer, `:set` options as listed, everything else at nvim's defaults): the screen rows the line takes,
+//! right-trimmed.
+
+use super::*;
+
+/// Paint `l` into rows the way the renderer does (wrapping), right-trimmed.
+fn rows(l: &LineLayout<'_>, width: usize) -> Vec<String> {
+    let mut grid = vec![vec![" ".to_string(); width]; l.rows];
+    for c in &l.cells {
+        let (r, col) = l.place(c.vcol);
+        if r >= grid.len() || col >= width {
+            continue;
+        }
+        grid[r][col] = match &c.text {
+            CellText::Str(s) => (*s).to_string(),
+            CellText::Char(ch) => ch.to_string(),
+            CellText::Blank => " ".into(),
+        };
+        for k in 1..c.width {
+            if col + k < width {
+                grid[r][col + k] = String::new();
+            }
+        }
+    }
+    grid.into_iter()
+        .map(|r| r.concat().trim_end().to_string())
+        .collect()
+}
+
+/// The layout options a `:set` line in the table gives.
+fn options(set: &str) -> (Layout<'static>, ListChars) {
+    let mut lay = Layout {
+        width: 0,
+        tabstop: ruse_core::Tabs::uniform(8),
+        wrap: true,
+        linebreak: false,
+        breakat: Box::leak(Box::new(BreakAt::default())),
+        showbreak: "",
+        breakindent: None,
+        list: None,
+        uhex: false,
+    };
+    let mut list = false;
+    let mut lcs = parse_listchars(LISTCHARS_DEFAULT).unwrap();
+    let mut bri = false;
+    let mut briopt = BriOpt::default();
+    for arg in set.split(' ').filter(|a| !a.is_empty()) {
+        match arg.split_once('=') {
+            None if arg == "linebreak" => lay.linebreak = true,
+            None if arg == "list" => list = true,
+            None if arg == "breakindent" => bri = true,
+            Some(("showbreak", v)) => lay.showbreak = Box::leak(v.to_string().into_boxed_str()),
+            Some(("briopt", v)) => briopt = parse_briopt(v).unwrap(),
+            Some(("listchars", v)) => lcs = parse_listchars(v).unwrap(),
+            Some(("tabstop", v)) => lay.tabstop = ruse_core::Tabs::uniform(v.parse().unwrap()),
+            Some(("vts", v)) => {
+                lay.tabstop = ruse_core::Tabs::new(8, ruse_core::VarStops::parse(v).unwrap());
+            }
+            _ => panic!("unknown test option {arg}"),
+        }
+    }
+    lay.breakindent = bri.then_some(briopt);
+    let lcs_static: &'static ListChars = Box::leak(Box::new(lcs.clone()));
+    lay.list = list.then_some(lcs_static);
+    (lay, lcs)
+}
+
+/// #1163: tabs paint to the stops of 'vartabstop', with and without 'list' (screen rows captured from nvim
+/// v0.12.6 `--clean --headless`, a 40-column grid, read back with `screenstring()`).
+#[test]
+fn tabs_paint_at_vartabstop_stops() {
+    for (set, text, want) in [
+        ("vts=4,8", "\ta\tb\tc", "    a       b       c"),
+        (
+            "vts=4,8 list listchars=tab:>-",
+            "\ta\tb\tc",
+            ">---a>------b>------c",
+        ),
+        ("vts=2,6,3", "x\t\t\t\ty", "x             y"),
+        ("vts=4,8 list listchars=tab:>-,space:.", "ab\t c", "ab>-.c"),
+    ] {
+        let (mut lay, _) = options(set);
+        lay.width = 40;
+        let l = layout(text.as_bytes(), &lay, &[]);
+        assert_eq!(rows(&l, 40), [want], "[{set}] {text:?}");
+    }
+}
+
+#[test]
+fn wrapped_lines_match_nvim_screens() {
+    let mut bad = Vec::new();
+    for &(width, set, text, want) in NVIM_ROWS {
+        let (mut lay, _) = options(set);
+        lay.width = width;
+        let l = layout(text, &lay, &[]);
+        let got = rows(&l, width);
+        if got != want {
+            bad.push(format!(
+                "{width} [{set}] {text:?}\n  want {want:?}\n  got  {got:?}"
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} mismatches:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
+
+/// #1251: a byte that is not UTF-8 shows as `<ff>`, four cells, split across rows like any transcription
+/// (nvim 0.12.6 shows `abcdefghij<f` on a 12-column row), and a tab after it starts at its fourth cell
+/// (nvim: `<ff>>   a` under `'list'`).
+#[test]
+fn an_invalid_byte_shows_as_four_hex_cells() {
+    let (mut lay, _) = options("");
+    lay.width = 12;
+    let line: &[u8] = b"abcdefghij\xff\xffxy";
+    let l = layout(line, &lay, &[]);
+    assert_eq!(rows(&l, 12), ["abcdefghij<f", "f><ff>xy"]);
+    assert_eq!(l.total, 20);
+    assert_eq!(
+        l.cursor_vcol(11, false),
+        14,
+        "the second <ff> starts at cell 14"
+    );
+    let (mut lay, _) = options("list");
+    lay.width = 12;
+    let line: &[u8] = b"\xff\ta";
+    assert_eq!(rows(&layout(line, &lay, &[]), 12), ["<ff>>   a"]);
+    // A combining mark after the byte composes onto its `<80>` and takes no cell, as nvim counts it.
+    let (mut lay, _) = options("");
+    lay.width = 12;
+    let line: &[u8] = b"a\x80\xcc\x81bc";
+    let l = layout(line, &lay, &[]);
+    assert_eq!(rows(&l, 12), ["a<80>bc"]);
+    assert_eq!(l.cursor_vcol(4, false), 5);
+}
+
+/// `(columns, :set options, line, the rows nvim shows)`.
+#[rustfmt::skip]
+const NVIM_ROWS: &[(usize, &str, &str, &[&str])] = &[
+    (12, "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b cccccccccc", "cccccccccccc", "cccccccc"]),
+    (12, "", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", "文yyyyyyyyyy", "yyyyyyyyyy"]),
+    (12, "", "  indented line that is long enough to wrap around twice ok", &["  indented l", "ine that is", "long enough", "to wrap arou", "nd twice ok"]),
+    (12, "", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文"]),
+    (12, "", " a  b   ", &[" a  b"]),
+    (12, "", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz      TAB", "    more", "tabs"]),
+    (12, "", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux cor", "ge grault ga", "rply waldo f", "red plugh xy", "zzy thud"]),
+    (12, "", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats"]),
+    (12, "", "    \t  mixed    nbsp   trailing   ", &["          mi", "xed    nbsp", "  trailing", ""]),
+    (12, "", "", &[""]),
+    (12, "", "short", &["short"]),
+    (12, "linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "bbbbbb", "cccccccccccc", "cccccccccccc", "cccccc"]),
+    (12, "linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", "文yyyyyyyyyy", "yyyyyyyyyy"]),
+    (12, "linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented", "line that", "is long", "enough to", "wrap around", "twice ok"]),
+    (12, "linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文"]),
+    (12, "linebreak", " a  b   ", &[" a  b"]),
+    (12, "linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz", "TAB", "more    tabs"]),
+    (12, "linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux", "corge", "grault", "garply", "waldo fred", "plugh xyzzy", "thud"]),
+    (12, "linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-", "dashes;and:", "colons,and.", "dots/and?", "questions!", "and@ats"]),
+    (12, "linebreak", "    \t  mixed    nbsp   trailing   ", &["          mi", "xed", "nbsp", "trailing"]),
+    (12, "linebreak", "", &[""]),
+    (12, "linebreak", "short", &["short"]),
+    (12, "showbreak=>>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", ">>aaaaaaaaaa", ">>aaaaaaaa b", ">>bbbbbbbbbb", ">>bbbbbbbbbb", ">>bbbbbbbbb", ">>cccccccccc", ">>cccccccccc", ">>cccccccccc"]),
+    (12, "showbreak=>>", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", ">>文yyyyyyyy", ">>yyyyyyyyyy", ">>yy"]),
+    (12, "showbreak=>>", "  indented line that is long enough to wrap around twice ok", &["  indented l", ">>ine that i", ">>s long eno", ">>ugh to wra", ">>p around t", ">>wice ok"]),
+    (12, "showbreak=>>", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", ">>中zzxxxxxx", ">>xxxxxxxxxx", ">>xx中文"]),
+    (12, "showbreak=>>", " a  b   ", &[" a  b"]),
+    (12, "showbreak=>>", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", ">>mnopqrstuv", ">>wxyz  TAB", ">>    more", ">>tabs"]),
+    (12, "showbreak=>>", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", ">>qux quux c", ">>orge graul", ">>t garply w", ">>aldo fred", ">>plugh xyzz", ">>y thud"]),
+    (12, "showbreak=>>", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", ">>shes;and:c", ">>olons,and.", ">>dots/and?q", ">>uestions!a", ">>nd@ats"]),
+    (12, "showbreak=>>", "    \t  mixed    nbsp   trailing   ", &["          mi", ">>xed    nbs", ">>p   traili", ">>ng"]),
+    (12, "showbreak=>>", "", &[""]),
+    (12, "showbreak=>>", "short", &["short"]),
+    (12, "showbreak=>> linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", ">>aaaaaaaaaa", ">>aaaaaaaa", ">>bbbbbbbbbb", ">>bbbbbbbbbb", ">>bbbbbbbbbb", ">>", ">>cccccccccc", ">>cccccccccc", ">>cccccccccc"]),
+    (12, "showbreak=>> linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", ">>文yyyyyyyy", ">>yyyyyyyyyy", ">>yy"]),
+    (12, "showbreak=>> linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented", ">>line that", ">>is long", ">>enough to", ">>wrap", ">>around", ">>twice ok"]),
+    (12, "showbreak=>> linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", ">>中zzxxxxxx", ">>xxxxxxxxxx", ">>xx中文"]),
+    (12, "showbreak=>> linebreak", " a  b   ", &[" a  b"]),
+    (12, "showbreak=>> linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", ">>mnopqrstuv", ">>wxyz", ">>TAB", ">>more  tabs"]),
+    (12, "showbreak=>> linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", ">>qux quux", ">>corge", ">>grault", ">>garply", ">>waldo", ">>fred", ">>plugh", ">>xyzzy thud"]),
+    (12, "showbreak=>> linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-", ">>dashes;", ">>and:", ">>colons,", ">>and.dots/", ">>and?", ">>questions!", ">>and@ats"]),
+    (12, "showbreak=>> linebreak", "    \t  mixed    nbsp   trailing   ", &["          mi", ">>xed", ">>nbsp", ">>trailing", ">>"]),
+    (12, "showbreak=>> linebreak", "", &[""]),
+    (12, "showbreak=>> linebreak", "short", &["short"]),
+    (12, "breakindent briopt=min:5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b cccccccccc", "cccccccccccc", "cccccccc"]),
+    (12, "breakindent briopt=min:5", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", "       文yyy", "       yyyyy", "       yyyyy", "       yyyyy", "       yy"]),
+    (12, "breakindent briopt=min:5", "  indented line that is long enough to wrap around twice ok", &["  indented l", "  ine that i", "  s long eno", "  ugh to wra", "  p around t", "  wice ok"]),
+    (12, "breakindent briopt=min:5", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文"]),
+    (12, "breakindent briopt=min:5", " a  b   ", &[" a  b"]),
+    (12, "breakindent briopt=min:5", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz      TAB", "    more", "tabs"]),
+    (12, "breakindent briopt=min:5", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux cor", "ge grault ga", "rply waldo f", "red plugh xy", "zzy thud"]),
+    (12, "breakindent briopt=min:5", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats"]),
+    (12, "breakindent briopt=min:5", "    \t  mixed    nbsp   trailing   ", &["          mi", "       xed", "         nbs", "       p   t", "       raili", "       ng"]),
+    (12, "breakindent briopt=min:5", "", &[""]),
+    (12, "breakindent briopt=min:5", "short", &["short"]),
+    (12, "breakindent briopt=min:5,shift:2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "  aaaaaaaaaa", "  aaaaaaaa b", "  bbbbbbbbbb", "  bbbbbbbbbb", "  bbbbbbbbb", "  cccccccccc", "  cccccccccc", "  cccccccccc"]),
+    (12, "breakindent briopt=min:5,shift:2", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", "       文yyy", "       yyyyy", "       yyyyy", "       yyyyy", "       yy"]),
+    (12, "breakindent briopt=min:5,shift:2", "  indented line that is long enough to wrap around twice ok", &["  indented l", "    ine that", "     is long", "     enough", "    to wrap", "    around t", "    wice ok"]),
+    (12, "breakindent briopt=min:5,shift:2", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "  中zzxxxxxx", "  xxxxxxxxxx", "  xx中文"]),
+    (12, "breakindent briopt=min:5,shift:2", " a  b   ", &[" a  b"]),
+    (12, "breakindent briopt=min:5,shift:2", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "  mnopqrstuv", "  wxyz  TAB", "      more", "  tabs"]),
+    (12, "breakindent briopt=min:5,shift:2", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "  qux quux c", "  orge graul", "  t garply w", "  aldo fred", "  plugh xyzz", "  y thud"]),
+    (12, "breakindent briopt=min:5,shift:2", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "  shes;and:c", "  olons,and.", "  dots/and?q", "  uestions!a", "  nd@ats"]),
+    (12, "breakindent briopt=min:5,shift:2", "    \t  mixed    nbsp   trailing   ", &["          mi", "       xed", "         nbs", "       p   t", "       raili", "       ng"]),
+    (12, "breakindent briopt=min:5,shift:2", "", &[""]),
+    (12, "breakindent briopt=min:5,shift:2", "short", &["short"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "+aaaaaaaaaaa", "+aaaaaaa bbb", "+bbbbbbbbbbb", "+bbbbbbbbbbb", "+bbbbb ccccc", "+ccccccccccc", "+ccccccccccc", "+ccc"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", "+       文yy", "+       yyyy", "+       yyyy", "+       yyyy", "+       yyyy", "+       yy"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "  indented line that is long enough to wrap around twice ok", &["  indented l", "+ ine that i", "+ s long eno", "+ ugh to wra", "+ p around t", "+ wice ok"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "+中zzxxxxxxx", "+xxxxxxxxxxx", "+中文"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", " a  b   ", &[" a  b"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "+mnopqrstuvw", "+xyz    TAB", "+    more", "+tabs"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "+qux quux co", "+rge grault", "+garply wald", "+o fred plug", "+h xyzzy thu", "+d"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "+shes;and:co", "+lons,and.do", "+ts/and?ques", "+tions!and@a", "+ts"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "    \t  mixed    nbsp   trailing   ", &["          mi", "+       xed", "+          n", "+       bsp", "+         tr", "+       aili", "+       ng", "+"]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "", &[""]),
+    (12, "breakindent briopt=min:5,sbr showbreak=+", "short", &["short"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "+aaaaaaaaaaa", "+aaaaaaa", "+bbbbbbbbbbb", "+bbbbbbbbbbb", "+bbbbbbbb", "+ccccccccccc", "+ccccccccccc", "+cccccccc"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中>", "       +文yy", "       +yyyy", "       +yyyy", "       +yyyy", "       +yyyy", "       +yy"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented", "  +line", "  +that is", "  +long", "  +enough", "  +to wrap", "  +around", "  +twice ok"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "+中zzxxxxxxx", "+xxxxxxxxxxx", "+中文"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", " a  b   ", &[" a  b"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "+mnopqrstuvw", "+xyz    TAB", "+    more", "+tabs"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "+qux quux", "+corge", "+grault", "+garply", "+waldo fred", "+plugh", "+xyzzy thud"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-", "+dashes;and:", "+colons,and.", "+dots/and?", "+questions!", "+and@ats"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "    \t  mixed    nbsp   trailing   ", &["          mi", "       +xed", "       +", "       +nbsp", "       +", "       +trai", "       +ling", "       +"]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "", &[""]),
+    (12, "breakindent briopt=min:5 showbreak=+ linebreak", "short", &["short"]),
+    (12, "list", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b cccccccccc", "cccccccccccc", "cccccccc"]),
+    (12, "list", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">       x中>", "文yyyyyyyyyy", "yyyyyyyyyy"]),
+    (12, "list", "  indented line that is long enough to wrap around twice ok", &["  indented l", "ine that is", "long enough", "to wrap arou", "nd twice ok"]),
+    (12, "list", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文"]),
+    (12, "list", " a  b   ", &[" a  b---"]),
+    (12, "list", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz>     TAB>", "    more>", "tabs"]),
+    (12, "list", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux cor", "ge grault ga", "rply waldo f", "red plugh xy", "zzy thud"]),
+    (12, "list", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats"]),
+    (12, "list", "    \t  mixed    nbsp   trailing   ", &["    >     mi", "xed  + nbsp", "  trailing--", "-"]),
+    (12, "list", "", &[""]),
+    (12, "list", "short", &["short"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa_bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b_cccccccccc", "cccccccccccc", "cccccccc$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">------<x中>", "文yyyyyyyyyy", "yyyyyyyyyy$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "  indented line that is long enough to wrap around twice ok", &["..indented_l", "ine_that_is_", "long_enough_", "to_wrap_arou", "nd_twice_ok$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", " a  b   ", &[".a__b~~~$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz>----<TAB>", "---<more>--<", "tabs$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo_bar_baz_", "qux_quux_cor", "ge_grault_ga", "rply_waldo_f", "red_plugh_xy", "zzy_thud$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "    \t  mixed    nbsp   trailing   ", &["....>--<..mi", "xed__+_nbsp_", "__trailing~~", "~$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "", &["$"]),
+    (12, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "short", &["short$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b cccccccccc", "cccccccccccc", "cccccccc$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">-------x中>", "文yyyyyyyyyy", "yyyyyyyyyy$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "  indented line that is long enough to wrap around twice ok", &["abindented l", "ine that is", "long enough", "to wrap arou", "nd twice ok$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", " a  b   ", &[" aabbaba$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz>-----TAB>", "----more>---", "tabs$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux cor", "ge grault ga", "rply waldo f", "red plugh xy", "zzy thud$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "    \t  mixed    nbsp   trailing   ", &["abab>---abmi", "xedab  nbspa", "batrailingab", "a$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "", &["$"]),
+    (12, "list listchars=tab:>-,multispace:ab,eol:$", "short", &["short$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa_", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "bbbbbb_", "cccccccccccc", "cccccccccccc", "cccccc$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">-------x中>", "文yyyyyyyyyy", "yyyyyyyyyy$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "  indented line that is long enough to wrap around twice ok", &["12indented_", "line_that_", "is_long_", "enough_to_", "wrap_around_", "twice_ok$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", " a  b   ", &["_a__b___$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz>-----", "TAB>--------", "more>---tabs", "$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo_bar_baz_", "qux_quux_", "corge_", "grault_", "garply_", "waldo_fred_", "plugh_xyzzy_", "thud$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-", "dashes;and:", "colons,and.", "dots/and?", "questions!", "and@ats$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "    \t  mixed    nbsp   trailing   ", &["1212>---12mi", "xed__ _", "nbsp___", "trailing___$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "", &["$"]),
+    (12, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "short", &["short$"]),
+    (12, "list listchars=eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b cccccccccc", "cccccccccccc", "cccccccc$"]),
+    (12, "list listchars=eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["^Ix中文yyyyy", "yyyyyyyyyyyy", "yyy$"]),
+    (12, "list listchars=eol:$", "  indented line that is long enough to wrap around twice ok", &["  indented l", "ine that is", "long enough", "to wrap arou", "nd twice ok$"]),
+    (12, "list listchars=eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文$"]),
+    (12, "list listchars=eol:$", " a  b   ", &[" a  b   $"]),
+    (12, "list listchars=eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz^ITAB^Imor", "e^Itabs$"]),
+    (12, "list listchars=eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux cor", "ge grault ga", "rply waldo f", "red plugh xy", "zzy thud$"]),
+    (12, "list listchars=eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats$"]),
+    (12, "list listchars=eol:$", "    \t  mixed    nbsp   trailing   ", &["    ^I  mixe", "d    nbsp", "trailing   $"]),
+    (12, "list listchars=eol:$", "", &["$"]),
+    (12, "list listchars=eol:$", "short", &["short$"]),
+    (12, "list listchars=eol:$ showbreak=>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", ">aaaaaaaaaaa", ">aaaaaaa bbb", ">bbbbbbbbbbb", ">bbbbbbbbbbb", ">bbbbb ccccc", ">ccccccccccc", ">ccccccccccc", ">ccc$"]),
+    (12, "list listchars=eol:$ showbreak=>", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["^Ix中文yyyyy", ">yyyyyyyyyyy", ">yyyy$"]),
+    (12, "list listchars=eol:$ showbreak=>", "  indented line that is long enough to wrap around twice ok", &["  indented l", ">ine that is", "> long enoug", ">h to wrap a", ">round twice", "> ok$"]),
+    (12, "list listchars=eol:$ showbreak=>", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", ">中zzxxxxxxx", ">xxxxxxxxxxx", ">中文$"]),
+    (12, "list listchars=eol:$ showbreak=>", " a  b   ", &[" a  b   $"]),
+    (12, "list listchars=eol:$ showbreak=>", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", ">mnopqrstuvw", ">xyz^ITAB^Im", ">ore^Itabs$"]),
+    (12, "list listchars=eol:$ showbreak=>", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", ">qux quux co", ">rge grault", ">garply wald", ">o fred plug", ">h xyzzy thu", ">d$"]),
+    (12, "list listchars=eol:$ showbreak=>", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", ">shes;and:co", ">lons,and.do", ">ts/and?ques", ">tions!and@a", ">ts$"]),
+    (12, "list listchars=eol:$ showbreak=>", "    \t  mixed    nbsp   trailing   ", &["    ^I  mixe", ">d    nbsp", "> trailing", "> $"]),
+    (12, "list listchars=eol:$ showbreak=>", "", &["$"]),
+    (12, "list listchars=eol:$ showbreak=>", "short", &["short$"]),
+    (12, "tabstop=4", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "aaaaaaaaaaaa", "aaaaaa bbbbb", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b cccccccccc", "cccccccccccc", "cccccccc"]),
+    (12, "tabstop=4", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["    x中文yyy", "yyyyyyyyyyyy", "yyyyy"]),
+    (12, "tabstop=4", "  indented line that is long enough to wrap around twice ok", &["  indented l", "ine that is", "long enough", "to wrap arou", "nd twice ok"]),
+    (12, "tabstop=4", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "中zzxxxxxxxx", "xxxxxxxxxx中", "文"]),
+    (12, "tabstop=4", " a  b   ", &[" a  b"]),
+    (12, "tabstop=4", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "mnopqrstuvwx", "yz  TAB more", "    tabs"]),
+    (12, "tabstop=4", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "qux quux cor", "ge grault ga", "rply waldo f", "red plugh xy", "zzy thud"]),
+    (12, "tabstop=4", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-da", "shes;and:col", "ons,and.dots", "/and?questio", "ns!and@ats"]),
+    (12, "tabstop=4", "    \t  mixed    nbsp   trailing   ", &["          mi", "xed    nbsp", "  trailing", ""]),
+    (12, "tabstop=4", "", &[""]),
+    (12, "tabstop=4", "short", &["short"]),
+    (12, "tabstop=4 linebreak showbreak=+", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaa", "+aaaaaaaaaaa", "+aaaaaaa", "+bbbbbbbbbbb", "+bbbbbbbbbbb", "+bbbbbbbb", "+ccccccccccc", "+ccccccccccc", "+cccccccc"]),
+    (12, "tabstop=4 linebreak showbreak=+", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["    x中文yyy", "+yyyyyyyyyyy", "+yyyyyy"]),
+    (12, "tabstop=4 linebreak showbreak=+", "  indented line that is long enough to wrap around twice ok", &["  indented", "+line that", "+is long", "+enough to", "+wrap", "+around", "+twice ok"]),
+    (12, "tabstop=4 linebreak showbreak=+", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx>", "+中zzxxxxxxx", "+xxxxxxxxxxx", "+中文"]),
+    (12, "tabstop=4 linebreak showbreak=+", " a  b   ", &[" a  b"]),
+    (12, "tabstop=4 linebreak showbreak=+", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijkl", "+mnopqrstuvw", "+xyz    TAB", "+more   tabs"]),
+    (12, "tabstop=4 linebreak showbreak=+", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz", "+qux quux", "+corge", "+grault", "+garply", "+waldo fred", "+plugh", "+xyzzy thud"]),
+    (12, "tabstop=4 linebreak showbreak=+", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-", "+dashes;and:", "+colons,and.", "+dots/and?", "+questions!", "+and@ats"]),
+    (12, "tabstop=4 linebreak showbreak=+", "    \t  mixed    nbsp   trailing   ", &["          mi", "+xed", "+nbsp", "+trailing"]),
+    (12, "tabstop=4 linebreak showbreak=+", "", &[""]),
+    (12, "tabstop=4 linebreak showbreak=+", "short", &["short"]),
+    (20, "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccc", "cccccccccccc"]),
+    (20, "", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", "yyyyyyyyyyyyy"]),
+    (20, "", "  indented line that is long enough to wrap around twice ok", &["  indented line that", " is long enough to w", "rap around twice ok"]),
+    (20, "", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文"]),
+    (20, "", " a  b   ", &[" a  b"]),
+    (20, "", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz      TAB", "more    tabs"]),
+    (20, "", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", " corge grault garply", " waldo fred plugh xy", "zzy thud"]),
+    (20, "", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats"]),
+    (20, "", "    \t  mixed    nbsp   trailing   ", &["          mixed    n", "bsp   trailing"]),
+    (20, "", "", &[""]),
+    (20, "", "short", &["short"]),
+    (20, "linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbb", "cccccccccccccccccccc", "cccccccccc"]),
+    (20, "linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", "yyyyyyyyyyyyy"]),
+    (20, "linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented line", "that is long enough", "to wrap around", "twice ok"]),
+    (20, "linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文"]),
+    (20, "linebreak", " a  b   ", &[" a  b"]),
+    (20, "linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz      TAB", "more    tabs"]),
+    (20, "linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux", "quux corge grault", "garply waldo fred", "plugh xyzzy thud"]),
+    (20, "linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;", "and:colons,and.dots/", "and?questions!and@", "ats"]),
+    (20, "linebreak", "    \t  mixed    nbsp   trailing   ", &["          mixed", "nbsp   trailing"]),
+    (20, "linebreak", "", &[""]),
+    (20, "linebreak", "short", &["short"]),
+    (20, "showbreak=>>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", ">>aaaaaaaaaa bbbbbbb", ">>bbbbbbbbbbbbbbbbbb", ">>bbbbb cccccccccccc", ">>cccccccccccccccccc"]),
+    (20, "showbreak=>>", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", ">>yyyyyyyyyyyyy"]),
+    (20, "showbreak=>>", "  indented line that is long enough to wrap around twice ok", &["  indented line that", ">> is long enough to", ">> wrap around twice", ">> ok"]),
+    (20, "showbreak=>>", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", ">>xxxxxxxxxxxxx中文"]),
+    (20, "showbreak=>>", " a  b   ", &[" a  b"]),
+    (20, "showbreak=>>", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", ">>uvwxyz    TAB", ">>more  tabs"]),
+    (20, "showbreak=>>", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", ">> corge grault garp", ">>ly waldo fred plug", ">>h xyzzy thud"]),
+    (20, "showbreak=>>", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ">>:colons,and.dots/a", ">>nd?questions!and@a", ">>ts"]),
+    (20, "showbreak=>>", "    \t  mixed    nbsp   trailing   ", &["          mixed    n", ">>bsp   trailing"]),
+    (20, "showbreak=>>", "", &[""]),
+    (20, "showbreak=>>", "short", &["short"]),
+    (20, "showbreak=>> linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", ">>aaaaaaaaaa", ">>bbbbbbbbbbbbbbbbbb", ">>bbbbbbbbbbbb", ">>cccccccccccccccccc", ">>cccccccccccc"]),
+    (20, "showbreak=>> linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", ">>yyyyyyyyyyyyy"]),
+    (20, "showbreak=>> linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented line", ">>that is long", ">>enough to wrap", ">>around twice ok"]),
+    (20, "showbreak=>> linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", ">>xxxxxxxxxxxxx中文"]),
+    (20, "showbreak=>> linebreak", " a  b   ", &[" a  b"]),
+    (20, "showbreak=>> linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", ">>uvwxyz    TAB", ">>more  tabs"]),
+    (20, "showbreak=>> linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux", ">>quux corge grault", ">>garply waldo fred", ">>plugh xyzzy thud"]),
+    (20, "showbreak=>> linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;", ">>and:colons,and.", ">>dots/and?", ">>questions!and@ats"]),
+    (20, "showbreak=>> linebreak", "    \t  mixed    nbsp   trailing   ", &["          mixed", ">>nbsp   trailing"]),
+    (20, "showbreak=>> linebreak", "", &[""]),
+    (20, "showbreak=>> linebreak", "short", &["short"]),
+    (20, "breakindent briopt=min:5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccc", "cccccccccccc"]),
+    (20, "breakindent briopt=min:5", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", "        yyyyyyyyyyyy", "        y"]),
+    (20, "breakindent briopt=min:5", "  indented line that is long enough to wrap around twice ok", &["  indented line that", "   is long enough to", "   wrap around twice", "   ok"]),
+    (20, "breakindent briopt=min:5", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文"]),
+    (20, "breakindent briopt=min:5", " a  b   ", &[" a  b"]),
+    (20, "breakindent briopt=min:5", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz      TAB", "more    tabs"]),
+    (20, "breakindent briopt=min:5", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", " corge grault garply", " waldo fred plugh xy", "zzy thud"]),
+    (20, "breakindent briopt=min:5", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats"]),
+    (20, "breakindent briopt=min:5", "    \t  mixed    nbsp   trailing   ", &["          mixed    n", "          bsp   trai", "          ling"]),
+    (20, "breakindent briopt=min:5", "", &[""]),
+    (20, "breakindent briopt=min:5", "short", &["short"]),
+    (20, "breakindent briopt=min:5,shift:2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "  aaaaaaaaaa bbbbbbb", "  bbbbbbbbbbbbbbbbbb", "  bbbbb cccccccccccc", "  cccccccccccccccccc"]),
+    (20, "breakindent briopt=min:5,shift:2", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", "          yyyyyyyyyy", "          yyy"]),
+    (20, "breakindent briopt=min:5,shift:2", "  indented line that is long enough to wrap around twice ok", &["  indented line that", "     is long enough", "    to wrap around t", "    wice ok"]),
+    (20, "breakindent briopt=min:5,shift:2", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "  xxxxxxxxxxxxx中文"]),
+    (20, "breakindent briopt=min:5,shift:2", " a  b   ", &[" a  b"]),
+    (20, "breakindent briopt=min:5,shift:2", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "  uvwxyz    TAB", "  more  tabs"]),
+    (20, "breakindent briopt=min:5,shift:2", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", "   corge grault garp", "  ly waldo fred plug", "  h xyzzy thud"]),
+    (20, "breakindent briopt=min:5,shift:2", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", "  :colons,and.dots/a", "  nd?questions!and@a", "  ts"]),
+    (20, "breakindent briopt=min:5,shift:2", "    \t  mixed    nbsp   trailing   ", &["          mixed    n", "            bsp   tr", "            ailing", ""]),
+    (20, "breakindent briopt=min:5,shift:2", "", &[""]),
+    (20, "breakindent briopt=min:5,shift:2", "short", &["short"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "+aaaaaaaaaa bbbbbbbb", "+bbbbbbbbbbbbbbbbbbb", "+bbb ccccccccccccccc", "+ccccccccccccccc"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", "+       yyyyyyyyyyyy", "+       y"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "  indented line that is long enough to wrap around twice ok", &["  indented line that", "+  is long enough to", "+  wrap around twice", "+  ok"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "+xxxxxxxxxxxxx中文"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", " a  b   ", &[" a  b"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "+uvwxyz     TAB", "+more   tabs"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", "+ corge grault garpl", "+y waldo fred plugh", "+xyzzy thud"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", "+:colons,and.dots/an", "+d?questions!and@ats"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "    \t  mixed    nbsp   trailing   ", &["          mixed    n", "+         bsp   trai", "+         ling"]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "", &[""]),
+    (20, "breakindent briopt=min:5,sbr showbreak=+", "short", &["short"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "+aaaaaaaaaa", "+bbbbbbbbbbbbbbbbbbb", "+bbbbbbbbbbb", "+ccccccccccccccccccc", "+ccccccccccc"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyy", "        +yyyyyyyyyyy", "        +yy"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented line", "  +that is long", "  +enough to wrap", "  +around twice ok"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "+xxxxxxxxxxxxx中文"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", " a  b   ", &[" a  b"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "+uvwxyz     TAB", "+more   tabs"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux", "+quux corge grault", "+garply waldo fred", "+plugh xyzzy thud"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;", "+and:colons,and.", "+dots/and?questions!", "+and@ats"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "    \t  mixed    nbsp   trailing   ", &["          mixed", "          +nbsp", "          +trailing", "          +"]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "", &[""]),
+    (20, "breakindent briopt=min:5 showbreak=+ linebreak", "short", &["short"]),
+    (20, "list", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccc", "cccccccccccc"]),
+    (20, "list", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">       x中文yyyyyyy", "yyyyyyyyyyyyy"]),
+    (20, "list", "  indented line that is long enough to wrap around twice ok", &["  indented line that", " is long enough to w", "rap around twice ok"]),
+    (20, "list", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文"]),
+    (20, "list", " a  b   ", &[" a  b---"]),
+    (20, "list", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz>     TAB>", "more>   tabs"]),
+    (20, "list", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", " corge grault garply", " waldo fred plugh xy", "zzy thud"]),
+    (20, "list", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats"]),
+    (20, "list", "    \t  mixed    nbsp   trailing   ", &["    >     mixed  + n", "bsp   trailing---"]),
+    (20, "list", "", &[""]),
+    (20, "list", "short", &["short"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa_bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b_cccccccccccccccccc", "cccccccccccc$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">------<x中文yyyyyyy", "yyyyyyyyyyyyy$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "  indented line that is long enough to wrap around twice ok", &["..indented_line_that", "_is_long_enough_to_w", "rap_around_twice_ok$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", " a  b   ", &[".a__b~~~$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz>----<TAB>---<", "more>--<tabs$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo_bar_baz_qux_quux", "_corge_grault_garply", "_waldo_fred_plugh_xy", "zzy_thud$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "    \t  mixed    nbsp   trailing   ", &["....>--<..mixed__+_n", "bsp___trailing~~~$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "", &["$"]),
+    (20, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "short", &["short$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccc", "cccccccccccc$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">-------x中文yyyyyyy", "yyyyyyyyyyyyy$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "  indented line that is long enough to wrap around twice ok", &["abindented line that", " is long enough to w", "rap around twice ok$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", " a  b   ", &[" aabbaba$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz>-----TAB>----", "more>---tabs$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", " corge grault garply", " waldo fred plugh xy", "zzy thud$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "    \t  mixed    nbsp   trailing   ", &["abab>---abmixedab  n", "bspabatrailingaba$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "", &["$"]),
+    (20, "list listchars=tab:>-,multispace:ab,eol:$", "short", &["short$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa_", "bbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbb_", "cccccccccccccccccccc", "cccccccccc$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">-------x中文yyyyyyy", "yyyyyyyyyyyyy$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "  indented line that is long enough to wrap around twice ok", &["12indented_line_", "that_is_long_enough_", "to_wrap_around_", "twice_ok$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", " a  b   ", &["_a__b___$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz>-----TAB>----", "more>---tabs$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo_bar_baz_qux_", "quux_corge_grault_", "garply_waldo_fred_", "plugh_xyzzy_thud$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;", "and:colons,and.dots/", "and?questions!and@", "ats$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "    \t  mixed    nbsp   trailing   ", &["1212>---12mixed__ _", "nbsp___trailing___$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "", &["$"]),
+    (20, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "short", &["short$"]),
+    (20, "list listchars=eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccc", "cccccccccccc$"]),
+    (20, "list listchars=eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["^Ix中文yyyyyyyyyyyyy", "yyyyyyy$"]),
+    (20, "list listchars=eol:$", "  indented line that is long enough to wrap around twice ok", &["  indented line that", " is long enough to w", "rap around twice ok$"]),
+    (20, "list listchars=eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文$"]),
+    (20, "list listchars=eol:$", " a  b   ", &[" a  b   $"]),
+    (20, "list listchars=eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz^ITAB^Imore^It", "abs$"]),
+    (20, "list listchars=eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", " corge grault garply", " waldo fred plugh xy", "zzy thud$"]),
+    (20, "list listchars=eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats$"]),
+    (20, "list listchars=eol:$", "    \t  mixed    nbsp   trailing   ", &["    ^I  mixed    nbs", "p   trailing   $"]),
+    (20, "list listchars=eol:$", "", &["$"]),
+    (20, "list listchars=eol:$", "short", &["short$"]),
+    (20, "list listchars=eol:$ showbreak=>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", ">aaaaaaaaaa bbbbbbbb", ">bbbbbbbbbbbbbbbbbbb", ">bbb ccccccccccccccc", ">ccccccccccccccc$"]),
+    (20, "list listchars=eol:$ showbreak=>", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["^Ix中文yyyyyyyyyyyyy", ">yyyyyyy$"]),
+    (20, "list listchars=eol:$ showbreak=>", "  indented line that is long enough to wrap around twice ok", &["  indented line that", "> is long enough to", ">wrap around twice o", ">k$"]),
+    (20, "list listchars=eol:$ showbreak=>", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", ">xxxxxxxxxxxxx中文$"]),
+    (20, "list listchars=eol:$ showbreak=>", " a  b   ", &[" a  b   $"]),
+    (20, "list listchars=eol:$ showbreak=>", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", ">uvwxyz^ITAB^Imore^I", ">tabs$"]),
+    (20, "list listchars=eol:$ showbreak=>", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", "> corge grault garpl", ">y waldo fred plugh", ">xyzzy thud$"]),
+    (20, "list listchars=eol:$ showbreak=>", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ">:colons,and.dots/an", ">d?questions!and@ats", ">$"]),
+    (20, "list listchars=eol:$ showbreak=>", "    \t  mixed    nbsp   trailing   ", &["    ^I  mixed    nbs", ">p   trailing   $"]),
+    (20, "list listchars=eol:$ showbreak=>", "", &["$"]),
+    (20, "list listchars=eol:$ showbreak=>", "short", &["short$"]),
+    (20, "tabstop=4", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaa bbbbbbbbb", "bbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccc", "cccccccccccc"]),
+    (20, "tabstop=4", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["    x中文yyyyyyyyyyy", "yyyyyyyyy"]),
+    (20, "tabstop=4", "  indented line that is long enough to wrap around twice ok", &["  indented line that", " is long enough to w", "rap around twice ok"]),
+    (20, "tabstop=4", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "xxxxxxxxxxxxx中文"]),
+    (20, "tabstop=4", " a  b   ", &[" a  b"]),
+    (20, "tabstop=4", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "uvwxyz  TAB more", "tabs"]),
+    (20, "tabstop=4", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux", " corge grault garply", " waldo fred plugh xy", "zzy thud"]),
+    (20, "tabstop=4", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and", ":colons,and.dots/and", "?questions!and@ats"]),
+    (20, "tabstop=4", "    \t  mixed    nbsp   trailing   ", &["          mixed    n", "bsp   trailing"]),
+    (20, "tabstop=4", "", &[""]),
+    (20, "tabstop=4", "short", &["short"]),
+    (20, "tabstop=4 linebreak showbreak=+", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaa", "+aaaaaaaaaa", "+bbbbbbbbbbbbbbbbbbb", "+bbbbbbbbbbb", "+ccccccccccccccccccc", "+ccccccccccc"]),
+    (20, "tabstop=4 linebreak showbreak=+", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["    x中文yyyyyyyyyyy", "+yyyyyyyyy"]),
+    (20, "tabstop=4 linebreak showbreak=+", "  indented line that is long enough to wrap around twice ok", &["  indented line", "+that is long", "+enough to wrap", "+around twice ok"]),
+    (20, "tabstop=4 linebreak showbreak=+", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxx", "+xxxxxxxxxxxxx中文"]),
+    (20, "tabstop=4 linebreak showbreak=+", " a  b   ", &[" a  b"]),
+    (20, "tabstop=4 linebreak showbreak=+", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrst", "+uvwxyz TAB more", "+tabs"]),
+    (20, "tabstop=4 linebreak showbreak=+", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux", "+quux corge grault", "+garply waldo fred", "+plugh xyzzy thud"]),
+    (20, "tabstop=4 linebreak showbreak=+", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;", "+and:colons,and.", "+dots/and?questions!", "+and@ats"]),
+    (20, "tabstop=4 linebreak showbreak=+", "    \t  mixed    nbsp   trailing   ", &["          mixed", "+nbsp   trailing"]),
+    (20, "tabstop=4 linebreak showbreak=+", "", &[""]),
+    (20, "tabstop=4 linebreak showbreak=+", "short", &["short"]),
+    (30, "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", " bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccccccccccccc", "cc"]),
+    (30, "", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", "yyy"]),
+    (30, "", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "nough to wrap around twice ok"]),
+    (30, "", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文"]),
+    (30, "", " a  b   ", &[" a  b"]),
+    (30, "", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "  TAB     more    tabs"]),
+    (30, "", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "ult garply waldo fred plugh xy", "zzy thud"]),
+    (30, "", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats"]),
+    (30, "", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp   trai", "ling"]),
+    (30, "", "", &[""]),
+    (30, "", "short", &["short"]),
+    (30, "linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "", "cccccccccccccccccccccccccccccc"]),
+    (30, "linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", "yyy"]),
+    (30, "linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long", "enough to wrap around twice ok"]),
+    (30, "linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文"]),
+    (30, "linebreak", " a  b   ", &[" a  b"]),
+    (30, "linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "  TAB     more    tabs"]),
+    (30, "linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge", "grault garply waldo fred", "plugh xyzzy thud"]),
+    (30, "linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,", "and.dots/and?questions!and@ats"]),
+    (30, "linebreak", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp", "trailing"]),
+    (30, "linebreak", "", &[""]),
+    (30, "linebreak", "short", &["short"]),
+    (30, "showbreak=>>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ">> bbbbbbbbbbbbbbbbbbbbbbbbbbb", ">>bbb cccccccccccccccccccccccc", ">>cccccc"]),
+    (30, "showbreak=>>", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", ">>yyy"]),
+    (30, "showbreak=>>", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", ">>nough to wrap around twice o", ">>k"]),
+    (30, "showbreak=>>", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", ">>xxx中文"]),
+    (30, "showbreak=>>", " a  b   ", &[" a  b"]),
+    (30, "showbreak=>>", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", ">>  TAB   more    tabs"]),
+    (30, "showbreak=>>", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", ">>ult garply waldo fred plugh", ">>xyzzy thud"]),
+    (30, "showbreak=>>", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", ">>d.dots/and?questions!and@ats"]),
+    (30, "showbreak=>>", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp   trai", ">>ling"]),
+    (30, "showbreak=>>", "", &[""]),
+    (30, "showbreak=>>", "short", &["short"]),
+    (30, "showbreak=>> linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ">>", ">>bbbbbbbbbbbbbbbbbbbbbbbbbbbb", ">>bb", ">>cccccccccccccccccccccccccccc", ">>cc"]),
+    (30, "showbreak=>> linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", ">>yyy"]),
+    (30, "showbreak=>> linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long", ">>enough to wrap around twice", ">>ok"]),
+    (30, "showbreak=>> linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", ">>xxx中文"]),
+    (30, "showbreak=>> linebreak", " a  b   ", &[" a  b"]),
+    (30, "showbreak=>> linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", ">>  TAB   more    tabs"]),
+    (30, "showbreak=>> linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge", ">>grault garply waldo fred", ">>plugh xyzzy thud"]),
+    (30, "showbreak=>> linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,", ">>and.dots/and?questions!and@", ">>ats"]),
+    (30, "showbreak=>> linebreak", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp", ">>trailing"]),
+    (30, "showbreak=>> linebreak", "", &[""]),
+    (30, "showbreak=>> linebreak", "short", &["short"]),
+    (30, "breakindent briopt=min:5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", " bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccccccccccccc", "cc"]),
+    (30, "breakindent briopt=min:5", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", "        yyy"]),
+    (30, "breakindent briopt=min:5", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "  nough to wrap around twice o", "  k"]),
+    (30, "breakindent briopt=min:5", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文"]),
+    (30, "breakindent briopt=min:5", " a  b   ", &[" a  b"]),
+    (30, "breakindent briopt=min:5", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "  TAB     more    tabs"]),
+    (30, "breakindent briopt=min:5", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "ult garply waldo fred plugh xy", "zzy thud"]),
+    (30, "breakindent briopt=min:5", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats"]),
+    (30, "breakindent briopt=min:5", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp   trai", "          ling"]),
+    (30, "breakindent briopt=min:5", "", &[""]),
+    (30, "breakindent briopt=min:5", "short", &["short"]),
+    (30, "breakindent briopt=min:5,shift:2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "   bbbbbbbbbbbbbbbbbbbbbbbbbbb", "  bbb cccccccccccccccccccccccc", "  cccccc"]),
+    (30, "breakindent briopt=min:5,shift:2", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", "          yyy"]),
+    (30, "breakindent briopt=min:5,shift:2", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "    nough to wrap around twice", "     ok"]),
+    (30, "breakindent briopt=min:5,shift:2", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "  xxx中文"]),
+    (30, "breakindent briopt=min:5,shift:2", " a  b   ", &[" a  b"]),
+    (30, "breakindent briopt=min:5,shift:2", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "    TAB   more    tabs"]),
+    (30, "breakindent briopt=min:5,shift:2", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "  ult garply waldo fred plugh", "  xyzzy thud"]),
+    (30, "breakindent briopt=min:5,shift:2", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "  d.dots/and?questions!and@ats"]),
+    (30, "breakindent briopt=min:5,shift:2", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp   trai", "            ling"]),
+    (30, "breakindent briopt=min:5,shift:2", "", &[""]),
+    (30, "breakindent briopt=min:5,shift:2", "short", &["short"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "+ bbbbbbbbbbbbbbbbbbbbbbbbbbbb", "+bb cccccccccccccccccccccccccc", "+cccc"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", "+       yyy"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "+ nough to wrap around twice o", "+ k"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "+xxx中文"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", " a  b   ", &[" a  b"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "+  TAB    more    tabs"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "+ult garply waldo fred plugh x", "+yzzy thud"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "+d.dots/and?questions!and@ats"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp   trai", "+         ling"]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "", &[""]),
+    (30, "breakindent briopt=min:5,sbr showbreak=+", "short", &["short"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "+", "+bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "+b", "+ccccccccccccccccccccccccccccc", "+c"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["        x中文yyyyyyyyyyyyyyyyy", "        +yyy"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long", "  +enough to wrap around", "  +twice ok"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "+xxx中文"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", " a  b   ", &[" a  b"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "+  TAB    more    tabs"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge", "+grault garply waldo fred", "+plugh xyzzy thud"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,", "+and.dots/and?questions!and@", "+ats"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp", "          +trailing"]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "", &[""]),
+    (30, "breakindent briopt=min:5 showbreak=+ linebreak", "short", &["short"]),
+    (30, "list", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", " bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccccccccccccc", "cc"]),
+    (30, "list", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">       x中文yyyyyyyyyyyyyyyyy", "yyy"]),
+    (30, "list", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "nough to wrap around twice ok"]),
+    (30, "list", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文"]),
+    (30, "list", " a  b   ", &[" a  b---"]),
+    (30, "list", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz>", "  TAB>    more>   tabs"]),
+    (30, "list", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "ult garply waldo fred plugh xy", "zzy thud"]),
+    (30, "list", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats"]),
+    (30, "list", "    \t  mixed    nbsp   trailing   ", &["    >     mixed  + nbsp   trai", "ling---"]),
+    (30, "list", "", &[""]),
+    (30, "list", "short", &["short"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "_bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b_cccccccccccccccccccccccccccc", "cc$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">------<x中文yyyyyyyyyyyyyyyyy", "yyy$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "  indented line that is long enough to wrap around twice ok", &["..indented_line_that_is_long_e", "nough_to_wrap_around_twice_ok$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", " a  b   ", &[".a__b~~~$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz>---", "-<TAB>---<more>--<tabs$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo_bar_baz_qux_quux_corge_gra", "ult_garply_waldo_fred_plugh_xy", "zzy_thud$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "    \t  mixed    nbsp   trailing   ", &["....>--<..mixed__+_nbsp___trai", "ling~~~$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "", &["$"]),
+    (30, "list listchars=tab:>-<,trail:~,lead:.,space:_,nbsp:+,eol:$", "short", &["short$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", " bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccccccccccccc", "cc$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">-------x中文yyyyyyyyyyyyyyyyy", "yyy$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "  indented line that is long enough to wrap around twice ok", &["abindented line that is long e", "nough to wrap around twice ok$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", " a  b   ", &[" aabbaba$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz>---", "--TAB>----more>---tabs$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "ult garply waldo fred plugh xy", "zzy thud$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "    \t  mixed    nbsp   trailing   ", &["abab>---abmixedab  nbspabatrai", "lingaba$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "", &["$"]),
+    (30, "list listchars=tab:>-,multispace:ab,eol:$", "short", &["short$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "_", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "_", "cccccccccccccccccccccccccccccc", "$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "\tx中文yyyyyyyyyyyyyyyyyyyy", &[">-------x中文yyyyyyyyyyyyyyyyy", "yyy$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "  indented line that is long enough to wrap around twice ok", &["12indented_line_that_is_long_", "enough_to_wrap_around_twice_ok", "$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", " a  b   ", &["_a__b___$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz>---", "--TAB>----more>---tabs$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo_bar_baz_qux_quux_corge_", "grault_garply_waldo_fred_", "plugh_xyzzy_thud$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,", "and.dots/and?questions!and@ats", "$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "    \t  mixed    nbsp   trailing   ", &["1212>---12mixed__ _nbsp___", "trailing___$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "", &["$"]),
+    (30, "list listchars=tab:>-,leadmultispace:12,space:_,eol:$ linebreak", "short", &["short$"]),
+    (30, "list listchars=eol:$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", " bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccccccccccccc", "cc$"]),
+    (30, "list listchars=eol:$", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["^Ix中文yyyyyyyyyyyyyyyyyyyy$"]),
+    (30, "list listchars=eol:$", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "nough to wrap around twice ok$"]),
+    (30, "list listchars=eol:$", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文$"]),
+    (30, "list listchars=eol:$", " a  b   ", &[" a  b   $"]),
+    (30, "list listchars=eol:$", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz^ITA", "B^Imore^Itabs$"]),
+    (30, "list listchars=eol:$", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "ult garply waldo fred plugh xy", "zzy thud$"]),
+    (30, "list listchars=eol:$", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats$"]),
+    (30, "list listchars=eol:$", "    \t  mixed    nbsp   trailing   ", &["    ^I  mixed    nbsp   traili", "ng   $"]),
+    (30, "list listchars=eol:$", "", &["$"]),
+    (30, "list listchars=eol:$", "short", &["short$"]),
+    (30, "list listchars=eol:$ showbreak=>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "> bbbbbbbbbbbbbbbbbbbbbbbbbbbb", ">bb cccccccccccccccccccccccccc", ">cccc$"]),
+    (30, "list listchars=eol:$ showbreak=>", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["^Ix中文yyyyyyyyyyyyyyyyyyyy$"]),
+    (30, "list listchars=eol:$ showbreak=>", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", ">nough to wrap around twice ok", ">$"]),
+    (30, "list listchars=eol:$ showbreak=>", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", ">xxx中文$"]),
+    (30, "list listchars=eol:$ showbreak=>", " a  b   ", &[" a  b   $"]),
+    (30, "list listchars=eol:$ showbreak=>", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz^ITA", ">B^Imore^Itabs$"]),
+    (30, "list listchars=eol:$ showbreak=>", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", ">ult garply waldo fred plugh x", ">yzzy thud$"]),
+    (30, "list listchars=eol:$ showbreak=>", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", ">d.dots/and?questions!and@ats$"]),
+    (30, "list listchars=eol:$ showbreak=>", "    \t  mixed    nbsp   trailing   ", &["    ^I  mixed    nbsp   traili", ">ng   $"]),
+    (30, "list listchars=eol:$ showbreak=>", "", &["$"]),
+    (30, "list listchars=eol:$ showbreak=>", "short", &["short$"]),
+    (30, "tabstop=4", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", " bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b cccccccccccccccccccccccccccc", "cc"]),
+    (30, "tabstop=4", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["    x中文yyyyyyyyyyyyyyyyyyyy"]),
+    (30, "tabstop=4", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long e", "nough to wrap around twice ok"]),
+    (30, "tabstop=4", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "xxx中文"]),
+    (30, "tabstop=4", " a  b   ", &[" a  b"]),
+    (30, "tabstop=4", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz  TA", "B more    tabs"]),
+    (30, "tabstop=4", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge gra", "ult garply waldo fred plugh xy", "zzy thud"]),
+    (30, "tabstop=4", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,an", "d.dots/and?questions!and@ats"]),
+    (30, "tabstop=4", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp   trai", "ling"]),
+    (30, "tabstop=4", "", &[""]),
+    (30, "tabstop=4", "short", &["short"]),
+    (30, "tabstop=4 linebreak showbreak=+", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccc", &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "+", "+bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "+b", "+ccccccccccccccccccccccccccccc", "+c"]),
+    (30, "tabstop=4 linebreak showbreak=+", "\tx中文yyyyyyyyyyyyyyyyyyyy", &["    x中文yyyyyyyyyyyyyyyyyyyy"]),
+    (30, "tabstop=4 linebreak showbreak=+", "  indented line that is long enough to wrap around twice ok", &["  indented line that is long", "+enough to wrap around twice", "+ok"]),
+    (30, "tabstop=4 linebreak showbreak=+", "xxxxxxxxxxx中zzxxxxxxxxxxxxxxxxxx中文", &["xxxxxxxxxxx中zzxxxxxxxxxxxxxxx", "+xxx中文"]),
+    (30, "tabstop=4 linebreak showbreak=+", " a  b   ", &[" a  b"]),
+    (30, "tabstop=4 linebreak showbreak=+", "abcdefghijklmnopqrstuvwxyz\tTAB\tmore\ttabs", &["abcdefghijklmnopqrstuvwxyz", "+TAB  more    tabs"]),
+    (30, "tabstop=4 linebreak showbreak=+", "foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud", &["foo bar baz qux quux corge", "+grault garply waldo fred", "+plugh xyzzy thud"]),
+    (30, "tabstop=4 linebreak showbreak=+", "word-with-dashes;and:colons,and.dots/and?questions!and@ats", &["word-with-dashes;and:colons,", "+and.dots/and?questions!and@", "+ats"]),
+    (30, "tabstop=4 linebreak showbreak=+", "    \t  mixed    nbsp   trailing   ", &["          mixed    nbsp", "+trailing"]),
+    (30, "tabstop=4 linebreak showbreak=+", "", &[""]),
+    (30, "tabstop=4 linebreak showbreak=+", "short", &["short"]),
+];
+
+/// #1294: [`layout_from`] counts the plain ASCII run before the window instead of laying it out, and lays
+/// out the rest exactly as the whole-line layout does: the same total and rows, and the same chars and
+/// cells from the row (or without 'wrap', the column) the window starts at.
+#[test]
+fn layout_from_skips_only_what_the_window_does_not_show() {
+    let lines: [&[u8]; 10] = [
+        b"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz",
+        "   indented words go on and on past the edge of the window e\u{301}x".as_bytes(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{301}bbb".as_bytes(),
+        "aaaaaaaaaaaaaaaaaaa\u{6f22}\u{5b57}aaaaaaaaaaaaaaaaaa\u{6f22}aaaaaaa".as_bytes(),
+        b"aaaaaaaaaaaaaaaaaaaaaaaaa\taaaaaaaaaaaaaaaaaaa\tbbbbbbbbbbbbbbbb",
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xffaaaaaaaaaaaaaaaaaaaaa\x80\x01bb",
+        "aaaaaaaaaaaaaaaaaaaaaaa\u{1f1ef}\u{1f1f5}\u{1f1f0}aaaaaaaaaaaaa\u{1f468}\u{200d}\u{1f469}"
+            .as_bytes(),
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa   trailing   ",
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        b"",
+    ];
+    let sets = [
+        "",
+        "showbreak=>>",
+        "breakindent briopt=shift:2",
+        "breakindent showbreak=+",
+        "list listchars=trail:-,space:.,eol:$",
+        "list listchars=eol:$ showbreak=>",
+    ];
+    let mut skipped = 0;
+    for set in sets {
+        for wrap in [true, false] {
+            for width in [1, 2, 7, 10] {
+                let (mut lay, _) = options(set);
+                lay.width = width;
+                lay.wrap = wrap;
+                for line in lines {
+                    for max_vcol in [usize::MAX, 23, 70] {
+                        let full = layout_upto(line, &lay, &[], max_vcol, usize::MAX);
+                        for min_vcol in 0..90 {
+                            let part = layout_from(line, &lay, &[], min_vcol, max_vcol, usize::MAX);
+                            let ctx = format!(
+                                "{set:?} wrap={wrap} w={width} {line:?} {min_vcol}..{max_vcol}"
+                            );
+                            assert_eq!((part.total, part.rows), (full.total, full.rows), "{ctx}");
+                            assert!(full.chars.ends_with(&part.chars), "{ctx}");
+                            assert!(full.cells.ends_with(&part.cells), "{ctx}");
+                            let shown = if wrap {
+                                min_vcol.min(max_vcol) / width * width
+                            } else {
+                                min_vcol.min(max_vcol)
+                            };
+                            let need = full.cells.iter().filter(|c| c.vcol >= shown).count();
+                            assert!(part.cells.len() >= need, "{ctx}");
+                            skipped += usize::from(part.chars.len() < full.chars.len());
+                            assert_eq!(
+                                rows_upto(line, &lay, max_vcol),
+                                full.rows,
+                                "{ctx} rows_upto"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(skipped > 10_000, "the run was skipped in {skipped} cases");
+}

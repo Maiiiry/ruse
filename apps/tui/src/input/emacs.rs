@@ -72,7 +72,7 @@ impl EmacsArg {
 /// [`KeyCode`] as the Vim namespaces are. Shift is tracked ONLY for non-character keys (`C-S-<backspace>`):
 /// for a printable key Shift is already folded into the char (`Shift-2` = `@`), so tracking it there would
 /// make a shifted printable miss its unshifted binding.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct EmacsKey {
     code: KeyCode,
     ctrl: bool,
@@ -232,14 +232,14 @@ impl EmacsProfile {
             EmacsKey::ctrl('f'),
             EmacsBinding::Directional {
                 bare: Command::MoveRight,
-                motion: Motion::Right,
+                motion: Motion::EmacsCharFwd,
             },
         )
         .bind(
             EmacsKey::ctrl('b'),
             EmacsBinding::Directional {
                 bare: Command::MoveLeft,
-                motion: Motion::Left,
+                motion: Motion::EmacsCharBack,
             },
         )
         .bind(
@@ -411,6 +411,89 @@ impl EmacsProfile {
     }
 }
 
+/// The file and buffer commands of the Emacs profile that ask questions or read a file name (#619): the
+/// session runs them (`app/session/emacs_files.rs`), since they prompt and touch files, not the document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EmacsAction {
+    /// `C-x C-c` `save-buffers-kill-terminal`: offer to save each buffer, then exit.
+    KillTerminal,
+    /// `C-x s` `save-some-buffers`.
+    SaveSomeBuffers,
+    /// `M-x revert-buffer`.
+    RevertBuffer,
+    /// `C-x x g` `revert-buffer-quick`.
+    RevertBufferQuick,
+    /// `C-x C-q` `read-only-mode`.
+    ReadOnlyMode,
+    /// `C-x C-f` `find-file`.
+    FindFile,
+    /// `C-x C-w` `write-file`.
+    WriteFile,
+    /// `M-x find-sibling-file`.
+    FindSiblingFile,
+}
+
+/// The `C-x` keys that run an [`EmacsAction`]: `(key, ctrl held, action)`.
+pub(crate) const EMACS_CX_ACTIONS: &[(char, bool, EmacsAction)] = &[
+    ('c', true, EmacsAction::KillTerminal),
+    ('s', false, EmacsAction::SaveSomeBuffers),
+    ('q', true, EmacsAction::ReadOnlyMode),
+    ('f', true, EmacsAction::FindFile),
+    ('w', true, EmacsAction::WriteFile),
+];
+
+/// The `M-x` names of the [`EmacsAction`]s.
+#[must_use]
+pub fn emacs_action_by_name(name: &str) -> Option<EmacsAction> {
+    Some(match name.trim() {
+        "save-buffers-kill-terminal" | "save-buffers-kill-emacs" => EmacsAction::KillTerminal,
+        "save-some-buffers" => EmacsAction::SaveSomeBuffers,
+        "revert-buffer" => EmacsAction::RevertBuffer,
+        "revert-buffer-quick" => EmacsAction::RevertBufferQuick,
+        "read-only-mode" => EmacsAction::ReadOnlyMode,
+        "find-file" => EmacsAction::FindFile,
+        "write-file" => EmacsAction::WriteFile,
+        "find-sibling-file" => EmacsAction::FindSiblingFile,
+        _ => return None,
+    })
+}
+
+/// The `C-x` prefix map (`ctl-x-map`): `(key, ctrl held, command)`. The key after `C-x` resolves here;
+/// anything else cancels the prefix. A table rather than a `match` so the static conflict check
+/// (ENG-PROFILE-001, #1130) can walk it.
+pub(crate) const EMACS_CX_MAP: &[(char, bool, Command)] = &[
+    ('s', true, Command::Save),              // C-x C-s — save-buffer
+    ('c', true, Command::Quit), // C-x C-c — save-buffers-kill-terminal (the session asks)
+    ('u', false, Command::Undo), // C-x u — undo
+    ('x', true, Command::ExchangePointMark), // C-x C-x — exchange point and mark
+    (
+        'u',
+        true,
+        Command::EmacsCaseRegion {
+            case: WordCase::Upcase, // C-x C-u — upcase-region
+        },
+    ),
+    (
+        'l',
+        true,
+        Command::EmacsCaseRegion {
+            case: WordCase::Downcase, // C-x C-l — downcase-region
+        },
+    ),
+];
+
+/// The command `C-x` then `key` runs, or `None` when the `C-x` map does not bind it.
+pub(crate) fn emacs_cx_command(key: KeyEvent) -> Option<Command> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    EMACS_CX_MAP
+        .iter()
+        .find(|(k, kc, _)| *k == c && *kc == ctrl)
+        .map(|(_, _, cmd)| cmd.clone())
+}
+
 /// Fold an Emacs prefix count into a command that has no native count field by repeating it: `count <= 1`
 /// is the bare command, more is an ordered `Replay` (`C-u 3 RET` → three newlines). The Emacs path never
 /// records, so `Replay` here is a pure "apply each in turn", not dot-repeat.
@@ -418,7 +501,12 @@ pub(crate) fn emacs_repeat(cmd: Command, count: u32) -> Feed {
     if count <= 1 {
         Feed::Cmd(cmd)
     } else {
-        Feed::Replay(vec![cmd; count as usize])
+        // Lazily: a huge `C-u` count must not build `count` commands up front (#683).
+        Feed::Repeat(super::Repeat {
+            unit: vec![cmd],
+            times: count,
+            ..super::Repeat::default()
+        })
     }
 }
 

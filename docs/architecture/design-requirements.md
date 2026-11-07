@@ -15,8 +15,8 @@ audience: [maintainers, contributors, llm-agents]
 status: draft
 related:
   - architecture.md
-  - stability-and-observability.md
-  - render-and-frontends.md
+  - ../design/stability-and-observability.md
+  - ../design/render-and-frontends.md
   - ../../spec/design-requirements.yaml
   - ../protocols/versioning-and-evolution.md
   - ../operations/ci-cd-and-release.md
@@ -35,8 +35,8 @@ related:
 > real user flows. Each numbered domain below explains why it matters. The mirror anti-patterns are in
 > [../anti-patterns/anti-patterns.md](../anti-patterns/anti-patterns.md).
 
-> **The requirement list and its status live in [`spec/design-requirements.yaml`](../../spec/design-requirements.yaml)**
-> (상태·목록의 정본은 spec/design-requirements.yaml). Each requirement keeps its original `DR-<CODE>-<n>` id as
+> **The requirement list and its status live in [`spec/design-requirements.yaml`](../../spec/design-requirements.yaml)**.
+> Each requirement keeps its original `DR-<CODE>-<n>` id as
 > `legacy_ids` (registry id `<CODE>-<NNN>`, e.g. `DR-PERSIST-3` → `PERSIST-003`), with priority tier P0–P3
 > (P0 foundational/data-integrity/core-path · P1 major-subsystem correctness · P2 quality · P3
 > long-horizon/polish). The `DR-` prefix is the positive "do" mirror of the same-code anti-pattern "don'ts"
@@ -159,7 +159,8 @@ because that is what users actually run.
 
 ## 18. CI/CD Additions (`OPS` addendum)
 (Base pipeline in [../operations/ci-cd-and-release.md](../operations/ci-cd-and-release.md).)
-Fast impact-scoped CI with periodic full runs and a merge queue. Release artifacts are built once and
+Fast impact-scoped CI with periodic full runs, and main gated on branches that are up to date with it (a
+merge queue where the host offers one; see OPS-001). Release artifacts are built once and
 rollback re-publishes a verified artifact. Reproducibility, soak and fault-injection runs, and quarantined
 tests with an expiry date keep CI honest about the long tail.
 

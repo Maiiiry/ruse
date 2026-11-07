@@ -45,15 +45,16 @@ The full methodology (§3) is written for the whole platform (plugins, remote, r
 what the two-crate v0 ([D-039]) actually has, and — per RFC-0012's rule that perf choices are made *after*
 measurement, never by intuition — fixes **what we measure first** before any optimization lands.
 
-**The per-keystroke cost is O(n) in the buffer today, in four independent places.** Naming them (with code
-homes) so a regression localizes to one, and so the storage question is not confused with the others:
+**Per-keystroke cost has these hot spots** (#876 adds another per-frame buffer copy). Naming them (with code homes) so a regression
+localizes to one, and so the storage question is not confused with the others. The numbers and the wins that
+changed #2, #3 and #4 follow below.
 
-| # | Hot spot | Where | Cost / key |
+| # | Hot spot | Where | Cost |
 | --- | --- | --- | --- |
-| 1 | `EditList::apply_to` builds a fresh `Vec` → `Arc::from` (a second copy), then `rebuild_index` | `crates/core/src/{edit,document}.rs` | O(n) |
-| 2 | **full tree-sitter re-parse every frame** — the `Tree` is not kept | `apps/tui/src/highlight.rs` | O(n) parse + query |
-| 3 | full per-byte color vec + walk from byte 0 (no viewport/scroll exists) | `apps/tui/src/main.rs` `render` | O(n) |
-| 4 | line-start index rebuilt whole | `crates/core/src/document.rs` `rebuild_index` | O(n) |
+| 1 | `EditList::apply_to` builds a fresh `Vec`, then the anchor index is rebuilt | `crates/core/src/{edit,document}.rs` | O(n) per edit |
+| 2 | Tree-sitter parse: incremental against the kept `Tree`, query bounded to the viewport; the `InputEdit` comes from an O(n) byte diff | `apps/tui/src/highlight.rs` | O(n) diff + reparse of the edit + O(viewport) query |
+| 3 | Per-byte color vec, bounded to the viewport | `apps/tui/src/ui/render.rs` | O(viewport) for the colour vec; paint still walks every grapheme above `top` (#840) |
+| 4 | Line-start index, cached per revision | `apps/tui/src/line_index.rs` | O(n) per edit, O(log n) lookup per frame |
 
 **Hypothesis (to confirm with numbers, not assert):** at daily-driver sizes (hundreds–thousands of lines) a
 full buffer copy is tens of µs — negligible — so the *felt* latency is dominated by **#2 (re-parse) and #3
@@ -66,7 +67,7 @@ pure, terminal-free costs whose comparison answers the hypothesis:
 - `crates/core/benches/edit_apply.rs` — a single mid-buffer insert on N = {100, 1k, 10k, 100k} lines (#1).
 - `apps/tui/benches/highlight_parse.rs` — one full `spans()` re-parse on the same N (#2).
 
-`render` (#3) is terminal-coupled; its pure span-flatten cost is folded into a later viewport slice. The
+`render` (#3) is terminal-coupled and has no bench of its own. The
 end-to-end input→render budget (§3.2, target < 16 ms) is the sum a human feels.
 
 **Optimization order (measure-first applies to *tradeoff* choices, not to every step):**
@@ -77,12 +78,12 @@ end-to-end input→render budget (§3.2, target < 16 ms) is the sum a human feel
 3. **(C) incremental tree-sitter** (keep the `Tree`, `tree.edit()` + re-parse) and **(D) incremental line
    index** — real tradeoffs; **gated on the baseline** showing #2/#4 dominate.
 
-**Storage is deferred behind a seam, not chosen now.** `Arc<[u8]>` (flat bytes) stays until a benchmark
+**Storage is deferred behind a seam, not chosen now.** `Arc<Vec<u8>>` (flat bytes) stays until a benchmark
 shows buffer mutation actually dominates (MB files). When it does, the swap goes behind a `TextStorage`
 trait that seals the coordinate model to **byte offsets** (Edit/EditList/anchor/undo/snapshot already speak
 bytes; a rope's char/line coordinates must never leak past the trait). The concrete rope/gap-buffer impl is
-**injected from the frontend** so `editor-core` stays dependency-free (the compiler-enforced IO-free/dep-free
-invariant — `crates/core/Cargo.toml` has no `[dependencies]`); the trait alone lives in core. Rope vs an own
+**injected from the frontend** so `ruse-core` takes no storage crate (its `[dependencies]` are
+`unicode-segmentation`, `unicode-width` and `regex`); the trait alone lives in core. Rope vs an own
 gap buffer (amortized `O(1)` for the cursor-local edits a modal editor makes) is itself a measured choice at
 that point — neither is in the build today.
 
@@ -124,8 +125,8 @@ At daily-driver sizes (≤1k lines) the per-keystroke syntax cost is now well wi
 pinned by `incremental_matches_full_parse_across_edits` (incremental spans must equal a full parse across
 an edit sequence). **Remaining lever:** the `InputEdit` is derived by an O(buffer) byte-diff, which is the
 residual cost at 10k+ lines; threading the actual edit deltas from the core `commit` (INV-TXN) would make
-it O(edit). Injections / folds / indent / multi-language (F-015 #4) are still unbuilt, so F-015 stays
-`planned` — only the parse path (#3) is done.
+it O(edit). Query-driven folds and indents are unbuilt; [spec/PRD.yaml](../../spec/PRD.yaml) F-015 owns the
+remaining scope and status.
 
 #### hlsearch spans cached (F-009) — measured, not assumed
 
@@ -207,9 +208,9 @@ the **on-disk format** each kind takes, so a fixture author has one shape to fol
 
 | Kind | ci-cd layer | Lives in | Format |
 | --- | --- | --- | --- |
-| Unit | L1 | `tests/unit/`, in-crate `#[test]` | Rust test functions; table-driven where inputs enumerate |
-| Property | L2 | `tests/property/` | `proptest`/`quickcheck` generators + shrink; invariants below |
-| Differential parity | L3 | `tests/parity/<profile>/*.yaml` | Declarative YAML fixture (§1.3), optional stock-editor oracle |
+| Unit | L1 | in-crate `#[test]`, `crates/core/tests/`, `apps/tui/tests/` | Rust test functions; table-driven where inputs enumerate |
+| Property | L2 | `crates/core/tests/properties.rs` | `proptest` generators + shrink; invariants below |
+| Differential parity | L3 | `tests/parity/<profile>/fixtures/corpus.yaml` | Declarative YAML fixture (§1.3), optional stock-editor oracle |
 | Plugin-compat | L3 | `tests/plugin-compat/<api>-<fixture>/` | WASM built with a **previous** SDK + expectation manifest |
 | Protocol fixtures | L3 | `tests/protocol-fixtures/<version>/`, `.../malformed/` | Versioned golden payloads + malformed/unknown-variant cases |
 | Platform matrix | L4 | `tests/terminal-matrix/`, `tests/remote-scenarios/` | Scenario scripts run under each PTY/host driver |
@@ -233,9 +234,10 @@ counterexample. The four load-bearing invariants (from [ci-cd-and-release.md §2
 guarding [anti-patterns](../anti-patterns/anti-patterns.md) TEST-5/6/7):
 
 - **Undo round-trip** — for any edit sequence, `apply` then `undo` restores the exact prior document
-  (bytes + revision relationship). Anchors valid before are valid after. (`tests/property/undo-roundtrip`.)
+  (bytes + revision relationship). Anchors valid before are valid after. (`crates/core/tests/properties.rs`.)
 - **Anchor-transform invariants** — for any edit and any anchor set, transformed anchors respect affinity
-  and never point outside the document; cost is not O(anchors × edits). (`tests/property/anchor-stability`.)
+  and never point outside the document; cost is not O(anchors × edits). (`crates/core/tests/properties.rs`,
+  `crates/core/src/anchor.rs`.)
 - **Transaction atomicity** — a transaction applies fully or not at all; a failed transaction leaves no
   partial mutation and does not advance the revision (guards CMD-16, upholds INV-TXN).
 - **Serialization round-trip** — `decode(encode(x)) == x` for every serializable contract (document,
@@ -246,7 +248,7 @@ Each failing case **must be reduced to a saved deterministic fixture** (§1.10),
 #### v0 status — SHIPPED (`crates/core/tests/properties.rs`)
 
 The property layer is **live** for the v0 semantic core (the first mechanized test-quality layer beyond
-example tests). Seven invariants run under `proptest` (dev-dependency only; the core crate stays dep-free):
+example tests). Seven invariants run under `proptest` (a dev-dependency, not linked into the core crate):
 
 - **UTF-8 / cursor-boundary safety** — no command sequence, from any buffer, ever produces invalid UTF-8 or
   leaves the cursor off a char boundary / out of bounds. (The headline totality property.)
@@ -272,9 +274,53 @@ test had missed:
    `inverse` now merges same-position inverse edits and `from_sorted` allows touching (matching `new`);
    `new` also drops no-op edits so they can't seed the collision.
 
-Deferred (still target-state above): anchor **affinity/span-delete** semantics as properties (bias direction,
-`Invalidate` flag correctness — only in-bounds totality is covered now), the O(A+E) cost bound as a
-performance property, and the differential-parity / fault-injection / replay-corpus / fuzzing layers.
+**Reference models, the invariant walker, the deep tier and fuzzing (#906, #909, #920).**
+
+- **Invariant walker.** `Workspace::assert_invariants` (with `EditorState`, `Document`, `View`, `UndoHistory`
+  and `AnchorStore` parts) checks the whole editor state and panics on the first broken rule: the undo
+  tree's structure, the anchor store's order and bounds, the saved state and a frozen snapshot index, every
+  view position inside the text on a char boundary, window, view and buffer-list consistency, and no
+  positions left pinned. The command-sequence property, `session_fuzz` (after every key) and the fuzz
+  targets call it, so every random test checks the whole state, not only the buffer.
+- **Reference model** (`crates/core/tests/reference_model.rs`). A naive cell model (bytes and anchors in one
+  list) runs next to `Document` through random transactions, undo, redo, saves, anchor creation and removal
+  and snapshots, and must agree on the bytes, each anchor's offset and `invalidated` flag (bias and
+  span-delete policy, touching edits applied left to right, #758), and the modified flag at the save point.
+  A second model keeps the text as lines and each mark as `(line, column)` and applies whole-line inserts
+  and deletes (both `dd` forms), `o` and in-line edits, undo and redo by what they mean to lines (#906): the
+  document's line anchors, plain `Tracked` positions and the restorable ones (`uh_namedm` swap) must agree
+  with it for `Drop`, `Keep` and `Cursor`.
+- **Registers** (`apps/tui/tests/register_model.rs`). Random yanks, deletes, puts, motions and undos through
+  the headless key path against a shadow model of `:help registers` (`"0`, the `"1`-`"9` ring, `"-`, named
+  and appended registers, `"_`). The model was checked against nvim v0.12.6 on 300 random sessions.
+- **Keymaps** (`apps/tui/src/input/keymap_check.rs`). The static conflict check of ENG-PROFILE-001
+  (#1130): no key is bound twice in one table and no prefix is hidden behind a plain binding, over the
+  Vim namespace layers, the Emacs tiers and `C-x` map, and the Native leader menu.
+- **Shadow consumers.** The line index refreshed by `(buffer, revision)` equals the `pos` scan after any
+  edit/undo/redo run (`line_index.rs`). Manual folds follow edits by line anchors (#819): a fold model
+  property (`session_fuzz.rs`) marks the lines in a fold through random `dd`/`o`/`O`/`p`/`P`/`J` and the
+  fold must span the marked lines, and the walker checks every fold set (in range, manual flat, indent
+  nested) and every fold anchor (`Headless::assert_invariants`).
+- **Unicode.** The cursor rests on an extended grapheme cluster boundary after any motion and after `x`,
+  `<BS>`, typing and undo over wide, combining, ZWJ, flag and jamo text (`properties.rs`); `session_fuzz`
+  types and starts from the same pieces. It found `e`/`E`/`de`, `t`/`T`, `g_`, `<BS>` and the phantom-line
+  clamp stepping by code point (fixed with oracle fixtures, #909). The UCD's `GraphemeBreakTest-17.0.0.txt`
+  (`tests/unicode/`) runs through the position conversions, `l`/`h`/`$`, `x`, the word motions and `f`/`t`
+  (`grapheme_conformance.rs`) and through the painter and caret column (`render.rs`); it found `f` landing
+  on a combining mark inside a cluster (#909).
+- **File round trip.** `apps/tui/tests/file_roundtrip.rs` opens and writes back, through the real binary,
+  every file in `apps/tui/tests/fixtures/files/` (line-ending mixes, BOMs, no final newline, lone CR, NUL,
+  invalid UTF-8, UTF-16, Latin-1, a long line); `persist/encoding.rs` holds the pure property.
+- **Deep tier.** Every proptest takes its case count from `cases(n)` / `test_cases(n)`, scaled by
+  `RUSE_PROPTEST_SCALE`. PRs run the base counts; the weekly `fuzz.yml` runs the suite at 16x and uploads
+  any new regression line.
+- **Coverage-guided fuzzing.** `fuzz/` is a separate cargo-fuzz workspace (excluded from the root build,
+  `DEP-LIBFUZZER`) with targets for keystroke sessions, document operations, key decoding, trace parsing,
+  journal replay, the terminal grid and the LSP framing; `fuzz.yml` runs each for 15 minutes weekly on
+  nightly. A crash input is reduced and committed as a regression test or proptest seed.
+
+Still deferred: the O(A+E) cost bound as a performance property, and the fault-injection and
+replay-corpus layers.
 
 ### 1.3 Differential parity — `tests/parity/<profile>/*.yaml`
 
@@ -338,20 +384,56 @@ The Neovim half is live and is the primary way the Vim input engine is now built
 generalize to any oracle:
 
 - **Oracle = pinned binary, black-box.** `tools/parity/oracle.py` runs the pinned `nvim` (`--headless -u NONE
-  -i NONE`); the local `nvim` must equal the census pin (v0.12.4) and its version is recorded in every run.
+  -i NONE`); the local `nvim` must equal the census pin (`version_label` in
+  [spec/parity/upstreams.yaml](../../spec/parity/upstreams.yaml)) and its version is recorded in every run.
   **Non-corruption is the load-bearing property** (three prior harnesses corrupted their own first
-  observation): feed keys with `nvim_feedkeys(...,'x')` then read state via the API AFTER — never through a
-  call that itself mutates. `oracle.py --selftest` (identity + determinism + hand-verified known ops) GATES
+  observation): feed keys with `nvim_feedkeys(...,'xt')` then read state via the API AFTER — never through a
+  call that itself mutates. The `t` feeds the keys **as typed** (#901): untyped keys are flushed after a
+  failed command, never reach a `q` recording, and an untyped `<Esc>` runs a command line instead of
+  abandoning it, so an untyped oracle records behaviour no user sees. `oracle.py --selftest` (identity + determinism + hand-verified known ops) GATES
   the corpus; `gov parity_oracle` runs it when a pinned nvim is present and otherwise verifies corpus
-  integrity only (nvim-optional, so CI without nvim stays green).
+  integrity only (nvim-optional, so CI without nvim stays green). The weekly `oracle.yml` workflow (#904)
+  closes that gap. It installs the nvim and Emacs pinned in `spec/parity/upstreams.yaml` (release URL and
+  sha256), runs both selftests, recaptures both corpora and fails on any difference from the committed
+  ones. It is not a required check.
 - **Every `expect` is ORACLE-CAPTURED, never hand-written.** For v0 the corpus uses a compact JSON-in-YAML
   form (`{name, lines, keys, expect:{text,cursor,registers…}}`) rather than the full schema above.
 - **Config-dependent ops** (indent `>>`, etc.) carry a per-fixture `setup` ex-command so nvim runs under
   ruse's defaults (e.g. `set shiftwidth=4 expandtab`) — cross-default comparison is invalid; match config or
   the fixture lies.
-- **A divergence is a FINDING, not a test failure.** `apps/tui/tests/parity_compare.rs` replays each fixture
-  through ruse and reports verified-vs-divergent; it stays green so ruse can be early. Divergences are the
-  work-list.
+- **Errors are observed as numbers, not text (#901).** Each fixture's `expect` carries `emsg`, the E-number
+  of the last error message the keys raised (`v:errmsg`, cleared first; `""` for none), and `failed`, whether
+  any command failed, an error or a Normal-mode beep (seen in a second process as Vim flushing untyped keys
+  queued after the failure; best effort, a failure inside a macro replay is missed). `emsg` is compared
+  against the E-number of the last error ruse put on the status line (`Headless::emsg`); `failed` is
+  captured only, since ruse has no bell. Error fixtures assert the state after the failure too, usually by
+  typing a key after it.
+- **Mode, marks, registers, the Visual area and undo (#900).** Every fixture records `mode`
+  (`nvim_get_mode()`); `nvim_feedkeys(.., 'x')` ends Insert mode and drops an armed operator once the keys run
+  out, so what it tells apart is Normal, Visual, Select and the command line. Four more are recorded only
+  where a fixture observes them, by its `observe` list or by its group (`OBSERVE_GROUPS` in `oracle.py`), so
+  the corpus stays reviewable:
+  - `marks`: a-z, `<`, `>`, `[`, `]`, `.`, `^` as `[line, col0]`, with `visualmode()`. Column -1 is MAXCOL, a
+    linewise end whose column is not compared. The `'.` that `nvim_buf_set_lines` sets is dropped when the
+    keys changed nothing.
+  - `regs`: `"1`-`"9` and `"-`.
+  - `visual`: in Visual mode, the kind and the fixed end (`getpos('v')`).
+  - `undo`: the text after each `:undo` back to where the keys started. Only fixtures under `UNDO_SETUP`
+    record it; its undo break makes the walk stop there. ruse walks `Command::Undo` the same way.
+
+  The existing fields regenerate byte-identically; only the new ones are added.
+- **Coverage by scenario class.** `python3 tools/parity/scenario_classes.py` tags each fixture with the
+  classes its keys touch (motion, operator x motion, text object, Visual, Insert, Ex, register, macro, undo,
+  marks, search, counts, error, multibyte, edge buffers, dot-repeat, config) and names the thin ones;
+  `--list CLASS` prints a class's fixtures. The tagging reads the keys heuristically; it does not run them.
+- **A divergence is allowed only when it is listed (#883).** `apps/tui/tests/parity_compare.rs` types each
+  fixture's keys into the headless session (the real key path, #895), `emacs_parity_compare.rs` resolves
+  each command by name and also types its default binding (ratcheted separately in
+  `tests/parity/emacs/known-key-divergences.txt`); each reports verified-vs-divergent, then
+  checks the run against the committed `tests/parity/<editor>/known-divergences.txt`. It FAILS on a
+  divergent fixture that is not listed (a regression, or a new fixture ruse does not match yet) and on a
+  listed fixture that now verifies (delete the line), so the list only shrinks. The list is the work-list;
+  adding to it is a reviewed change with a reason, never a way to silence a regression.
 
 **Fixture taxonomy — ATOMIC then COMPOSITE (do both):**
 
@@ -471,19 +553,26 @@ Two layers now drive the whole vertical, not just in-library units:
   malformed trace, and a base-hash mismatch that must be *rejected*, not misapplied). This is the only
   test that exercises the finished binary as a process.
 - **`apps/tui/tests/lang_arg_e2e.rs`** drives the **real input engine + core together** exactly as
-  `main.rs::run` composes them (keystroke → Lang-Arg translate → `Feed` → `Command` → edit), covering the
+  `app/session.rs::run` composes them (keystroke → Lang-Arg translate → `Feed` → `Command` → edit), covering the
   F-027 vertical the inline `feed` unit tests cannot reach (translated edits on a real document,
   dot-repeat replaying the translated char, and the adversarial "and to nothing else" boundary at the
   document level).
+- **`ruse_tui::headless::Headless`** (#895) is a terminal-free session over the binary's real key path: it
+  owns the same `Session` `app/session.rs::run` drives and feeds keys through `Session::on_key` (macro layer,
+  session prefixes and chords, pickers, `H`/`M`/`L`, the input engine, the Ex dispatch), running the per-frame
+  work (`pre_frame`, `post_render`) before every key, macro-replayed keys included. Keys are Vim notation,
+  decoded as crossterm decodes a legacy terminal (`<C-\>` is `CTRL-4`, uppercase carries `SHIFT`). Tests read
+  the buffer, cursor, mode, mark, registers and status message. `apps/tui/tests/session_intercepts.rs`
+  repeats the `pty_intercepts.rs` cases through it in microseconds; the PTY file stays as the check that the
+  binary wires the same path.
 - **`apps/tui/tests/session_fuzz.rs`** is the **full-stack keystroke fuzzer**: random Vim keystroke
-  sessions (up to 140 keys) driven through the real engine with the mode following the REAL editor state,
-  applied to the core. It asserts the load-bearing kernel invariants after EVERY key (valid UTF-8, cursor
+  sessions (up to 140 keys) driven through the headless session, so every key takes the real key path. It asserts the load-bearing kernel invariants after EVERY key (valid UTF-8, cursor
   on a char boundary) and that a full undo of any session restores the initial buffer; a separate
   monotonic-alphabet variant (no in-session `u`/CTRL-R) asserts the full undo↔redo round trip. This is the
   first test to fuzz the COMPOSED stack over long sessions — where mode × operator × register × dot ×
   undo-grouping interactions live. (It already surfaced one finding — see below.)
-- **`apps/tui/tests/scenarios.rs`** is a curated set of realistic multi-step sessions with exact
-  end-states — dot-repeat × count, named-register yank/paste, visual + operator, search → change → `n` →
+- **`apps/tui/tests/scenarios.rs`** is a curated set of realistic multi-step sessions, typed through the
+  headless session (no hand mirror of `session.rs`), with exact end-states — dot-repeat × count, named-register yank/paste, visual + operator, search → change → `n` →
   `.`, substitute + undo grouping, blockwise-insert replication + undo, and multi-window buffer sharing —
   each a readable regression guard for a known-tricky cross-feature interaction. All pass, i.e. the
   compound behaviours match Vim, not just the single ops the oracle corpus covers.
@@ -493,15 +582,25 @@ dropped to **Normal** mode instead of returning to Insert — the undo/redo comm
 `mode: Mode::Normal`, clobbering the KL-OBL-5 one-shot resume. Fixed by making undo/redo PRESERVE Insert
 (they restore document state, not mode; the engine only reaches them from Normal or from Insert via
 `i_CTRL-O`, so preserving Insert is correct and Normal is unchanged). Regression tests:
-`crates/core/src/editor.rs` `undo_via_insert_one_shot_returns_to_insert` + `undo_from_normal_stays_in_normal`.
+`crates/core/src/editor/` `undo_via_insert_one_shot_returns_to_insert` + `undo_from_normal_stays_in_normal`.
 This is the loop working as intended — the fuzzer found a real parity edge and it was closed.
 
-**Honest gap (still MANUAL):** the *live-terminal* path — the raw-key event loop, raw-mode, and the render
-diff painting to an actual tty — has **no automated coverage**. `--replay` bypasses the input engine
-(it replays `Command`s), and the e2e test drives the engine below the terminal, so the crossterm read
-loop + screen flush in `main.rs::run` is verified only by hand. A PTY-driven harness (§1.7 TUI golden)
-is the eventual home for it; it is deliberately not built yet (a flaky screen-scraping harness would cost
-more than the thin glue it covers). Recorded here so the boundary is visible, not assumed.
+**PTY layer (#896):** the *live-terminal* path runs the real binary on a pseudo-terminal
+(`apps/tui/tests/support/mod.rs`: scratch `HOME`, explicit environment, bounded waits). It asserts on disk
+contents, exit status and terminal teardown, not on screen scraping:
+
+- **`apps/tui/tests/pty_e2e.rs`** — edit/save/quit, failed writes, recovery prompts, signals.
+- **`apps/tui/tests/pty_intercepts.rs`** — the session's key intercepts end to end (the same cases run
+  headless in `session_intercepts.rs`).
+- **`apps/tui/tests/pty_input.rs`** — raw input decoding: escape sequences and UTF-8 split across reads,
+  ESC-as-Alt (Vim: `<M-x>` = `<Esc>x`; Emacs: ESC is the meta prefix), kitty keyboard keys and release events,
+  and bracketed paste chunked at the start/stop codes, a 64-byte boundary, CRLF and a 24 KiB burst.
+- **`apps/tui/tests/cli_startup.rs`** — `--help`, `--version`, usage errors (exit 2), `--`, and the
+  one-line refusal without a terminal on stdin or stdout (exit 1).
+
+The TERM/COLORTERM capability matrix is a pure unit test of the detection order
+(`terminal/capabilities.rs`, env passed as a function). CI also `cargo install`s the binary and runs
+`--version` from the install prefix. Still manual: the rendered screen itself (§1.7 TUI golden).
 
 ### 1.10 Deterministic replay — `tests/replay/`
 
@@ -528,8 +627,10 @@ the failure mode this contract exists to forbid. Fuzz-counterexample-as-fixture 
 
 ## 2. `tests/` directory layout & traceability
 
-`tests/` does not exist yet (the tree below is the target); `trace.verify` in `spec/PRD.yaml` already points
-into it, so the paths are a contract before the files exist.
+`tests/` holds only `tests/parity/{vim,emacs}/fixtures/corpus.yaml` today; other tests live next to the code
+(table above). The tree below is the target layout. A `planned` feature's `trace.verify` in `spec/PRD.yaml`
+may point into it; a `status: done` feature's `trace.verify` names the real test files that prove it (crate
+tests, inline test modules, the parity corpus), and `spec-validate` fails when one does not resolve (#886).
 
 ```
 tests/
@@ -537,9 +638,9 @@ tests/
 ├── property/             L2 — proptest invariants (§1.2)
 ├── integration/          L3/L4 — cross-component scenarios
 ├── parity/               L3 — differential fixtures
-│   ├── vim/              operator-motion.yaml, text-objects.yaml, registers.yaml, undo-tree.yaml,
-│   │                     search-substitute.yaml, ...
-│   ├── emacs/            kill-ring.yaml, prefix-keys.yaml, universal-arg.yaml
+│   ├── vim/              fixtures/corpus.yaml (live); operator-motion.yaml, text-objects.yaml, registers.yaml,
+│   │                     undo-tree.yaml, search-substitute.yaml, ... (trace.verify targets)
+│   ├── emacs/            fixtures/corpus.yaml (live); kill-ring.yaml, prefix-keys.yaml, universal-arg.yaml (targets)
 │   ├── native/           modal-text.yaml, leader-discovery.yaml
 │   └── expected/         oracle-captured / shared expectations
 ├── plugin-compat/        L3 — old-SDK WASM fixtures (§1.4)
@@ -557,36 +658,48 @@ tests/
 The chain is `F-* → trace.parity (parity IDs) → trace.design (design doc) → trace.verify (fixtures here)`
 ([development-model.md](development-model.md) "traceability chain"; enforced by `spec-validate`'s DoD rule —
 every `stage: mvp` / `priority: must` feature must resolve `trace.design` and carry non-empty `acceptance`).
-Below, each feature's `trace.verify` paths and the dominant test *kind* that is its evidence. **A feature is
-not Proven until these fixtures exist and pass** (§5).
+Each feature's `trace.verify` paths and stage live in [spec/PRD.yaml](../../spec/PRD.yaml). Below is the dominant
+test *kind* that is its evidence. **A feature is not Proven until these fixtures exist and pass** (§5).
 
-| Feature | Stage/Prio | `trace.verify` → | Evidence kind |
-| --- | --- | --- | --- |
-| F-001 Transactional editing | mvp/must | `property/undo-roundtrip`, `unit/transaction-revision` | Property + Unit |
-| F-002 Document & coordinate model | mvp/must | `property/anchor-stability`, `unit/coordinate-widths` | Property + Unit |
-| F-003 Vim input profile | mvp/must | `parity/vim/{operator-motion,text-objects,registers}.yaml` | Differential parity |
-| F-004 Semantic command engine + palette | mvp/must | `unit/command-registry`, `integration/palette-context` | Unit + Integration |
-| F-005 Undo/redo grouping | mvp/must | `parity/vim/undo-tree.yaml`, `unit/undo-grouping` | Parity + Unit |
-| F-006 TUI rendering (ANSI/Unicode) | mvp/must | `unit/render-diff`, `integration/render-profile-pin` | Unit + TUI golden |
-| F-007 Buffers/views/windows/splits | mvp/must | `integration/split-independent-cursors`, `unit/view-local-state` | Integration + Unit |
-| F-008 File open/save/crash recovery | mvp/must | `fault-injection/truncated-journal`, `unit/save-atomic` | Fault-injection + Unit |
-| F-009 Search & substitute | mvp/should | `parity/vim/search-substitute.yaml` | Differential parity |
-| F-010 Terminal capability detection | mvp/must | `unit/capability-ledger`, `integration/da1-probe` | Unit + Platform |
-| F-011 PTY-backed terminal buffer | post-mvp/should | `integration/{pty-unix,conpty-windows}` | Platform matrix |
-| F-012 Emacs input profile | post-mvp/should | `parity/emacs/{kill-ring,prefix-keys,universal-arg}.yaml` | Differential parity |
-| F-013 Native input profile | post-mvp/could | `parity/native/{modal-text,leader-discovery}.yaml` | Differential parity (explicit expected) |
-| F-014 Built-in LSP (local+remote) | post-mvp/should | `integration/lsp-remote`, `unit/language-service-model` | Integration |
-| F-015 Tree-sitter highlighting | post-mvp/should | `integration/treesitter-highlight`, `property/incremental-reparse` | Integration + Property |
-| F-016 Plugin protocol + host | post-mvp/must | `integration/plugin-panic-isolation`, `integration/plugin-sdk-conformance` | Integration + Plugin-compat |
-| F-017 Remote client/runtime (SSH) | post-mvp/should | `remote-scenarios/{first-connect-bootstrap,reconnect-resume}` | Remote scenarios (fault-injection) |
-| F-018 Debugger (DAP + location) | future/could | `debug/{dap-backend,location-model}` | Integration |
-| F-019 GUI frontend | future/could | `integration/gui-render-parity`, `unit/render-ir-shared` | TUI/render golden (cross-frontend) |
-| F-020 Extension marketplace | future/could | `integration/{lockfile-reproducible,compat-ci-old-sdk}` | Plugin-compat + reproducibility |
-| F-021 AI agent integration | future/could | `integration/ai-proposal-review`, `unit/execute-vs-propose` | Integration (preflight) |
+| Feature | Evidence kind |
+| --- | --- |
+| F-001 Transactional editing | Property + Unit |
+| F-002 Document & coordinate model | Property + Unit |
+| F-003 Keymap layer router + Vim profile | Differential parity |
+| F-004 Semantic command engine + palette | Unit + Integration |
+| F-005 Undo/redo grouping | Parity + Unit |
+| F-006 TUI rendering (ANSI/Unicode) | Unit + TUI golden |
+| F-007 Buffers/views/windows/splits | Integration + Unit |
+| F-008 File open/save/crash recovery | Fault-injection + Unit |
+| F-009 Search & substitute | Differential parity |
+| F-010 Terminal capability detection | Unit + Platform |
+| F-011 PTY-backed terminal buffer | Platform matrix |
+| F-012 Emacs input profile | Differential parity |
+| F-013 Native input profile | Differential parity (explicit expected) |
+| F-014 Built-in LSP (local+remote) | Integration |
+| F-015 Tree-sitter highlighting | Integration + Property |
+| F-016 Plugin protocol + host | Integration + Plugin-compat |
+| F-017 Remote client/runtime (SSH) | Remote scenarios (fault-injection) |
+| F-018 GUI frontend | TUI/render golden (cross-frontend) |
+| F-019 Extension marketplace | Plugin-compat + reproducibility |
+| F-020 AI agent integration | Integration (preflight) |
+| F-021 Debugger (DAP + location) | Integration |
+| F-022 Command traces & deterministic replay | Unit + Property |
+| F-023 Operators, motions & dot-repeat | Differential parity |
+| F-024 Insert namespace | Differential parity |
+| F-025 Visual + Select namespaces | Differential parity |
+| F-026 Command-line namespace | Differential parity |
+| F-027 Lang-Arg namespace | Differential parity |
+| F-028 Text objects | Differential parity |
+| F-029 Registers / kill-ring | Differential parity |
+| F-030 Runtime health check | Unit |
+| F-031 Rich in-buffer rendering | Property + Unit |
+| F-032 Multi-buffer arena | Unit + Property |
 
-> `spec-validate` should grow to check that each `trace.verify` path **resolves to a real fixture** once
-> `tests/` exists (today it checks `trace.design` resolves). That closes the loop: a `must` feature with a
-> dangling `verify` path fails CI — the machine-checkable form of "no evidence, not Proven."
+> `spec-validate` checks that every `trace.verify` and `trace.contract` path of a `status: done` feature
+> **resolves to a real file**, and that a done feature's `trace.verify` is not empty (#886). A done feature
+> with a dangling `verify` path fails CI — the machine-checkable form of "no evidence, not Proven." Paths of
+> `planned` features name where the proof will live and are not checked.
 
 ---
 
@@ -671,6 +784,10 @@ transformation pipeline stays dumpable (§3.2).
   ([stability-and-observability.md §2.1,§11.1](../design/stability-and-observability.md)).
 - **Quarantine carries an expiry + owner** ([ci-cd-and-release.md §13](ci-cd-and-release.md)); a muted test
   is a tracked debt, not a silent skip.
+- **Integer overflow is a bug in every profile.** Release builds wrap silently (no `overflow-checks`), so
+  arithmetic on user-sized inputs (counts, columns, offsets) saturates or checks explicitly rather than
+  relying on the debug-only panic; the suite also runs under `--release` on `main`/weekly (`rust-release`,
+  [ci-cd-and-release.md §1](ci-cd-and-release.md), #899).
 - **Golden/protocol payloads are frozen once published** — a changed byte is a signal, reviewed as a
   breaking change, not silently re-recorded.
 
@@ -713,11 +830,11 @@ behavior always keeps an explicit `expected` (guards SPEC-6, PAR-6).
 
 ## Open questions
 
-1. **Oracle pinning & availability.** Which exact `vim`/`nvim`/`emacs` versions are the oracle, how are they
-   pinned in CI, and how do we handle oracle behavior that is itself a bug we intentionally diverge from?
+1. **Oracle availability.** Versions are pinned in [spec/parity/upstreams.yaml](../../spec/parity/upstreams.yaml).
+   How are the oracles provided in CI, and how do we handle oracle behavior that is itself a bug we intentionally diverge from?
    (A per-fixture `oracle.compare` allowlist is the current escape hatch — is that enough?)
-2. **`spec-validate` `trace.verify` resolution.** When `tests/` lands, should `spec-validate` hard-fail on a
-   dangling `verify` path for `mvp`/`must` features, and warn for others — or gate all? (§2.)
+2. **`spec-validate` `trace.verify` resolution.** Decided (#886): it hard-fails a dangling `verify` or
+   `contract` path of any `status: done` feature, whatever its stage; `planned` paths are not checked. (§2.)
 3. **Golden snapshot format & churn.** Cell-grid text vs a structured (grapheme,width,style) record — which
    minimizes noisy diffs while still catching width/combining bugs? How are intentional golden updates
    reviewed so they aren't rubber-stamped (guards TERMOUT-2)?

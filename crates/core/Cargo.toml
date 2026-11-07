@@ -34,5 +34,21 @@ name = "edit_apply"
 harness = false
 
 [[bench]]
+name = "anchor_apply"
+harness = false
+
+[[bench]]
 name = "line_math"
+harness = false
+
+[[bench]]
+name = "long_line"
+harness = false
+
+[[bench]]
+name = "long_line_motions"
+harness = false
+
+[[bench]]
+name = "word_search"
 harness = false

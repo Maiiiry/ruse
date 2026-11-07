@@ -48,6 +48,7 @@ fn modern_terminal_confirms_everything() {
     stream.extend(decrqm(1006, 1)); // SGR mouse: set
     stream.extend(decrqm(2026, 2)); // synchronized output: reset — but RECOGNISED = supported
     stream.extend(decrqm(2048, 1)); // resize events: set
+    stream.extend(decrqm(1004, 2)); // focus reports: reset, recognised (#1220)
     stream.extend_from_slice(KITTY_REPLY);
     stream.extend_from_slice(DA1);
 
@@ -57,6 +58,7 @@ fn modern_terminal_confirms_everything() {
     assert!(ledger.enabled(Capability::SgrMouse));
     assert!(ledger.enabled(Capability::SynchronizedOutput)); // recognised, even though currently off
     assert!(ledger.enabled(Capability::ResizeEvents));
+    assert!(ledger.enabled(Capability::FocusEvents));
     assert_eq!(ledger.key_encoding(), KeyEncoding::Kitty);
     assert_eq!(
         ledger.get(Capability::SgrMouse).unwrap().source,
@@ -101,15 +103,37 @@ fn reply_split_across_reads_is_reassembled() {
 }
 
 #[test]
-fn stray_input_before_fence_is_ignored() {
-    // A keystroke ('j') arriving amid the replies is not a known CSI reply and must be skipped
-    // without derailing the parse or the fence.
+fn stray_input_before_fence_is_kept_as_typed_input() {
+    // A keystroke ('j') arriving amid the replies is not a known CSI reply: it must not derail the parse
+    // or the fence, and it is kept for the event loop rather than dropped (#1013).
     let mut stream = decrqm(2004, 1);
     stream.push(b'j');
     stream.extend_from_slice(DA1);
-    let (ledger, parser) = drive(&[&stream]);
+    let (ledger, mut parser) = drive(&[&stream]);
     assert!(parser.is_fenced());
     assert!(ledger.enabled(Capability::BracketedPaste));
+    assert_eq!(parser.take_typed(), b"j");
+}
+
+#[test]
+fn typed_keys_around_the_replies_survive_in_order() {
+    // Text before the batch, an arrow key (a CSI that is no reply) and an Alt chord between replies, a
+    // reply split across reads, keys after the fence in the same read, and a lone Esc at the end.
+    let mut first = b"ab".to_vec();
+    first.extend_from_slice(&decrqm(2004, 1));
+    first.extend_from_slice(b"\x1b[A\x1bx");
+    first.extend_from_slice(&decrqm(1006, 0)[..4]);
+    let mut second = decrqm(1006, 0)[4..].to_vec();
+    second.extend_from_slice(b"\x1b[?1u");
+    second.extend_from_slice(DA1);
+    second.extend_from_slice("c한\x1b".as_bytes());
+    let (ledger, mut parser) = drive(&[&first, &second]);
+    assert!(parser.is_fenced());
+    assert!(ledger.enabled(Capability::BracketedPaste));
+    assert!(!ledger.enabled(Capability::SgrMouse));
+    assert_eq!(ledger.key_encoding(), KeyEncoding::Kitty);
+    assert_eq!(parser.take_typed(), "ab\x1b[A\x1bxc한\x1b".as_bytes());
+    assert!(parser.take_typed().is_empty(), "taken once");
 }
 
 #[test]

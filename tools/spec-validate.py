@@ -6,9 +6,11 @@ Runs from the repo root. Enforces the doc-system discipline (one fact one home r
   1. YAML parses; PRD/POLICY enums are within their closed sets; no duplicate F-/C-/ENG- IDs.
   2. PRD component `depends_on` resolve AND respect build_stage order (D-036)
      (kernel < input < tui < workspace < plugin < remote — a component may not depend on a later stage).
-  3. PRD feature `depends_on` resolve to a component or feature.
+  3. PRD feature `depends_on` resolve to a component or feature; a `status: done` feature's trace.verify /
+     trace.contract paths exist (#886).
   4. POLICY `invariants:` resolve to the INV-* registry (docs/invariants/reference-invariants.md).
-  5. POLICY `antipattern.refs` resolve to a real anti-pattern catalog ID (docs/anti-patterns).
+  5. POLICY `antipattern.refs` resolve to a real anti-pattern catalog ID (docs/anti-patterns), and each
+     `evidence_tests` entry names a cited evidence and an existing test file.
   6. context-profiles `include` resolve to a known ID (F/C/ENG/ARCH/D/INV) or an existing file.
   7. Every Markdown relative link under spec/ and docs/ resolves.
 
@@ -125,6 +127,12 @@ for pid,pr in (pol.get("principles") or {}).items():
     ap = (pr.get("antipattern") or {}).get("refs",[]) or []
     for r in ap:
         if not ap_ok(r): err(f"POLICY {pid}: antipattern ref -> unknown {r}")
+# An `evidence_tests` entry names the test that provides a live evidence name: the name must be one some
+# principle cites, and the test file must exist.
+_cited = {e for pr in (pol.get("principles") or {}).values() for e in ((pr.get("practice") or {}).get("evidence") or [])}
+for ev, path in (pol.get("evidence_tests") or {}).items():
+    if ev not in _cited: err(f"POLICY evidence_tests: {ev} is not cited by any principle's evidence")
+    if not os.path.exists(path): err(f"POLICY evidence_tests: {ev} -> {path} does not exist")
 
 # ---------- 5b. capabilities.yaml + dependencies.yaml ----------
 CAP_ENUMS = {
@@ -159,11 +167,19 @@ for cid,c in (prd.get("components") or {}).items():
         target = os.path.normpath(os.path.join("spec", r.split("#")[0]))
         if not os.path.exists(target): err(f"PRD {cid}: ref does not resolve -> {r}")
 
-# ---------- 5d. feature `trace.design` file paths resolve (verify=aspirational, not checked) ----------
+# ---------- 5d. feature `trace.design` file paths resolve (trace.verify: see 5d' for done features) ----------
 for fid,f in (prd.get("features") or {}).items():
     for d in ((f.get("trace") or {}).get("design") or []):
         target = os.path.normpath(os.path.join("spec", d.split("#")[0]))
         if not os.path.exists(target): err(f"PRD {fid}: trace.design does not resolve -> {d}")
+
+# ---------- 5d'. a done feature's proof chain exists (#886) ----------
+# trace.verify / trace.contract of a `planned` feature name where the proof WILL live; for `status: done`
+# they are the proof of finished work, so every path must resolve and trace.verify must not be empty.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rusekit.spec_trace import done_trace_errors  # noqa: E402
+for m in done_trace_errors(prd.get("features") or {}, "spec"):
+    err(m)
 
 # ---------- 5e. Definition-of-Done readiness gate (development-model.md) ----------
 # Every mvp / must feature must be product-ready-traced: a resolving trace.design + non-empty acceptance.

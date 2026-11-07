@@ -25,6 +25,30 @@ mod tests {
         assert_eq!(feed("l"), Feed::Cmd(Command::Move(1, Motion::Right)));
     }
 
+    /// #899: a long count used to overflow `u32` (`saturating_mul(10) + d`, and `op * motion`) — a panic
+    /// in debug, a silent wrap in release. Counts now clamp at Neovim's 999999999, which is what
+    /// `nvim --clean` reports as `v:count` for both `99999999999Q` and `99999y99999Q` (v0.12.6).
+    #[test]
+    fn huge_counts_clamp_to_the_neovim_ceiling() {
+        assert_eq!(
+            feed("99999999999w"),
+            Feed::Cmd(Command::Move(MAX_COUNT, Motion::WordFwd))
+        );
+        assert_eq!(
+            feed("4294967299w"),
+            Feed::Cmd(Command::Move(MAX_COUNT, Motion::WordFwd))
+        );
+        assert_eq!(
+            feed("99999d99999w"),
+            Feed::Cmd(Command::Delete(MAX_COUNT, Motion::WordFwd))
+        );
+        // A `0` digit at the ceiling (the `count > 0` arm) also stays clamped.
+        assert_eq!(
+            feed("9999999990w"),
+            Feed::Cmd(Command::Move(MAX_COUNT, Motion::WordFwd))
+        );
+    }
+
     #[test]
     fn substitute_char_s_is_change_right() {
         // `s` = `cl`: change one char rightward; `3s` changes three. `cl` produces the same command.
@@ -64,37 +88,53 @@ mod tests {
             Feed::Cmd(Command::Delete(25, Motion::MidLine))
         );
         assert_eq!(feed("ygM"), Feed::Cmd(Command::Yank(50, Motion::MidLine)));
-        // `gm` (screen-line middle) is DEFERRED — it needs the window width, which the engine lacks — so it
-        // aborts as operator-pending rather than aliasing `gM` (see the GSecond note).
-        assert_eq!(feed("gm"), Feed::Ignored);
     }
 
     #[test]
-    fn g_prefixed_display_line_motions_alias_plain_motions() {
-        // ruse does not soft-wrap (one buffer line == one display row), so Vim's display-line motions
-        // `gj`/`gk`/`g0`/`g$`/`g^` equal `j`/`k`/`0`/`$`/`^` — exactly as Vim itself under `nowrap`.
-        assert_eq!(feed("gj"), Feed::Cmd(Command::Move(1, Motion::Down)));
-        assert_eq!(feed("gk"), Feed::Cmd(Command::Move(1, Motion::Up)));
-        assert_eq!(feed("g0"), Feed::Cmd(Command::Move(1, Motion::LineStart)));
-        assert_eq!(feed("g$"), Feed::Cmd(Command::Move(1, Motion::LineEnd)));
+    fn g_prefixed_screen_line_motions_go_to_the_frontend() {
+        // `gj`/`gk`/`g0`/`g^`/`gm`/`g$` count in the window's screen rows (#615), which the engine does not
+        // know: it hands them over with the folded count and keeps the operator armed.
+        use crate::input::ScreenMotion::*;
+        let sm = |motion, count| Feed::ScreenMotion { motion, count };
+        assert_eq!(feed("gj"), sm(Down, 1));
+        assert_eq!(feed("gk"), sm(Up, 1));
+        assert_eq!(feed("g0"), sm(Start, 1));
+        assert_eq!(feed("g^"), sm(FirstNonBlank, 1));
+        assert_eq!(feed("gm"), sm(Middle, 1));
+        assert_eq!(feed("g$"), sm(End, 1));
+        assert_eq!(feed("3gj"), sm(Down, 3));
+        assert_eq!(feed("2d3gk"), sm(Up, 6));
+        // The frontend finishes it: the operator over the byte target (`go`'s rules), or `j`/`k` without
+        // 'wrap'.
+        let mut e = InputEngine::new();
+        for c in "dgj".chars() {
+            e.feed(k(c), Mode::Normal);
+        }
         assert_eq!(
-            feed("g^"),
-            Feed::Cmd(Command::Move(1, Motion::LineFirstNonBlank))
+            e.screen_motion_to(9),
+            Feed::Cmd(Command::Delete(10, Motion::GotoByte))
         );
-        // Count-aware: the count accumulated before `g` carries through (`3gj` == `3j`).
-        assert_eq!(feed("3gj"), Feed::Cmd(Command::Move(3, Motion::Down)));
-        assert_eq!(feed("2gk"), Feed::Cmd(Command::Move(2, Motion::Up)));
-        // Operator-composable. The horizontal forms match nvim exactly (`dg$` == `d$`, `dg^` == `d^`).
-        assert_eq!(feed("g$"), feed("$"));
-        assert_eq!(feed("dg$"), feed("d$"));
-        assert_eq!(feed("dg^"), feed("d^"));
-        assert_eq!(feed("dg0"), feed("d0"));
-        // DELIBERATE DIVERGENCE (operator over the VERTICAL forms): `dgj`/`dgk` alias `dj`/`dk` (linewise).
-        // nvim treats `gj`/`gk` as characterwise-exclusive (subject to exclusive-linewise promotion), so
-        // nvim's `dgj` deletes ONE line, not two — see the note in input/mod.rs's GSecond arms.
-        assert_eq!(feed("dgj"), Feed::Cmd(Command::Delete(1, Motion::Down)));
-        assert_eq!(feed("ygk"), Feed::Cmd(Command::Yank(1, Motion::Up)));
-        assert_eq!(feed("d2gj"), Feed::Cmd(Command::Delete(2, Motion::Down)));
+        for c in "2dgj".chars() {
+            e.feed(k(c), Mode::Normal);
+        }
+        assert_eq!(
+            e.screen_motion_lines(true),
+            Feed::Cmd(Command::Delete(2, Motion::Down))
+        );
+        for c in "dgk".chars() {
+            e.feed(k(c), Mode::Normal);
+        }
+        assert_eq!(
+            e.screen_motion_fail(),
+            Feed::Beep {
+                clear_register: false
+            }
+        );
+        // The failed motion dropped the operator: `x` is `x` again.
+        assert_eq!(
+            e.feed(k('x'), Mode::Normal),
+            Feed::Cmd(Command::DeleteUnder(1))
+        );
     }
 
     #[test]
@@ -189,29 +229,37 @@ mod tests {
             feed("*"),
             Feed::Cmd(Command::SearchWordUnder {
                 forward: true,
-                whole_word: true
+                whole_word: true,
+                op: SearchOp::Move,
+                count: 1
             })
         );
         assert_eq!(
             feed("#"),
             Feed::Cmd(Command::SearchWordUnder {
                 forward: false,
-                whole_word: true
+                whole_word: true,
+                op: SearchOp::Move,
+                count: 1
             })
         );
         // `g*` / `g#` — match anywhere (no word boundaries).
         assert_eq!(
-            feed("g*"),
+            feed("3g*"),
             Feed::Cmd(Command::SearchWordUnder {
                 forward: true,
-                whole_word: false
+                whole_word: false,
+                op: SearchOp::Move,
+                count: 3
             })
         );
         assert_eq!(
             feed("g#"),
             Feed::Cmd(Command::SearchWordUnder {
                 forward: false,
-                whole_word: false
+                whole_word: false,
+                op: SearchOp::Move,
+                count: 1
             })
         );
     }
@@ -409,7 +457,8 @@ mod tests {
                 Motion::FindChar {
                     ch: 'x',
                     forward: true,
-                    till: false
+                    till: false,
+                    repeat: false
                 }
             ))
         );
@@ -448,14 +497,31 @@ mod tests {
 
     #[test]
     fn lang_stage_translates_on_the_command_line() {
-        // The Command-line namespace is Lang-Arg-eligible: a mapped key appends its TRANSLATION to the
+        // A `/` line follows the Insert language state; a `:` line starts unmapped, and `c_CTRL-^` flips
+        // the map for that line only (nvim v0.12.6, #810). A mapped key appends its TRANSLATION to the
         // owned line buffer (F-026 owns the buffer; the stage rewrites the key before it lands there).
         let mut e = InputEngine::new();
         e.lang_map.insert('a', 'б');
         e.lang_active = true;
-        assert_eq!(e.feed(k(':'), Mode::Normal), Feed::Pending); // opens the command line
+        assert_eq!(e.feed(k('/'), Mode::Normal), Feed::Pending); // opens the search line
         let _ = e.feed(k('a'), Mode::Normal);
         assert_eq!(e.cmdline.as_ref().map(|c| c.buffer.as_str()), Some("б"));
+        e.cmdline = None;
+        assert_eq!(e.feed(k(':'), Mode::Normal), Feed::Pending);
+        let _ = e.feed(k('a'), Mode::Normal);
+        assert_eq!(e.cmdline.as_ref().map(|c| c.buffer.as_str()), Some("a"));
+        assert_eq!(e.feed(ctrl_caret(), Mode::Normal), Feed::Pending);
+        let _ = e.feed(k('a'), Mode::Normal);
+        assert_eq!(e.cmdline.as_ref().map(|c| c.buffer.as_str()), Some("aб"));
+        assert!(
+            e.lang_active,
+            "a `:` line's CTRL-^ leaves the Insert state alone"
+        );
+        // On a `/` line CTRL-^ is the Insert state too.
+        e.cmdline = None;
+        let _ = e.feed(k('/'), Mode::Normal);
+        let _ = e.feed(ctrl_caret(), Mode::Normal);
+        assert!(!e.lang_active);
     }
 
     #[test]
@@ -509,11 +575,20 @@ mod tests {
     #[test]
     fn parse_delete_ranges() {
         use ruse_core::SubRange;
-        assert_eq!(parse_ex("d"), Ex::Delete(SubRange::CurrentLine));
-        assert_eq!(parse_ex("delete"), Ex::Delete(SubRange::CurrentLine));
-        assert_eq!(parse_ex("2,5d"), Ex::Delete(SubRange::Lines(2, 5)));
-        assert_eq!(parse_ex("%d"), Ex::Delete(SubRange::WholeFile));
-        assert_eq!(parse_ex("3delete"), Ex::Delete(SubRange::Lines(3, 3)));
+        assert_eq!(parse_ex("d"), Ex::Delete(SubRange::CurrentLine, None, None));
+        assert_eq!(
+            parse_ex("delete"),
+            Ex::Delete(SubRange::CurrentLine, None, None)
+        );
+        assert_eq!(
+            parse_ex("2,5d"),
+            Ex::Delete(SubRange::Lines(2, 5), None, None)
+        );
+        assert_eq!(parse_ex("%d"), Ex::Delete(SubRange::WholeFile, None, None));
+        assert_eq!(
+            parse_ex("3delete"),
+            Ex::Delete(SubRange::Lines(3, 3), None, None)
+        );
         // Not a delete verb → falls through (Unknown), not a spurious Delete.
         assert!(matches!(parse_ex("diffthis"), Ex::Unknown(_)));
     }
@@ -521,10 +596,10 @@ mod tests {
     #[test]
     fn parse_yank_ranges() {
         use ruse_core::SubRange;
-        assert_eq!(parse_ex("y"), Ex::Yank(SubRange::CurrentLine));
-        assert_eq!(parse_ex("yank"), Ex::Yank(SubRange::CurrentLine));
-        assert_eq!(parse_ex("1,3y"), Ex::Yank(SubRange::Lines(1, 3)));
-        assert_eq!(parse_ex("%yank"), Ex::Yank(SubRange::WholeFile));
+        assert_eq!(parse_ex("y"), Ex::Yank(SubRange::CurrentLine, None));
+        assert_eq!(parse_ex("yank"), Ex::Yank(SubRange::CurrentLine, None));
+        assert_eq!(parse_ex("1,3y"), Ex::Yank(SubRange::Lines(1, 3), None));
+        assert_eq!(parse_ex("%yank"), Ex::Yank(SubRange::WholeFile, None));
     }
 
     #[test]
@@ -558,8 +633,9 @@ mod tests {
             parse_ex("t5"),
             Ex::Copy(SubRange::CurrentLine, LineAddr::Line(5))
         );
-        // A move/copy with no destination is not a valid command → Unknown.
-        assert!(matches!(parse_ex("m"), Ex::Unknown(_)));
+        // A move/copy with no destination is E16, as in nvim.
+        assert_eq!(parse_ex("m"), Ex::Fail("E16: Invalid range".into()));
+        assert_eq!(parse_ex("t"), Ex::Fail("E16: Invalid range".into()));
     }
 
     #[test]
@@ -570,14 +646,16 @@ mod tests {
             parse_ex("put"),
             Ex::Put {
                 addr: LineAddr::Current,
-                reg: None
+                reg: None,
+                above: false
             }
         );
         assert_eq!(
             parse_ex("pu"),
             Ex::Put {
                 addr: LineAddr::Current,
-                reg: None
+                reg: None,
+                above: false
             }
         );
         // Addressed puts: `:2put` (after line 2), `:0put` (top), `:$put` (last line), `:.put` (current).
@@ -585,28 +663,32 @@ mod tests {
             parse_ex("2put"),
             Ex::Put {
                 addr: LineAddr::Line(2),
-                reg: None
+                reg: None,
+                above: false
             }
         );
         assert_eq!(
             parse_ex("0put"),
             Ex::Put {
                 addr: LineAddr::Line(0),
-                reg: None
+                reg: None,
+                above: false
             }
         );
         assert_eq!(
             parse_ex("$put"),
             Ex::Put {
                 addr: LineAddr::Last,
-                reg: None
+                reg: None,
+                above: false
             }
         );
         assert_eq!(
             parse_ex(".put"),
             Ex::Put {
                 addr: LineAddr::Current,
-                reg: None
+                reg: None,
+                above: false
             }
         );
         // A register argument (whitespace-separated): named, numbered, and the clipboard register.
@@ -614,28 +696,41 @@ mod tests {
             parse_ex("put a"),
             Ex::Put {
                 addr: LineAddr::Current,
-                reg: Some('a')
+                reg: Some('a'),
+                above: false
             }
         );
         assert_eq!(
             parse_ex("2put a"),
             Ex::Put {
                 addr: LineAddr::Line(2),
-                reg: Some('a')
+                reg: Some('a'),
+                above: false
             }
         );
         assert_eq!(
             parse_ex("put +"),
             Ex::Put {
                 addr: LineAddr::Current,
-                reg: Some('+')
+                reg: Some('+'),
+                above: false
             }
         );
         assert_eq!(
             parse_ex("pu 0"),
             Ex::Put {
                 addr: LineAddr::Current,
-                reg: Some('0')
+                reg: Some('0'),
+                above: false
+            }
+        );
+        // `:put!` puts above.
+        assert_eq!(
+            parse_ex("2put! a"),
+            Ex::Put {
+                addr: LineAddr::Line(2),
+                reg: Some('a'),
+                above: true
             }
         );
         // The register must be separated by whitespace — `:puta` is not `:put a` (Vim E492) → Unknown.
@@ -644,10 +739,68 @@ mod tests {
         assert!(matches!(parse_ex("put ab"), Ex::Unknown(_)));
     }
 
+    /// #1234: the command name is the whole run of letters, so a word that only starts like a command is
+    /// E492 (nvim v0.12.6, the `exn_*` oracle fixtures) and never runs that command.
+    #[test]
+    fn parse_whole_word_command_names() {
+        for line in [
+            "nosuch",
+            "nox",
+            "sefoo",
+            "sexy",
+            "wqq",
+            "wqx",
+            "nosuch arg",
+            "nosuch!",
+            "2nosuch",
+            "Xfoo",
+            "W",
+            "dx",
+            "deletex",
+            "yx",
+            "jx",
+            "mx",
+            "copyx",
+            "normx",
+            "%sortx",
+            "nohx",
+            "keex",
+            "trace savex",
+        ] {
+            assert!(matches!(parse_ex(line), Ex::Unknown(_)), ":{line}");
+        }
+        // `:k` alone takes its argument glued on, but not as `:kee…` (`:keepmarks`).
+        assert_eq!(
+            parse_ex("3ke"),
+            Ex::Mark {
+                range: SubRange::Lines(3, 3),
+                name: 'e'
+            }
+        );
+        for (line, rest) in [("kfoo", "foo"), ("3kax", "ax"), ("k ax", "ax")] {
+            assert_eq!(
+                parse_ex(line),
+                Ex::Fail(format!("E488: Trailing characters: {rest}")),
+                ":{line}"
+            );
+        }
+        let (_, rest) = strip_modifiers("kee d");
+        assert_eq!(rest, "d");
+        let (_, rest) = strip_modifiers("keepmarks 2d");
+        assert_eq!(rest, "2d");
+    }
+
     #[test]
     fn parse_edit_reload() {
-        assert_eq!(parse_ex("e!"), Ex::EditReload);
-        assert_eq!(parse_ex("edit!"), Ex::EditReload);
+        use crate::input::{EditSpec, FileOpts};
+        let reload = Ex::Edit(EditSpec {
+            bang: true,
+            file: None,
+            cmd: None,
+            opts: FileOpts::default(),
+        });
+        assert_eq!(parse_ex("e!"), reload);
+        assert_eq!(parse_ex("edit!"), reload);
     }
 
     #[test]
@@ -660,31 +813,64 @@ mod tests {
         assert!(matches!(parse_ex("earlier x"), Ex::Unknown(_)));
     }
 
+    /// The `:set` arguments `line` parses to, and the error that stopped it.
+    fn set_args(line: &str) -> (Vec<crate::input::set_cmd::SetArg>, Option<String>) {
+        match parse_ex(line) {
+            Ex::SetOptions(l) => (l.args.into_iter().map(|(a, _)| a).collect(), l.error),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_set_options() {
-        use ruse_core::EditorOption;
-        assert_eq!(parse_ex("set ic"), Ex::Set(EditorOption::IgnoreCase(true)));
+        use crate::input::set_cmd::{AssignOp, Opt, RawVal, SetArg};
+        let one = |line: &str| {
+            let (args, err) = set_args(line);
+            assert_eq!(err, None, "{line}");
+            args.into_iter().next().expect(line)
+        };
+        let num = |opt, n| SetArg::Assign {
+            opt,
+            op: AssignOp::Set,
+            val: RawVal::Num(n),
+        };
+        assert_eq!(one("set ic"), SetArg::Bool(Opt::IgnoreCase, true));
         assert_eq!(
-            parse_ex("set noignorecase"),
-            Ex::Set(EditorOption::IgnoreCase(false))
+            one("set noignorecase"),
+            SetArg::Bool(Opt::IgnoreCase, false)
         );
-        assert_eq!(parse_ex("set scs"), Ex::Set(EditorOption::SmartCase(true)));
+        assert_eq!(one("set scs"), SetArg::Bool(Opt::SmartCase, true));
+        assert_eq!(one("set expandtab"), SetArg::Bool(Opt::ExpandTab, true));
+        assert_eq!(one("set noet"), SetArg::Bool(Opt::ExpandTab, false));
+        assert_eq!(one("set sw=2"), num(Opt::ShiftWidth, 2));
+        assert_eq!(one("set shiftwidth=8"), num(Opt::ShiftWidth, 8));
+        // `tabstop` is its own option, not an alias of `shiftwidth` (#601).
+        assert_eq!(one("set ts=8"), num(Opt::TabStop, 8));
+        assert_eq!(one("set tabstop=2"), num(Opt::TabStop, 2));
+        // An option nvim does not know is E518 (#1087); a misused or mistyped one E474/E521; one nvim
+        // knows but ruse does not implement only says so.
+        let err = |line: &str| set_args(line).1;
         assert_eq!(
-            parse_ex("set expandtab"),
-            Ex::Set(EditorOption::ExpandTab(true))
+            err("set bogus").as_deref(),
+            Some("E518: Unknown option: bogus")
         );
         assert_eq!(
-            parse_ex("set noet"),
-            Ex::Set(EditorOption::ExpandTab(false))
+            err("set nobogus").as_deref(),
+            Some("E518: Unknown option: nobogus")
         );
-        assert_eq!(parse_ex("set sw=2"), Ex::Set(EditorOption::ShiftWidth(2)));
         assert_eq!(
-            parse_ex("set shiftwidth=8"),
-            Ex::Set(EditorOption::ShiftWidth(8))
+            err("set nosw").as_deref(),
+            Some("E474: Invalid argument: nosw")
         );
-        // Unknown option → not a Set (falls through to Unknown).
-        assert!(matches!(parse_ex("set bogus"), Ex::Unknown(_)));
-        assert!(matches!(parse_ex("set"), Ex::Unknown(_)));
+        assert_eq!(
+            err("set sw=x").as_deref(),
+            Some("E521: Number required after =: sw=x")
+        );
+        assert_eq!(one("set nonumber"), SetArg::Bool(Opt::Number, false));
+        assert_eq!(one("set nospell"), SetArg::Unsupported("spell".into()));
+        assert_eq!(one("set invwrap"), SetArg::Toggle(Opt::Wrap));
+        // A bare `:set` lists the changed options.
+        assert_eq!(set_args("set"), (vec![], None));
     }
 
     #[test]
@@ -702,14 +888,14 @@ mod tests {
         match parse_ex("sort! n") {
             Ex::Sort(r, s) => {
                 assert_eq!(r, SubRange::WholeFile);
-                assert!(s.reverse && s.numeric && !s.unique);
+                assert!(s.reverse && s.key == ruse_core::SortKind::Decimal && !s.unique);
             }
             other => panic!("expected Sort, got {other:?}"),
         }
         match parse_ex("1,3sort u") {
             Ex::Sort(r, s) => {
                 assert_eq!(r, SubRange::Lines(1, 3));
-                assert!(!s.reverse && !s.numeric && s.unique);
+                assert!(!s.reverse && s.key == ruse_core::SortKind::Text && s.unique);
             }
             other => panic!("expected Sort, got {other:?}"),
         }
@@ -731,7 +917,7 @@ mod tests {
         match parse_ex("sort rn /\\d\\+/") {
             Ex::Sort(_, s) => {
                 assert_eq!(s.pattern.as_deref(), Some("\\d\\+"));
-                assert!(s.use_match && s.numeric);
+                assert!(s.use_match && s.key == ruse_core::SortKind::Decimal);
             }
             other => panic!("expected Sort, got {other:?}"),
         }
@@ -778,6 +964,116 @@ mod tests {
                 count: 1,
                 motion: Motion::InnerParagraph
             }
+        );
+    }
+
+    /// #800: `!` over a search, `n`, `*`/`#`, `gn` or a mark hands the span command to the frontend (which
+    /// numbers its lines) instead of aborting; the operator slot is the non-mutating `Yank` placeholder.
+    #[test]
+    fn filter_operator_over_span_commands_emits_filterspan() {
+        let mut e = InputEngine::new();
+        for c in "!/x".chars() {
+            assert_eq!(e.feed(k(c), Mode::Normal), Feed::Pending);
+        }
+        assert_eq!(
+            e.feed(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Mode::Normal
+            ),
+            Feed::FilterSpan(Command::Search {
+                op: SearchOp::Yank,
+                count: 1,
+                pattern: "x".into(),
+                backward: false,
+                offset: SearchOffset::None,
+            })
+        );
+        // `n` after that search, with the filter's count folded in.
+        let mut last = Feed::Ignored;
+        for c in "2!n".chars() {
+            last = e.feed(k(c), Mode::Normal);
+        }
+        assert_eq!(
+            last,
+            Feed::FilterSpan(Command::Search {
+                op: SearchOp::Yank,
+                count: 2,
+                pattern: "x".into(),
+                backward: false,
+                offset: SearchOffset::None,
+            })
+        );
+        for c in "!g".chars() {
+            e.feed(k(c), Mode::Normal);
+        }
+        assert_eq!(
+            e.feed(k('n'), Mode::Normal),
+            Feed::FilterSpan(Command::SearchObject {
+                op: SearchOp::Yank,
+                count: 1,
+                pattern: "x".into(),
+                backward: false,
+            })
+        );
+        assert_eq!(
+            feed("!'a"),
+            Feed::FilterSpan(Command::OpToMark {
+                op: MarkOp::Yank,
+                name: 'a',
+                linewise: true,
+            })
+        );
+        assert_eq!(
+            feed("!#"),
+            Feed::FilterSpan(Command::SearchWordUnder {
+                forward: false,
+                whole_word: true,
+                op: SearchOp::Yank,
+                count: 1,
+            })
+        );
+        // The engine is back at a command boundary: the next key starts a new command.
+        assert_eq!(e.pending(), Pending::Base);
+    }
+
+    /// #1071: `*`/`#`/`g*`/`g#` are operator motions (`d*`, `2c#`, `gUg*`), carrying operator and count.
+    #[test]
+    fn star_and_hash_continue_an_armed_operator() {
+        assert_eq!(
+            feed("2d3*"),
+            Feed::Cmd(Command::SearchWordUnder {
+                forward: true,
+                whole_word: true,
+                op: SearchOp::Delete,
+                count: 6,
+            })
+        );
+        assert_eq!(
+            feed("c#"),
+            Feed::Cmd(Command::SearchWordUnder {
+                forward: false,
+                whole_word: true,
+                op: SearchOp::Change,
+                count: 1,
+            })
+        );
+        assert_eq!(
+            feed("gUg*"),
+            Feed::Cmd(Command::SearchWordUnder {
+                forward: true,
+                whole_word: false,
+                op: SearchOp::Case(WordCase::Upcase),
+                count: 1,
+            })
+        );
+        assert_eq!(
+            feed(">g#"),
+            Feed::Cmd(Command::SearchWordUnder {
+                forward: false,
+                whole_word: false,
+                op: SearchOp::Shift { left: false },
+                count: 1,
+            })
         );
     }
 
@@ -877,7 +1173,7 @@ mod tests {
         assert_eq!(feed("cw"), Feed::Cmd(Command::Change(1, Motion::WordFwd)));
     }
 
-    fn ctrl(c: char) -> KeyEvent {
+    pub(super) fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
@@ -920,7 +1216,12 @@ mod tests {
             })
         );
         // An unwired bracket command aborts cleanly.
-        assert_eq!(feed("]x"), Feed::Ignored);
+        assert_eq!(
+            feed("]x"),
+            Feed::Beep {
+                clear_register: false
+            }
+        );
     }
 
     #[test]
@@ -1142,12 +1443,14 @@ mod tests {
 
     #[test]
     fn set_textwidth_parses() {
-        use ruse_core::EditorOption;
-        assert_eq!(
-            parse_ex("set textwidth=72"),
-            Ex::Set(EditorOption::TextWidth(72))
-        );
-        assert_eq!(parse_ex("set tw=0"), Ex::Set(EditorOption::TextWidth(0)));
+        use crate::input::set_cmd::{AssignOp, Opt, RawVal, SetArg};
+        let tw = |n| SetArg::Assign {
+            opt: Opt::TextWidth,
+            op: AssignOp::Set,
+            val: RawVal::Num(n),
+        };
+        assert_eq!(set_args("set textwidth=72"), (vec![tw(72)], None));
+        assert_eq!(set_args("set tw=0"), (vec![tw(0)], None));
     }
 
     #[test]
@@ -1525,12 +1828,16 @@ mod tests {
                 Feed::Cmd(Command::InsertChar(c))
             );
         }
-        let mut tail: Vec<Command> = Vec::new();
-        for _ in 0..2 {
-            tail.extend("hello".chars().map(Command::InsertChar));
-        }
-        tail.push(Command::EnterNormal);
-        assert_eq!(e.feed(esc(), Mode::Insert), Feed::Replay(tail));
+        // The repeats are lazy (#683): the body twice more, then the `<Esc>`.
+        assert_eq!(
+            e.feed(esc(), Mode::Insert),
+            Feed::Repeat(Repeat {
+                head: Vec::new(),
+                unit: "hello".chars().map(Command::InsertChar).collect(),
+                times: 2,
+                tail: vec![Command::EnterNormal],
+            })
+        );
     }
 
     #[test]
@@ -1546,11 +1853,12 @@ mod tests {
         );
         assert_eq!(
             e.feed(esc(), Mode::Insert),
-            Feed::Replay(vec![
-                Command::OpenBelow,
-                Command::InsertChar('x'),
-                Command::EnterNormal,
-            ])
+            Feed::Repeat(Repeat {
+                head: Vec::new(),
+                unit: vec![Command::OpenBelow, Command::InsertChar('x')],
+                times: 1,
+                tail: vec![Command::EnterNormal],
+            })
         );
     }
 
@@ -1914,7 +2222,7 @@ mod tests {
         assert_eq!(e.feed(ctrl('u'), Mode::Insert), Feed::Pending);
         assert_eq!(
             e.feed(ctrl('f'), Mode::Insert),
-            Feed::Cmd(Command::Move(4, Motion::Right))
+            Feed::Cmd(Command::Move(4, Motion::EmacsCharFwd))
         );
 
         // Explicit decimal: `C-u 3 7 C-b` moves left 37.
@@ -1923,7 +2231,7 @@ mod tests {
         assert_eq!(e.feed(k('7'), Mode::Insert), Feed::Pending);
         assert_eq!(
             e.feed(ctrl('b'), Mode::Insert),
-            Feed::Cmd(Command::Move(37, Motion::Left))
+            Feed::Cmd(Command::Move(37, Motion::EmacsCharBack))
         );
 
         // `C-u C-u` → 16: a self-insert repeats sixteen times (Replay, not a single Cmd).
@@ -1931,7 +2239,11 @@ mod tests {
         assert_eq!(e.feed(ctrl('u'), Mode::Insert), Feed::Pending);
         assert_eq!(
             e.feed(k('a'), Mode::Insert),
-            Feed::Replay(vec![Command::InsertChar('a'); 16])
+            Feed::Repeat(Repeat {
+                unit: vec![Command::InsertChar('a')],
+                times: 16,
+                ..Repeat::default()
+            })
         );
 
         // count == 1 keeps the grapheme-aware bare motion — the no-argument path is unchanged.
@@ -1956,7 +2268,11 @@ mod tests {
         assert_eq!(e.feed(ctrl('s'), Mode::Insert), Feed::Cmd(Command::Save));
 
         assert_eq!(e.feed(ctrl('x'), Mode::Insert), Feed::Pending);
-        assert_eq!(e.feed(ctrl('c'), Mode::Insert), Feed::Cmd(Command::Quit));
+        // `C-x C-c` is the session's `save-buffers-kill-terminal`, which asks before quitting (#619).
+        assert_eq!(
+            e.feed(ctrl('c'), Mode::Insert),
+            Feed::EmacsAction(crate::input::EmacsAction::KillTerminal)
+        );
 
         assert_eq!(e.feed(ctrl('x'), Mode::Insert), Feed::Pending);
         assert_eq!(e.feed(k('u'), Mode::Insert), Feed::Cmd(Command::Undo));
@@ -2022,6 +2338,44 @@ mod tests {
         assert_eq!(
             e.feed(m_del, Mode::Insert),
             Feed::Cmd(Command::EmacsBackwardKillWord { count: 1 })
+        );
+    }
+
+    #[test]
+    fn emacs_esc_is_the_meta_prefix() {
+        // #896: `ESC u` = `M-u` (Emacs 31.1 `esc-map`), wherever the read boundary falls.
+        let mut e = InputEngine::emacs();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(e.feed(esc, Mode::Insert), Feed::Pending);
+        let want = InputEngine::emacs().feed(meta('u'), Mode::Insert);
+        assert!(matches!(want, Feed::Cmd(_)), "M-u is bound: {want:?}");
+        assert_eq!(e.feed(k('u'), Mode::Insert), want);
+        // Consumed by one key: the next plain key inserts.
+        assert_eq!(
+            e.feed(k('u'), Mode::Insert),
+            Feed::Cmd(Command::InsertChar('u'))
+        );
+        // A `C-u` count survives the prefix: `C-u 3 ESC d` = `C-u 3 M-d`.
+        let mut e = InputEngine::emacs();
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        e.feed(ctrl_u, Mode::Insert);
+        e.feed(k('3'), Mode::Insert);
+        e.feed(esc, Mode::Insert);
+        let mut fresh = InputEngine::emacs();
+        fresh.feed(ctrl_u, Mode::Insert);
+        fresh.feed(k('3'), Mode::Insert);
+        assert_eq!(
+            e.feed(k('d'), Mode::Insert),
+            fresh.feed(meta('d'), Mode::Insert)
+        );
+        // `C-x` owns its next key: `C-x ESC` does not arm the prefix.
+        let mut e = InputEngine::emacs();
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        e.feed(ctrl_x, Mode::Insert);
+        assert_eq!(e.feed(esc, Mode::Insert), Feed::Ignored);
+        assert_eq!(
+            e.feed(k('u'), Mode::Insert),
+            Feed::Cmd(Command::InsertChar('u'))
         );
     }
 
@@ -2112,7 +2466,11 @@ mod tests {
         assert_eq!(e.feed(k('2'), Mode::Insert), Feed::Pending);
         assert_eq!(
             e.feed(enter, Mode::Insert),
-            Feed::Replay(vec![Command::InsertNewline; 2])
+            Feed::Repeat(Repeat {
+                unit: vec![Command::InsertNewline],
+                times: 2,
+                ..Repeat::default()
+            })
         );
         assert_eq!(e.feed(ctrl('u'), Mode::Insert), Feed::Pending);
         assert_eq!(e.feed(k('3'), Mode::Insert), Feed::Pending);
@@ -2322,11 +2680,17 @@ mod tests {
         };
         assert_eq!(
             e.feed(k('p'), vis),
-            Feed::Cmd(Command::PasteSelection { swap: true })
+            Feed::Cmd(Command::PasteSelection {
+                swap: true,
+                count: 1,
+            })
         );
         assert_eq!(
             e.feed(k('P'), vis),
-            Feed::Cmd(Command::PasteSelection { swap: false })
+            Feed::Cmd(Command::PasteSelection {
+                swap: false,
+                count: 1,
+            })
         );
     }
 
@@ -2451,7 +2815,12 @@ mod tests {
     }
 
     fn fc(ch: char, forward: bool, till: bool) -> Motion {
-        Motion::FindChar { ch, forward, till }
+        Motion::FindChar {
+            ch,
+            forward,
+            till,
+            repeat: false,
+        }
     }
 
     #[test]
@@ -2495,19 +2864,85 @@ mod tests {
     }
 
     #[test]
+    fn pending_reports_what_the_next_key_belongs_to() {
+        // #679: the session's intercepts consult this before taking a key.
+        let mut e = InputEngine::new();
+        assert_eq!(e.pending(), Pending::Base);
+        e.feed(k('3'), Mode::Normal);
+        assert_eq!(e.pending(), Pending::Base, "a count is still a boundary");
+        e.feed(k('d'), Mode::Normal);
+        assert_eq!(e.pending(), Pending::Operator);
+        e.feed(k('f'), Mode::Normal);
+        assert_eq!(
+            e.pending(),
+            Pending::Argument,
+            "the find char wins over the operator"
+        );
+        e.feed(k('z'), Mode::Normal);
+        assert_eq!(e.pending(), Pending::Base);
+        e.feed(k('['), Mode::Normal);
+        assert_eq!(e.pending(), Pending::Bracket { open: true });
+        e.take_count();
+        for arg in ['r', 'm', '"', '\'', '`', 'g'] {
+            e.feed(k(arg), Mode::Normal);
+            assert_eq!(e.pending(), Pending::Argument, "after {arg:?}");
+            e.take_count();
+        }
+        e.feed(k(':'), Mode::Normal);
+        assert_eq!(
+            e.pending(),
+            Pending::Argument,
+            "the command line owns its keys"
+        );
+    }
+
+    #[test]
+    fn gqq_and_gqgq_format_count_lines() {
+        let fmt = |count| {
+            Feed::Cmd(Command::Format {
+                count,
+                motion: Motion::Line,
+                keep_cursor: false,
+            })
+        };
+        let mut e = InputEngine::new();
+        for c in "2gq".chars() {
+            e.feed(k(c), Mode::Normal);
+        }
+        assert_eq!(e.feed(k('q'), Mode::Normal), fmt(2));
+        e.feed(k('g'), Mode::Normal);
+        e.feed(k('q'), Mode::Normal);
+        e.feed(k('g'), Mode::Normal);
+        assert_eq!(e.feed(k('q'), Mode::Normal), fmt(1));
+    }
+
+    #[test]
     fn semicolon_repeats_comma_reverses() {
         let mut e = InputEngine::new();
         e.feed(k('f'), Mode::Normal);
         e.feed(k('x'), Mode::Normal); // last_find = (x, forward, not-till)
+        let again = |ch, forward, till| Motion::FindChar {
+            ch,
+            forward,
+            till,
+            repeat: true,
+        };
         assert_eq!(
             e.feed(k(';'), Mode::Normal),
-            Feed::Cmd(Command::Move(1, fc('x', true, false))),
+            Feed::Cmd(Command::Move(1, again('x', true, false))),
             "; repeats the last find"
         );
         assert_eq!(
             e.feed(k(','), Mode::Normal),
-            Feed::Cmd(Command::Move(1, fc('x', false, false))),
+            Feed::Cmd(Command::Move(1, again('x', false, false))),
             ", repeats reversed"
+        );
+        // A repeated `t` is marked as a repeat, so the core skips the char it stopped before (#802).
+        e.feed(k('t'), Mode::Normal);
+        e.feed(k('x'), Mode::Normal);
+        assert_eq!(
+            e.feed(k(';'), Mode::Normal),
+            Feed::Cmd(Command::Move(1, again('x', true, true)))
         );
     }
 
@@ -2537,8 +2972,8 @@ mod tests {
         assert_eq!(feed("3J"), Feed::Cmd(Command::JoinLines(3)));
         assert_eq!(feed("gJ"), Feed::Cmd(Command::JoinLinesNoSpace(1)));
         assert_eq!(feed("g&"), Feed::Cmd(Command::RepeatSubstituteGlobal));
-        // Bare `&` is the current-line, flag-dropping repeat (distinct from `g&`).
-        assert_eq!(feed("&"), Feed::Cmd(Command::RepeatSubstituteLine));
+        // Bare `&` is the session's (it reads the count), never the engine's (#700).
+        assert_ne!(feed("&"), Feed::Cmd(Command::RepeatSubstituteLine));
         assert_eq!(feed("`."), Feed::Cmd(Command::GotoLastChange));
         assert_eq!(feed("g;"), Feed::Cmd(Command::GotoOlderChange));
         assert_eq!(feed("g,"), Feed::Cmd(Command::GotoNewerChange));
@@ -2776,17 +3211,19 @@ mod tests {
             })
         );
 
-        // Like `dc`, a second (different) operator key re-arms rather than aborting; a motion then completes it.
+        // A second, DIFFERENT operator key aborts the armed one (nvim `checkclearop`, #790) — it does not
+        // re-arm — so the following motion is a bare move.
         let mut e = InputEngine::new();
         assert_eq!(e.feed(k('>'), Mode::Normal), Feed::Pending);
-        assert_eq!(e.feed(k('<'), Mode::Normal), Feed::Pending);
+        assert_eq!(
+            e.feed(k('<'), Mode::Normal),
+            Feed::Beep {
+                clear_register: false
+            }
+        );
         assert_eq!(
             e.feed(k('j'), Mode::Normal),
-            Feed::Cmd(Command::ShiftMotion {
-                left: true,
-                count: 1,
-                motion: Motion::Down
-            })
+            Feed::Cmd(Command::Move(1, Motion::Down))
         );
     }
 
@@ -2827,7 +3264,12 @@ mod tests {
     fn lone_g_is_pending_then_cancels_on_non_g() {
         let mut e = InputEngine::new();
         assert_eq!(e.feed(k('g'), Mode::Normal), Feed::Pending);
-        assert_eq!(e.feed(k('z'), Mode::Normal), Feed::Ignored);
+        assert_eq!(
+            e.feed(k('z'), Mode::Normal),
+            Feed::Beep {
+                clear_register: false
+            }
+        );
     }
 
     #[test]
@@ -2875,7 +3317,8 @@ mod tests {
 
     #[test]
     fn visual_o_swaps_selection_ends() {
-        // In Visual/Select, `o` emits SwapSelectionEnds (in Normal it is OpenBelow).
+        // In Visual, `o` emits SwapSelectionEnds (in Normal it is OpenBelow; in Select a typed `o` replaces
+        // the selection, #792).
         let mut e = InputEngine::new();
         assert_eq!(
             e.feed(
@@ -2893,7 +3336,7 @@ mod tests {
                     kind: SelectKind::Linewise
                 }
             ),
-            Feed::Cmd(Command::SwapSelectionEnds)
+            Feed::Cmd(Command::ReplaceSelection('o'))
         );
         // Sanity: `o` in Normal is still OpenBelow.
         assert_eq!(feed("o"), Feed::Cmd(Command::OpenBelow));
@@ -3031,26 +3474,192 @@ mod tests {
     }
 
     #[test]
-    fn select_operators_and_motions_match_visual() {
+    fn select_printable_keys_replace_and_movement_extends() {
+        // nvim v0.12.6 (`:help Select-mode`, #792): every printable key replaces the selection — the keys
+        // Visual binds (`d`, `l`, `w`), the shared initiators (`f`, `g`, `"`, `m`, `` ` ``), digits and `:`.
         let sel = Mode::Select {
             kind: SelectKind::Charwise,
         };
+        for c in [
+            'd', 'y', 'c', 'l', 'w', 'f', 'g', 'G', '"', 'm', '`', '5', '0', ':', ' ', 'z', 'J',
+        ] {
+            let mut e = InputEngine::new();
+            assert_eq!(
+                e.feed(k(c), sel),
+                Feed::Cmd(Command::ReplaceSelection(c)),
+                "Select {c:?}"
+            );
+            assert!(e.normal.is_clean(), "Select {c:?} left grammar state");
+        }
         let mut e = InputEngine::new();
-        // d/y/c act on the selection, exactly as in Visual.
-        assert_eq!(e.feed(k('d'), sel), Feed::Cmd(Command::DeleteSelection));
-        assert_eq!(e.feed(k('y'), sel), Feed::Cmd(Command::YankSelection));
-        assert_eq!(e.feed(k('c'), sel), Feed::Cmd(Command::ChangeSelection));
-        // A motion extends the selection (a bare Move; the frontend re-plans it against the anchor).
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // `<CR>` and `CTRL-J` replace with a line break; `<BS>`, `<Del>` and `CTRL-H` delete.
+        let nl = Feed::Cmd(Command::ReplaceSelection('\n'));
+        assert_eq!(e.feed(key(KeyCode::Enter), sel), nl);
+        assert_eq!(e.feed(ctrl('j'), sel), nl);
+        for k in [key(KeyCode::Backspace), key(KeyCode::Delete), ctrl('h')] {
+            assert_eq!(e.feed(k, sel), Feed::Cmd(Command::DeleteSelection));
+        }
+        // Non-printable movement extends the selection (a bare Move the core re-plans against the anchor).
         assert_eq!(
-            e.feed(k('l'), sel),
+            e.feed(key(KeyCode::Right), sel),
             Feed::Cmd(Command::Move(1, Motion::Right))
         );
         assert_eq!(
-            e.feed(k('w'), sel),
-            Feed::Cmd(Command::Move(1, Motion::WordFwd))
+            e.feed(ctrl('n'), sel),
+            Feed::Cmd(Command::Move(1, Motion::Down))
         );
+        // `<Tab>` is not printable here: nothing happens (nvim beeps).
+        assert_eq!(e.feed(key(KeyCode::Tab), sel), Feed::Ignored);
         // Esc leaves the selection.
         assert_eq!(e.feed(esc(), sel), Feed::Cmd(Command::EnterNormal));
+    }
+
+    #[test]
+    fn select_ctrl_o_runs_one_visual_command() {
+        // `v_CTRL-O`: Visual for one command; one that keeps the selection returns to Select, one that
+        // ends it (a change) runs plain so `.` records it.
+        let sel = Mode::Select {
+            kind: SelectKind::Charwise,
+        };
+        let vis = Mode::Visual {
+            kind: SelectKind::Charwise,
+        };
+        let mut e = InputEngine::new();
+        assert_eq!(
+            e.feed(ctrl('o'), sel),
+            Feed::Cmd(Command::EnterVisual {
+                kind: SelectKind::Charwise
+            })
+        );
+        assert_eq!(e.feed(k('2'), vis), Feed::Pending);
+        assert_eq!(
+            e.feed(k('e'), vis),
+            Feed::Replay(vec![
+                Command::Move(2, Motion::WordEnd),
+                Command::EnterSelect {
+                    kind: SelectKind::Charwise
+                }
+            ])
+        );
+        // The shot is spent: the next Visual key is plain Visual.
+        assert_eq!(
+            e.feed(k('l'), vis),
+            Feed::Cmd(Command::Move(1, Motion::Right))
+        );
+        // A change ends the selection and is not wrapped.
+        e.feed(ctrl('o'), sel);
+        assert_eq!(e.feed(k('d'), vis), Feed::Cmd(Command::DeleteSelection));
+        // A shape switch returns to Select in the new shape.
+        e.feed(ctrl('o'), sel);
+        assert_eq!(
+            e.feed(k('V'), vis),
+            Feed::Replay(vec![
+                Command::EnterVisual {
+                    kind: SelectKind::Linewise
+                },
+                Command::EnterSelect {
+                    kind: SelectKind::Linewise
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn g_h_family_enters_select() {
+        // `gh` / `gH` / `g CTRL-H` start Select charwise / linewise / blockwise; a count extends it.
+        for (key, kind) in [
+            (k('h'), SelectKind::Charwise),
+            (k('H'), SelectKind::Linewise),
+            (ctrl('h'), SelectKind::Blockwise),
+        ] {
+            let mut e = InputEngine::new();
+            e.feed(k('g'), Mode::Normal);
+            assert_eq!(
+                e.feed(key, Mode::Normal),
+                Feed::Replay(vec![
+                    Command::EnterVisual { kind },
+                    Command::EnterSelect { kind }
+                ])
+            );
+        }
+        let mut e = InputEngine::new();
+        for c in "2g".chars() {
+            e.feed(k(c), Mode::Normal);
+        }
+        assert_eq!(
+            e.feed(k('H'), Mode::Normal),
+            Feed::Replay(vec![
+                Command::EnterVisual {
+                    kind: SelectKind::Linewise
+                },
+                Command::Move(1, Motion::Down),
+                Command::EnterSelect {
+                    kind: SelectKind::Linewise
+                }
+            ])
+        );
+        // `gV` from Normal does nothing; `dgh` is not an operator form.
+        let mut e = InputEngine::new();
+        e.feed(k('g'), Mode::Normal);
+        assert_eq!(e.feed(k('V'), Mode::Normal), Feed::Ignored);
+        assert!(e.normal.is_clean());
+    }
+
+    #[test]
+    fn visual_line_operators_and_command_entry() {
+        let vis = Mode::Visual {
+            kind: SelectKind::Charwise,
+        };
+        let block = Mode::Visual {
+            kind: SelectKind::Blockwise,
+        };
+        let op = |c| Feed::Cmd(Command::VisualOp(c));
+        let one = |key: KeyEvent, mode: Mode| InputEngine::new().feed(key, mode);
+        assert_eq!(one(k('D'), vis), op(VisualOp::Lines(OpKind::Delete)));
+        assert_eq!(one(k('X'), vis), op(VisualOp::Lines(OpKind::Delete)));
+        assert_eq!(one(k('Y'), vis), op(VisualOp::Lines(OpKind::Yank)));
+        for c in ['C', 'S', 'R'] {
+            assert_eq!(one(k(c), vis), op(VisualOp::Lines(OpKind::Change)));
+        }
+        assert_eq!(one(k('D'), block), op(VisualOp::BlockToEol(OpKind::Delete)));
+        assert_eq!(one(k('C'), block), op(VisualOp::BlockToEol(OpKind::Change)));
+        assert_eq!(one(k('X'), block), Feed::Cmd(Command::DeleteSelection));
+        assert_eq!(one(k('Y'), block), Feed::Cmd(Command::YankSelection));
+        assert_eq!(one(k('S'), block), op(VisualOp::Lines(OpKind::Change)));
+        assert_eq!(one(k('O'), block), op(VisualOp::OtherCorner));
+        assert_eq!(one(k('O'), vis), Feed::Cmd(Command::SwapSelectionEnds));
+        assert_eq!(one(k('J'), vis), op(VisualOp::Join { spaces: true }));
+        assert_eq!(one(k('='), vis), op(VisualOp::Reindent));
+        assert_eq!(
+            one(k('<'), vis),
+            op(VisualOp::Shift {
+                left: true,
+                count: 1
+            })
+        );
+        let mut e = InputEngine::new();
+        e.feed(k('3'), vis);
+        assert_eq!(
+            e.feed(k('>'), vis),
+            op(VisualOp::Shift {
+                left: false,
+                count: 3
+            })
+        );
+        let mut e = InputEngine::new();
+        e.feed(k('g'), vis);
+        assert_eq!(e.feed(k('J'), vis), op(VisualOp::Join { spaces: false }));
+        let mut e = InputEngine::new();
+        e.feed(k('g'), vis);
+        assert_eq!(e.feed(k('q'), vis), op(VisualOp::Format));
+        // `:` / `!` leave Visual at its start and open the command line on the selection's range.
+        let mut e = InputEngine::new();
+        assert_eq!(e.feed(k(':'), vis), op(VisualOp::LeaveAtStart));
+        assert_eq!(e.cmdline(), Some((':', "'<,'>", 5)));
+        let mut e = InputEngine::new();
+        assert_eq!(e.feed(k('!'), vis), op(VisualOp::LeaveAtStart));
+        assert_eq!(e.cmdline(), Some((':', "'<,'>!", 6)));
     }
 
     #[test]
@@ -3169,7 +3778,10 @@ mod tests {
             Feed::Cmd(Command::InsertChar('z'))
         );
         assert_eq!(e.feed(k(':'), Mode::Normal), Feed::Pending);
-        assert_eq!(parse_ex("wq"), Ex::SaveQuit);
+        assert!(matches!(
+            parse_ex("wq"),
+            Ex::Write(crate::input::WriteSpec { quit: true, .. })
+        ));
         assert_eq!(
             parse_ex("trace save t.trace"),
             Ex::SaveTrace("t.trace".into())
@@ -3177,6 +3789,8 @@ mod tests {
         // `:checkhealth` and its `:che` prefix both parse (F-030).
         assert_eq!(parse_ex("checkhealth"), Ex::CheckHealth);
         assert_eq!(parse_ex("che"), Ex::CheckHealth);
+        assert_eq!(parse_ex("checktime"), Ex::CheckTime);
+        assert_eq!(parse_ex("checkt"), Ex::CheckTime);
         // `:rename {new}` / `:rn {new}` (F-014 LSP rename); a bare verb or a whitespaced name stays Unknown.
         assert_eq!(parse_ex("rename widget"), Ex::Rename("widget".into()));
         assert_eq!(parse_ex("rn widget"), Ex::Rename("widget".into()));
@@ -3191,21 +3805,28 @@ mod tests {
         assert_eq!(parse_ex("references"), Ex::References);
         assert_eq!(parse_ex("refs"), Ex::References);
         assert_eq!(parse_ex("ref"), Ex::References);
-        // `:codeaction` / `:ca` (F-014 LSP code actions).
+        // `:codeaction` (F-014 LSP code actions); `:ca` is nvim's `:cabbrev`, not an alias (#609).
         assert_eq!(parse_ex("codeaction"), Ex::CodeAction);
-        assert_eq!(parse_ex("ca"), Ex::CodeAction);
+        assert!(matches!(parse_ex("ca"), Ex::Unknown(_)));
         // `:diagnostics` / `:diags` / `:diag` (F-014 diagnostics list); `:d` is still delete.
         assert_eq!(parse_ex("diagnostics"), Ex::Diagnostics);
         assert_eq!(parse_ex("diags"), Ex::Diagnostics);
         assert_eq!(parse_ex("diag"), Ex::Diagnostics);
         assert_eq!(parse_ex("trust"), Ex::Trust);
+        assert_eq!(parse_ex("untrust"), Ex::Untrust);
+        assert_eq!(parse_ex("trust ++remove"), Ex::Untrust);
+        assert_eq!(parse_ex("inspect config"), Ex::InspectConfig(None));
+        assert_eq!(
+            parse_ex("inspect config editor.tab_width"),
+            Ex::InspectConfig(Some("editor.tab_width".into()))
+        );
         assert_eq!(parse_ex("registers"), Ex::Registers);
         assert_eq!(parse_ex("reg"), Ex::Registers);
         assert_eq!(parse_ex("display"), Ex::Registers);
         assert_eq!(parse_ex("marks"), Ex::Marks);
         assert_eq!(parse_ex("jumps"), Ex::Jumps);
         assert_eq!(parse_ex("changes"), Ex::Changes);
-        assert_eq!(parse_ex("d"), Ex::Delete(SubRange::CurrentLine));
+        assert_eq!(parse_ex("d"), Ex::Delete(SubRange::CurrentLine, None, None));
     }
 
     /// F-007 multi-buffer ex commands parse: `:enew`, `:ls`, `:bn`/`:bp`, `:b {n}` (with/without space),
@@ -3227,15 +3848,21 @@ mod tests {
         assert_eq!(parse_ex("b#"), Ex::Buffer(BufTarget::Alternate));
         assert!(matches!(parse_ex("b foo"), Ex::Unknown(_)));
         assert!(matches!(parse_ex("bx"), Ex::Unknown(_)));
-        // `:e {file}` / `:edit {file}` open a file; `:enew`/`:ene` and a bare `:e` are NOT edits.
-        assert_eq!(parse_ex("e src/main.rs"), Ex::Edit("src/main.rs".into()));
-        assert_eq!(parse_ex("edit a.txt"), Ex::Edit("a.txt".into()));
+        // `:e {file}` / `:edit {file}` open a file; `:enew`/`:ene` are not edits, and a bare `:e` re-edits the
+        // buffer's own file (#610).
+        let edit = |file: Option<&str>| {
+            Ex::Edit(crate::input::EditSpec {
+                bang: false,
+                file: file.map(str::to_string),
+                cmd: None,
+                opts: crate::input::FileOpts::default(),
+            })
+        };
+        assert_eq!(parse_ex("e src/main.rs"), edit(Some("src/main.rs")));
+        assert_eq!(parse_ex("edit a.txt"), edit(Some("a.txt")));
         assert_eq!(parse_ex("enew"), Ex::Enew);
         assert_eq!(parse_ex("ene"), Ex::Enew);
-        assert!(
-            matches!(parse_ex("e"), Ex::Unknown(_)),
-            "bare :e is not an edit"
-        );
+        assert_eq!(parse_ex("e"), edit(None));
     }
 }
 
@@ -3243,7 +3870,7 @@ mod tests {
 /// replays it — the operator/edit at the CURRENT cursor, plus any captured insert text (F-023).
 #[cfg(test)]
 mod dot_repeat_tests {
-    use super::tests::{esc, k};
+    use super::tests::{ctrl, esc, k};
     use crate::input::*;
 
     /// Feed a whole sequence, tracking the mode the way the frontend does (a completed command may change
@@ -3274,7 +3901,12 @@ mod dot_repeat_tests {
     #[test]
     fn dot_with_no_prior_change_is_a_clean_noop() {
         let mut e = InputEngine::new();
-        assert_eq!(e.feed(k('.'), Mode::Normal), Feed::Ignored);
+        assert_eq!(
+            e.feed(k('.'), Mode::Normal),
+            Feed::Beep {
+                clear_register: false
+            }
+        );
         assert!(e.last_change.is_none());
     }
 
@@ -3295,6 +3927,56 @@ mod dot_repeat_tests {
         assert_eq!(
             last,
             Feed::Replay(vec![Command::Delete(1, Motion::WordFwd)])
+        );
+    }
+
+    #[test]
+    fn a_failed_change_puts_the_earlier_one_back() {
+        // `x`, then `dfz` fails in the core (no `z`): the engine forgets it, so `.` repeats the `x` (#1179).
+        let mut e = InputEngine::new();
+        assert_eq!(
+            e.feed(k('x'), Mode::Normal),
+            Feed::Cmd(Command::DeleteUnder(1))
+        );
+        for key in [k('d'), k('f')] {
+            e.feed(key, Mode::Normal);
+        }
+        let Feed::Cmd(dfz) = e.feed(k('z'), Mode::Normal) else {
+            panic!("dfz is one command");
+        };
+        e.change_failed(&dfz, false);
+        assert_eq!(
+            e.feed(k('.'), Mode::Normal),
+            Feed::Replay(vec![Command::DeleteUnder(1)])
+        );
+        // Only the command just recorded is forgotten: a second report changes nothing.
+        e.change_failed(&dfz, false);
+        assert_eq!(
+            e.feed(k('.'), Mode::Normal),
+            Feed::Replay(vec![Command::DeleteUnder(1)])
+        );
+    }
+
+    #[test]
+    fn a_change_nvim_saves_before_it_fails_stays() {
+        // `CTRL-A` without a number fails after nvim's `prep_redo`, and a refused `"/dw` inside its operator.
+        let mut e = InputEngine::new();
+        e.feed(k('x'), Mode::Normal);
+        let Feed::Cmd(add) = e.feed(ctrl('a'), Mode::Normal) else {
+            panic!("CTRL-A is one command");
+        };
+        e.change_failed(&add, false);
+        assert_eq!(e.feed(k('.'), Mode::Normal), Feed::Replay(vec![add]));
+        for key in [k('"'), k('/'), k('d')] {
+            e.feed(key, Mode::Normal);
+        }
+        let Feed::Cmd(dw) = e.feed(k('w'), Mode::Normal) else {
+            panic!("dw is one command");
+        };
+        e.change_failed(&dw, true);
+        assert_eq!(
+            e.feed(k('.'), Mode::Normal),
+            Feed::Replay(vec![Command::SetRegister(Some('/')), dw])
         );
     }
 
@@ -3387,7 +4069,12 @@ mod dot_repeat_tests {
         e.feed(k('y'), Mode::Normal);
         e.feed(k('w'), Mode::Normal);
         assert!(e.last_change.is_none());
-        assert_eq!(e.feed(k('.'), Mode::Normal), Feed::Ignored);
+        assert_eq!(
+            e.feed(k('.'), Mode::Normal),
+            Feed::Beep {
+                clear_register: false
+            }
+        );
     }
 
     #[test]
@@ -3610,7 +4297,17 @@ mod search_tests {
     #[test]
     fn slash_opens_search_and_n_repeats() {
         let mut e = InputEngine::new();
-        assert_eq!(e.feed(k('n'), Mode::Normal), Feed::Ignored); // no prior search yet
+        // No prior search yet: a search with no pattern, which the core fails (E35, #1173).
+        assert_eq!(
+            e.feed(k('n'), Mode::Normal),
+            Feed::Cmd(Command::Search {
+                op: SearchOp::Move,
+                count: 1,
+                pattern: String::new(),
+                backward: false,
+                offset: SearchOffset::None,
+            })
+        );
         assert_eq!(e.feed(k('/'), Mode::Normal), Feed::Pending);
         // Submitting the pattern yields a bare-move Search AND records it for `n`/`N`.
         assert_eq!(
@@ -3754,9 +4451,17 @@ mod search_tests {
     #[test]
     fn gn_and_gn_backward_emit_the_search_object_with_the_last_pattern() {
         let mut e = InputEngine::new();
-        // Before any search, `gn` finds no pattern and aborts cleanly.
+        // Before any search, `gn` carries an empty pattern, which the core fails (E35, #1184).
         assert_eq!(e.feed(k('g'), Mode::Normal), Feed::Pending);
-        assert_eq!(e.feed(k('n'), Mode::Normal), Feed::Ignored);
+        assert_eq!(
+            e.feed(k('n'), Mode::Normal),
+            Feed::Cmd(Command::SearchObject {
+                op: SearchOp::Move,
+                count: 1,
+                pattern: String::new(),
+                backward: false,
+            })
+        );
         // After a search, bare `gn` = the Move (Visual-select) object; `gN` sets backward.
         e.set_last_search("foo".into(), true);
         assert_eq!(e.feed(k('g'), Mode::Normal), Feed::Pending);
@@ -3813,11 +4518,51 @@ mod search_tests {
     }
 
     #[test]
-    fn empty_search_pattern_is_inert() {
+    fn empty_search_pattern_with_no_previous_search_fails_in_the_core() {
         let mut e = InputEngine::new();
-        assert_eq!(e.feed(k('/'), Mode::Normal), Feed::Pending);
-        // No prior search → empty pattern has nothing to reuse, so it aborts.
-        assert_eq!(e.submit_search(String::new(), false), Feed::Ignored);
+        assert_eq!(e.feed(k('?'), Mode::Normal), Feed::Pending);
+        // No prior search → the empty pattern has nothing to reuse: the search runs with no pattern, which
+        // the core fails (E35, #1173), and nothing is recorded for `n`.
+        assert_eq!(
+            e.submit_search(String::new(), true),
+            Feed::Cmd(Command::Search {
+                op: SearchOp::Move,
+                count: 1,
+                pattern: String::new(),
+                backward: true,
+                offset: SearchOffset::None,
+            })
+        );
+        assert_eq!(e.last_search(), None);
+    }
+
+    #[test]
+    fn g_backtick_and_g_quote_jump_keeping_the_jumplist() {
+        let mut e = InputEngine::new();
+        assert_eq!(e.feed(k('g'), Mode::Normal), Feed::Pending);
+        assert_eq!(e.feed(k('`'), Mode::Normal), Feed::Pending);
+        assert_eq!(
+            e.feed(k('a'), Mode::Normal),
+            Feed::KeepJumps(Command::GotoNamedMark('a'))
+        );
+        assert_eq!(e.feed(k('g'), Mode::Normal), Feed::Pending);
+        assert_eq!(e.feed(k('\''), Mode::Normal), Feed::Pending);
+        assert_eq!(
+            e.feed(k('.'), Mode::Normal),
+            Feed::KeepJumps(Command::GotoLastChangeLine)
+        );
+        // Under an operator it is the operator over the mark, as `` d`a ``.
+        for key in ['d', 'g', '`'] {
+            assert_eq!(e.feed(k(key), Mode::Normal), Feed::Pending);
+        }
+        assert_eq!(
+            e.feed(k('a'), Mode::Normal),
+            Feed::Cmd(Command::OpToMark {
+                op: MarkOp::Delete,
+                name: 'a',
+                linewise: false,
+            })
+        );
     }
 
     #[test]
@@ -3895,10 +4640,16 @@ mod search_tests {
             split_search_offset("foo/", '/'),
             ("foo".into(), Some(SearchOffset::None))
         );
-        // An escaped delimiter stays in the pattern; the split is the LAST unescaped one.
+        // An escaped delimiter stays in the pattern; the split is the first unescaped one.
         assert_eq!(
             split_search_offset("ab\\/cd/e", '/'),
             ("ab\\/cd".into(), Some(SearchOffset::End(0)))
+        );
+        // A delimiter inside `[...]` is part of the pattern (#803, nvim `skip_regexp`).
+        assert_eq!(split_search_offset("[/]", '/'), ("[/]".into(), None));
+        assert_eq!(
+            split_search_offset("[/]/e", '/'),
+            ("[/]".into(), Some(SearchOffset::End(0)))
         );
         // Backward delimiter `?` (a `/` in the pattern is then literal).
         assert_eq!(
@@ -4035,7 +4786,7 @@ mod state_machine_props {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(crate::test_cases(256))]
 
         /// No key sequence ever leaves a partial command dangling: after any outcome that is not
         /// `Feed::Pending`, every transient axis (count, operator, key-expectation) is cleared. And a
@@ -4064,6 +4815,7 @@ mod state_machine_props {
                         || !e.activations.is_empty()
                         || e.insert.ctrl_g
                         || e.insert.ctrl_r
+                        || e.insert.keep_undo // `CTRL-G U` arms the next `<Left>`/`<Right>` (#1076)
                         || e.cmdline.is_some(); // an open command-line namespace is real pending state (F-026)
                     prop_assert!(has_state, "Feed::Pending but the engine is idle");
                 } else {
@@ -4484,8 +5236,8 @@ mod substitute_parse_tests {
     #[test]
     fn gdefault_inverts_the_g_flag() {
         // With gdefault ON, a BARE `:s///` is global and `:s///g` is single.
-        assert!(parse_substitute("s/a/b/", true).unwrap().global);
-        assert!(!parse_substitute("s/a/b/g", true).unwrap().global);
+        assert!(parse_substitute("s/a/b/", true).unwrap().unwrap().global);
+        assert!(!parse_substitute("s/a/b/g", true).unwrap().unwrap().global);
     }
 
     #[test]
@@ -4606,10 +5358,61 @@ mod global_parse_tests {
 
     #[test]
     fn global_normalx_is_not_the_normal_verb() {
-        // `normalx` is not `normal x` — with no `d`/`s`/`normal` payload the whole `:g` line is Unknown.
-        assert!(matches!(parse_ex("g/foo/normalx"), Ex::Unknown(_)));
-        // A bare `normal` (no delimiting space/keys) is likewise not a valid payload.
-        assert!(matches!(parse_ex("g/foo/normal"), Ex::Unknown(_)));
+        // `normalx` is not `normal x`: it is some other command, which the Ex dispatch runs (and refuses)
+        // per marked line (#1245).
+        assert_eq!(
+            glob("g/foo/normalx").cmd,
+            GlobalPayload::Ex("normalx".into())
+        );
+        // A bare `normal` (no delimiting space/keys) is likewise not a `normal` payload.
+        assert_eq!(glob("g/foo/normal").cmd, GlobalPayload::Ex("normal".into()));
+    }
+
+    /// #1245: only a bare `d` and a plain `s///` run in core's one pass; every other command is the
+    /// verbatim text the Ex dispatch runs per marked line, `|` and all.
+    #[test]
+    fn other_global_commands_run_through_the_ex_dispatch() {
+        let ex = |line: &str| glob(line).cmd;
+        for (line, cmd) in [
+            ("g/b/d 2", "d 2"),
+            ("g/b/d a", "d a"),
+            ("g/b/j", "j"),
+            ("g/^/m0", "m0"),
+            ("g/a/>2", ">2"),
+            ("g/a/d|d", "d|d"),
+            ("g/a/s/1/X/ 2", "s/1/X/ 2"),
+            ("g/a/s/1/X/n", "s/1/X/n"),
+            ("g/a/s/1/X/&", "s/1/X/&"),
+            ("g/a/s/1/X/p", "s/1/X/p"),
+            ("g/./s/1/X/|s/a/Y/", "s/1/X/|s/a/Y/"),
+            ("g/a/g/1/d", "g/1/d"),
+            ("g/a/foo", "foo"),
+        ] {
+            assert_eq!(ex(line), GlobalPayload::Ex(cmd.into()), "{line}");
+        }
+        assert_eq!(ex("g/a/delete"), GlobalPayload::Core(GlobalCmd::Delete));
+        assert!(matches!(ex("g/a/s/1/X/g"), GlobalPayload::Core(_)));
+        assert!(matches!(ex("g/a/s/1/X/e"), GlobalPayload::Core(_)));
+    }
+
+    /// The keys of a `:g/pat/normal` are verbatim to the end of the line, as `:normal`'s are: a trailing
+    /// blank or `<C-v><CR>` survives.
+    #[test]
+    fn global_normal_keys_keep_their_trailing_chars() {
+        assert_eq!(
+            glob("g/a/normal :.d\r").cmd,
+            GlobalPayload::Normal {
+                bang: false,
+                keys: ":.d\r".into()
+            }
+        );
+        assert_eq!(
+            glob("g/a/normal A ").cmd,
+            GlobalPayload::Normal {
+                bang: false,
+                keys: "A ".into()
+            }
+        );
     }
 }
 
@@ -4629,24 +5432,58 @@ mod nohighlight_parse_tests {
 mod binding_label_tests {
     use crate::input::*;
 
-    /// F-004 #2: a command with a STATIC layer binding reports it; a grammar/ex command (no layer
-    /// binding) reports None — the deliberate MVP scope (static layer bindings only).
+    /// The palette label of every registered command available in `mode`, under `e`'s profile.
+    fn labels(e: &InputEngine, mode: Mode) -> Vec<(&'static str, Option<String>)> {
+        let specs = ruse_core::available(&ruse_core::Context {
+            mode,
+            has_selection: false,
+        });
+        let cmds: Vec<Command> = specs.iter().map(|s| s.command.clone()).collect();
+        let out = e.binding_labels(&cmds, mode);
+        specs.iter().map(|s| s.id).zip(out).collect()
+    }
+
+    fn label<'a>(all: &'a [(&'static str, Option<String>)], id: &str) -> Option<&'a str> {
+        all.iter()
+            .find(|(i, _)| *i == id)
+            .unwrap_or_else(|| panic!("{id} not offered"))
+            .1
+            .as_deref()
+    }
+
+    /// F-004 #2 (#956): the palette shows the key that runs each command in the current mode under the
+    /// active profile — grammar keys included, not only the static layer tables.
     #[test]
-    fn binding_label_reports_static_layer_bindings_only() {
-        let e = InputEngine::new();
-        // The Insert layer binds Esc -> EnterNormal, Enter -> InsertNewline, Backspace -> DeleteBack.
-        assert_eq!(
-            e.binding_label(&Command::EnterNormal).as_deref(),
-            Some("Esc")
-        );
-        assert_eq!(
-            e.binding_label(&Command::InsertNewline).as_deref(),
-            Some("CR")
-        );
-        assert_eq!(e.binding_label(&Command::DeleteBack).as_deref(), Some("BS"));
-        // Undo (`u`) is Normal grammar, not a layer binding, so it has no static binding here.
-        assert_eq!(e.binding_label(&Command::Undo), None);
-        assert_eq!(e.binding_label(&Command::Save), None);
+    fn binding_labels_follow_the_grammar_and_the_profile() {
+        let vim = InputEngine::new();
+        let normal = labels(&vim, Mode::Normal);
+        for (id, key) in [
+            ("editor.insert", "i"),
+            ("editor.insert_after", "a"),
+            ("editor.undo", "u"),
+            ("editor.redo", "C-r"),
+            ("editor.undo_older", "g-"),
+            ("editor.undo_newer", "g+"),
+            ("editor.join_lines", "J"),
+            ("editor.line_start", "0"),
+            ("editor.line_end", "$"),
+            ("editor.reselect", "gv"),
+        ] {
+            assert_eq!(label(&normal, id), Some(key), "{id}");
+        }
+        // Vim has no key for `:w` or `:q` (`ZZ` is `:x`, `ZQ` is `:q!`).
+        assert_eq!(label(&normal, "file.save"), None);
+        assert_eq!(label(&normal, "file.quit"), None);
+        let insert = labels(&vim, Mode::Insert);
+        assert_eq!(label(&insert, "editor.normal_mode"), Some("Esc"));
+        assert_eq!(label(&insert, "editor.newline"), Some("CR"));
+        assert_eq!(label(&insert, "editor.delete_back"), Some("BS"));
+        assert_eq!(label(&insert, "editor.break_undo"), Some("C-g u"));
+        // The Emacs profile's own keys, not Vim's.
+        let emacs = labels(&InputEngine::emacs(), Mode::Insert);
+        assert_eq!(label(&emacs, "file.save"), Some("C-x C-s"));
+        assert_eq!(label(&emacs, "file.quit"), Some("C-x C-c"));
+        assert_eq!(label(&emacs, "editor.break_undo"), None);
     }
 
     /// Arm an operator prefix, then resolve a viewport screen-motion (`H`/`M`/`L`) to the ABSOLUTE `line`
@@ -4935,6 +5772,29 @@ mod binding_label_tests {
     }
     fn esc() -> KeyEvent {
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    /// #897: Normal `<C-c>` is an interrupt, not the `c` operator: `<C-c><C-c>` was `cc`. It cancels a
+    /// pending operator or awaited key, and leaves Visual (nvim v0.12.6).
+    #[test]
+    fn normal_ctrl_c_interrupts_instead_of_changing() {
+        let mut e = InputEngine::new();
+        assert_eq!(e.feed(ctrl_c(), Mode::Normal), Feed::Ignored);
+        assert_eq!(e.feed(ctrl_c(), Mode::Normal), Feed::Ignored);
+        assert_eq!(e.feed(k('d'), Mode::Normal), Feed::Pending);
+        assert_eq!(e.feed(ctrl_c(), Mode::Normal), Feed::Ignored);
+        assert_eq!(
+            e.feed(k('d'), Mode::Normal),
+            Feed::Pending,
+            "the cancelled d is gone"
+        );
+        assert_eq!(e.feed(ctrl_c(), Mode::Normal), Feed::Ignored);
+        assert_eq!(e.feed(k('f'), Mode::Normal), Feed::Pending);
+        assert_eq!(e.feed(ctrl_c(), Mode::Normal), Feed::Ignored);
+        let vis = Mode::Visual {
+            kind: SelectKind::Charwise,
+        };
+        assert_eq!(e.feed(ctrl_c(), vis), Feed::Cmd(Command::EnterNormal));
     }
 
     #[test]

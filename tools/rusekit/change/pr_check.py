@@ -14,6 +14,7 @@ import sys
 
 from rusekit import repo, render, contract, model as model_mod  # noqa: E402
 from rusekit.change.classify import classify_changeset  # noqa: E402
+from rusekit.change.edit import CONTRACT_FLAGS  # noqa: E402
 
 
 # Automation whose PRs never carry a hand-authored gate block. Rather than exempt them blindly,
@@ -64,7 +65,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--base", help="git ref to diff against")
     ap.add_argument("--files", nargs="*", help="explicit file list")
     ap.add_argument("--pr-body", help="CI mode: read the declared contract from a PR body file "
-                                      "(gate of record = diff + re-run verify; local .ruse is untrusted)")
+                                      "(gate of record = diff + re-run verify; local work dir is untrusted)")
     ap.add_argument("--actor", help="CI: PR author login; a TRUSTED_BOTS actor may pass without a gate block")
     args = ap.parse_args(argv)
 
@@ -136,11 +137,36 @@ def main(argv: list[str]) -> int:
     eff_kind = declared
     if cl.observed_kind and (cl.observed_risk > (contract.kind_risk(declared) or -1)):
         eff_kind = cl.observed_kind
+    # contracts.* flags (#1204): a change that declares it crosses a stability boundary is a `contract`
+    # change (spec/templates/change.yaml), whatever the paths say; a stored-format change also names its
+    # migration. A path that suggests a flag the contract leaves false is a warning: the diff cannot tell
+    # a format change from a refactor of the code that reads the format.
+    con = c.get("contracts") or {}
+    art = c.get("artifacts") or {}
+    crossed = [k for k in CONTRACT_FLAGS if con.get(k) is True]
+    floor = contract.kind_risk("contract")
+    if crossed and floor is not None:
+        declared_risk = contract.kind_risk(declared) if declared else None
+        ok_kind = declared_risk is not None and declared_risk >= floor
+        checks.append((ok_kind, f"contracts: {', '.join(crossed)} set, so the kind is 'contract'"
+                       + ("" if ok_kind else f" — declared '{declared}' is too low "
+                          "(`change set --kind contract`)")))
+        if (contract.kind_risk(eff_kind) or 0) < floor:
+            eff_kind = "contract"
+    if con.get("persistent_format") is True:
+        mig = art.get("migration")
+        named = isinstance(mig, str) and bool(mig.strip())
+        checks.append((named, "contracts: persistent-format change names its migration"
+                       + (f" ({mig})" if named else
+                          " — `change set --migration <ref>` (or `--migration none`)")))
+    for f, flag, why in cl.flag_hits:
+        if con.get(flag) is not True:
+            warns.append(f"contracts: {f} ({why}) — if this changes the format, "
+                         f"`change set --{flag.replace('_', '-')}`")
     kspec = kinds.get(eff_kind, {})
     eff_risk = kspec.get("risk", 0)
 
     # required artifacts
-    art = c.get("artifacts") or {}
     aff = c.get("affected") or {}
     for req in kspec.get("required_artifacts", []):
         if req == "issue":
@@ -160,12 +186,14 @@ def main(argv: list[str]) -> int:
             linked = bool(contract.affected_ids(c) or art.get("rfc") or art.get("decision"))
             checks.append((linked, "artifact: a spec/Decision ID is linked"))
         elif req == "compat":
-            # P0: no protocol_compat tool yet — require an explicit human attestation field.
-            if art.get("compat_reviewed"):
-                checks.append((True, "artifact: compatibility reviewed (attested)"))
-            else:
-                warns.append("artifact: compatibility review required — set "
-                             "artifacts.compat_reviewed: true after review (tool is P1)")
+            # No protocol-compat tool yet (verify NOT_YET), so the artifact is a human attestation: where the
+            # compatibility review is recorded. It was a warning, so `contract` could never fail on it (#887).
+            cr = art.get("compat_reviewed")
+            named = (isinstance(cr, str) and bool(cr.strip())) or cr is True
+            checks.append((named, "artifact: compatibility review recorded"
+                           + (f" ({cr})" if isinstance(cr, str) and named else "" if named else
+                              " — `change set --compat-reviewed <ref>` (the RFC section or review "
+                              "that checked old peers / old data)")))
         elif req == "migration":
             checks.append((art.get("migration") is not None, "artifact: migration decided"))
 
@@ -183,11 +211,14 @@ def main(argv: list[str]) -> int:
     # evidence (risk >= 2). Recorded evidence must exist and NONE may be failing; a
     # required step that was never run is a warning (e.g. heavy cargo steps deferred),
     # not a hard block — the human decides whether the missing evidence is acceptable.
+    evidence_note: str | None = None
     if eff_risk >= 2 and ci:
         # Local evidence.json is fabricatable, so it is NEVER the server-side gate of record. In CI the
         # required verify steps are separate REQUIRED JOBS (branch protection) that re-run from scratch.
-        checks.append((True, "evidence: gate of record is CI's own verify jobs "
-                             f"({', '.join(kspec.get('evidence', []) or ['verify'])}), not local evidence.json"))
+        # This job cannot see their result, so it records no check here (a check that cannot fail is not
+        # one, #887): it says where the evidence is enforced instead.
+        evidence_note = ("not checked by this job — the required CI jobs (rust, spec-validate) re-run "
+                         f"{', '.join(kspec.get('evidence', []) or ['verify'])}; local evidence.json is untrusted")
     elif eff_risk >= 2:
         steps = _evidence_steps(issue)
         required_ev = kspec.get("evidence", [])
@@ -209,7 +240,9 @@ def main(argv: list[str]) -> int:
     render.field("Declared kind", declared or "—")
     render.field("Effective kind", f"{eff_kind} (risk {eff_risk})")
     render.field("Changed files", f"{len(cs.files)} (source: {cs.source})")
-    render.field("Mode", "CI — diff + PR body (local .ruse untrusted)" if ci else "local preflight")
+    render.field("Mode", "CI — diff + PR body (local work dir untrusted)" if ci else "local preflight")
+    if evidence_note:
+        render.field("Evidence", evidence_note)
     print()
     passed = True
     for ok_, msg in checks:

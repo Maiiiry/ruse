@@ -4,8 +4,12 @@
 //! including the span-delete collapse and [`AnchorPolicy`], and the batched `O(A + E)` sweep (§4) that
 //! meets **INV-ANCHOR** ("not O(anchors × edits)"). Anchors are generation-checked handles
 //! (**INV-HANDLE**); a stale id is an assert, never a silent wrong answer.
+//!
+//! Besides these BYTE anchors the store holds LINE anchors ([`Track::Line`], anchor-store §3.1): Vim's
+//! marks, jumplist and change list follow whole-line inserts and deletes but keep their column through an
+//! edit inside their line, which is what nvim's `mark_adjust` does (#686). [`LineMap`] is that rule.
 
-use crate::edit::EditList;
+use crate::edit::{Edit, EditList};
 use crate::pos::BytePos;
 
 /// Which side of a boundary an anchor clings to when an insertion lands exactly at its offset
@@ -31,6 +35,27 @@ pub enum AnchorPolicy {
     Invalidate,
 }
 
+/// What a LINE anchor does when its whole line is deleted — the three cases of nvim's `mark_adjust`
+/// (`ONE_ADJUST`, `ONE_ADJUST_NODEL`, `ONE_ADJUST_CURSOR`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LineGravity {
+    /// The position is deleted with its line (a lowercase mark, `` `^ ``): `E20` after.
+    Drop,
+    /// The position moves to the line that took the deleted line's place, keeping its column (an
+    /// uppercase mark, the jumplist, the change list, the Visual marks).
+    Keep,
+    /// The position moves to column 0 of the line before the deleted ones (another window's cursor).
+    Cursor,
+}
+
+/// How an anchor follows an edit: by byte with a [`Bias`] (decorations, a caret), or by line with a
+/// [`LineGravity`] (Vim marks, anchor-store §3.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Track {
+    Byte(Bias),
+    Line(LineGravity),
+}
+
 /// A generation-checked handle into the store (INV-HANDLE). A freed slot bumps its generation, so a
 /// stale `AnchorId` mismatches and is caught, never dereferenced to the wrong anchor.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -43,29 +68,119 @@ pub struct AnchorId {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Resolved {
     pub offset: BytePos,
-    /// True iff a span-delete collapsed this anchor and its policy was [`AnchorPolicy::Invalidate`].
+    /// True iff a span-delete collapsed this anchor and its policy was [`AnchorPolicy::Invalidate`], or
+    /// its line was deleted and it is a [`LineGravity::Drop`] line anchor.
     pub invalidated: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Anchor {
+    /// The offset LESS the shift pending at its rank ([`AnchorStore::shift`]); the absolute offset
+    /// while unranked.
     offset: usize,
-    bias: Bias,
+    track: Track,
     policy: AnchorPolicy,
     invalidated: bool,
+    /// Its index in [`AnchorStore::order`], or [`UNRANKED`] until the next normalize.
+    rank: u32,
 }
+
+const UNRANKED: u32 = u32::MAX;
 
 struct Slot {
     gen: u32,
     anchor: Option<Anchor>,
 }
 
+/// A Fenwick tree of pending shifts over anchor ranks: an edit adds its delta from the first rank past
+/// it on, in `O(log A)`, instead of rewriting every later anchor (anchor-store §4; #1122 measured the
+/// per-edit rebuild).
+#[derive(Default)]
+struct Shifts(Vec<isize>);
+
+impl Shifts {
+    fn reset(&mut self, n: usize) {
+        self.0.clear();
+        self.0.resize(n, 0);
+    }
+
+    /// Add `d` to every rank `>= r`.
+    fn add_from(&mut self, r: usize, d: isize) {
+        let mut i = r + 1;
+        while i <= self.0.len() {
+            self.0[i - 1] += d;
+            i += i.isolate_lowest_one();
+        }
+    }
+
+    /// The shift pending at rank `r`.
+    fn at(&self, r: usize) -> isize {
+        let mut i = r + 1;
+        let mut s = 0;
+        while i > 0 {
+            s += self.0[i - 1];
+            i -= i.isolate_lowest_one();
+        }
+        s
+    }
+}
+
 /// One authoritative per-document anchor store (anchor-store G1). Holds every cursor, selection edge,
 /// mark, diagnostic and decoration position; no subsystem keeps its own offset bookkeeping.
+///
+/// The store is kept offset-ordered (`order`, by rank) with a Fenwick tree of pending shifts, so an
+/// edit costs `O(log A)` plus the anchors on the lines it touches, not a pass over every anchor. An
+/// insert or remove only marks the order stale; the next edit re-sorts once (`O(A log A)`), so a batch
+/// of creations is paid for once.
 #[derive(Default)]
 pub struct AnchorStore {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    /// Live slot indices by rank, ascending by offset (valid while `!stale`).
+    order: Vec<u32>,
+    shift: Shifts,
+    /// An anchor was inserted or removed since the order was last built.
+    stale: bool,
+}
+
+/// The single-edit rule (anchor-store §3) for one anchor at `a`, in the frame the edit `[pos, pos+del)
+/// → ins` is expressed in: the deleted span collapses to `pos`, then the insertion is placed by bias,
+/// exactly as a delete followed by an insert (and as nvim moves an extmark). Returns the new offset and
+/// whether the anchor sat strictly inside the deleted span.
+fn map_one(a: usize, pos: usize, del: usize, ins: usize, bias: Bias) -> (usize, bool) {
+    let end = pos + del;
+    if a < pos {
+        (a, false)
+    } else if a > end {
+        (a - del + ins, false)
+    } else {
+        let inside = pos < a && a < end;
+        match bias {
+            Bias::Before => (pos, inside),
+            Bias::After => (pos + ins, inside),
+        }
+    }
+}
+
+/// The byte rule over a whole edit set for one anchor at `o`: the edits it reaches, in turn, each
+/// shifted into the frame the edits before it leave — the same answer as applying them one by one, also
+/// for touching edits (#758). Returns the new offset and whether it sat strictly inside a deleted span.
+fn map_byte_inside(es: &[Edit], o: usize, bias: Bias) -> (usize, bool) {
+    let i = es.partition_point(|e| e.end().0 < o);
+    let mut shift: isize = es[..i].iter().map(Edit::delta).sum();
+    let mut cur = (o as isize + shift) as usize;
+    let mut inside = false;
+    for e in &es[i..] {
+        let pos = (e.pos.0 as isize + shift) as usize;
+        if cur < pos {
+            break;
+        }
+        let (n, ins) = map_one(cur, pos, e.del, e.ins.len(), bias);
+        cur = n;
+        inside |= ins;
+        shift += e.delta();
+    }
+    (cur, inside)
 }
 
 impl AnchorStore {
@@ -75,14 +190,26 @@ impl AnchorStore {
         AnchorStore::default()
     }
 
-    /// Create an anchor at `offset` (bytes) with the given bias and span-delete policy.
-    pub fn insert(&mut self, offset: usize, bias: Bias, policy: AnchorPolicy) -> AnchorId {
+    /// Create a byte anchor at `offset` (bytes) with the given bias and span-delete policy.
+    pub fn insert(&mut self, offset: BytePos, bias: Bias, policy: AnchorPolicy) -> AnchorId {
+        self.insert_tracked(offset.0, Track::Byte(bias), policy)
+    }
+
+    /// Create a LINE anchor at `offset` (anchor-store §3.1): it follows line inserts and deletes, keeps
+    /// its column through an edit inside its line, and does `gravity` when its line is deleted.
+    pub fn insert_line(&mut self, offset: BytePos, gravity: LineGravity) -> AnchorId {
+        self.insert_tracked(offset.0, Track::Line(gravity), AnchorPolicy::Clamp)
+    }
+
+    fn insert_tracked(&mut self, offset: usize, track: Track, policy: AnchorPolicy) -> AnchorId {
         let anchor = Anchor {
             offset,
-            bias,
+            track,
             policy,
             invalidated: false,
+            rank: UNRANKED,
         };
+        self.stale = true;
         if let Some(slot) = self.free.pop() {
             let s = &mut self.slots[slot as usize];
             s.anchor = Some(anchor);
@@ -105,6 +232,7 @@ impl AnchorStore {
                 s.anchor = None;
                 s.gen = s.gen.wrapping_add(1);
                 self.free.push(id.slot);
+                self.stale = true;
                 true
             }
             _ => false,
@@ -115,6 +243,15 @@ impl AnchorStore {
         match self.slots.get(id.slot as usize) {
             Some(s) if s.gen == id.gen => s.anchor.as_ref(),
             _ => None,
+        }
+    }
+
+    /// The absolute offset of `a` (its stored offset plus the shift pending at its rank).
+    fn offset_of(&self, a: &Anchor) -> usize {
+        if a.rank == UNRANKED {
+            a.offset
+        } else {
+            (a.offset as isize + self.shift.at(a.rank as usize)) as usize
         }
     }
 
@@ -136,7 +273,7 @@ impl AnchorStore {
     #[must_use]
     pub fn try_resolve(&self, id: AnchorId) -> Option<Resolved> {
         self.get(id).map(|a| Resolved {
-            offset: BytePos(a.offset),
+            offset: BytePos(self.offset_of(a)),
             invalidated: a.invalidated,
         })
     }
@@ -144,95 +281,597 @@ impl AnchorStore {
     /// Number of live anchors.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.anchor.is_some()).count()
+        self.slots.len() - self.free.len()
     }
 
     /// Whether the store holds no live anchors.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(|s| s.anchor.is_none())
+        self.len() == 0
     }
 
     /// Every live anchor as `(id, resolved)`, ascending by offset — the material a snapshot freezes
     /// into its anchor index.
     #[must_use]
     pub fn resolved(&self) -> Vec<(AnchorId, Resolved)> {
-        let mut out: Vec<(AnchorId, Resolved)> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| {
-                s.anchor.map(|a| {
-                    (
-                        AnchorId {
-                            slot: i as u32,
-                            gen: s.gen,
-                        },
-                        Resolved {
-                            offset: BytePos(a.offset),
-                            invalidated: a.invalidated,
-                        },
-                    )
-                })
+        let entry = |i: usize| {
+            let s = &self.slots[i];
+            s.anchor.map(|a| {
+                (
+                    AnchorId {
+                        slot: i as u32,
+                        gen: s.gen,
+                    },
+                    Resolved {
+                        offset: BytePos(self.offset_of(&a)),
+                        invalidated: a.invalidated,
+                    },
+                )
             })
-            .collect();
-        out.sort_by_key(|(_, r)| r.offset.0);
-        out
+        };
+        if self.stale {
+            let mut out: Vec<_> = (0..self.slots.len()).filter_map(entry).collect();
+            out.sort_by_key(|(_, r)| r.offset.0);
+            out
+        } else {
+            self.order
+                .iter()
+                .filter_map(|&s| entry(s as usize))
+                .collect()
+        }
     }
 
-    /// Carry every live anchor across one transaction's whole disjoint edit set at once (anchor-store
-    /// §4). Cost is `O(A log A + E)` here (the store is sorted per apply rather than kept ordered) —
-    /// still off the `O(A × E)` the invariant forbids; keeping the store permanently offset-ordered is
-    /// the documented optimization.
-    pub fn apply_edits(&mut self, edits: &EditList) {
-        let es = edits.edits();
-        if es.is_empty() {
+    /// Check the store's structure against a text of `len` bytes and panic on the first broken rule
+    /// (#906): the free list names exactly the empty slots, every live anchor resolves inside the text,
+    /// and while the order is built it holds every live anchor once, ascending by offset, each at its
+    /// own rank. `O(A log A)`; for property and fuzz tests, not the edit path.
+    pub fn assert_invariants(&self, len: usize) {
+        let mut free = self.free.clone();
+        free.sort_unstable();
+        free.dedup();
+        assert_eq!(
+            free.len(),
+            self.free.len(),
+            "a slot is on the free list twice"
+        );
+        for &f in &free {
+            let s = self.slots.get(f as usize).expect("a free slot exists");
+            assert!(s.anchor.is_none(), "free slot {f} holds an anchor");
+        }
+        let empty = self.slots.iter().filter(|s| s.anchor.is_none()).count();
+        assert_eq!(
+            empty,
+            free.len(),
+            "an empty slot is missing from the free list"
+        );
+        for (i, s) in self.slots.iter().enumerate() {
+            if let Some(a) = &s.anchor {
+                let o = self.offset_of(a);
+                assert!(o <= len, "anchor in slot {i} at {o}, past the end {len}");
+            }
+        }
+        if self.stale {
             return;
         }
-        // Live slot indices, ascending by offset — the sweep visits anchors in this order.
-        let mut live: Vec<usize> = (0..self.slots.len())
-            .filter(|&i| self.slots[i].anchor.is_some())
-            .collect();
-        live.sort_by_key(|&i| self.slots[i].anchor.expect("live").offset);
-
-        let mut delta: isize = 0; // cumulative delta of all edits fully left of the current anchor
-        let mut ei = 0usize;
-        for si in live {
-            let a = self.slots[si].anchor.as_mut().expect("live");
-            let off = a.offset;
-            // Advance past edits that end strictly before this anchor; fold their delta into the carry.
-            while ei < es.len() && off > es[ei].end() {
-                delta += es[ei].delta();
-                ei += 1;
+        assert_eq!(
+            self.order.len(),
+            self.len(),
+            "the order misses a live anchor"
+        );
+        assert_eq!(self.shift.0.len(), self.order.len(), "shift tree size");
+        for (r, &slot) in self.order.iter().enumerate() {
+            let a = self.slots[slot as usize]
+                .anchor
+                .expect("an ordered slot is live");
+            assert_eq!(
+                a.rank as usize, r,
+                "slot {slot} ranked {} at rank {r}",
+                a.rank
+            );
+            if r > 0 {
+                assert!(
+                    self.at_rank(r - 1) <= self.at_rank(r),
+                    "anchor order inverted at rank {r}"
+                );
             }
-            let new_off = if ei < es.len() && es[ei].pos.0 <= off && off <= es[ei].end() {
-                let e = &es[ei];
-                let (pos, end, insn) = (e.pos.0, e.end(), e.ins.len());
-                let local = if off == pos {
-                    if a.bias == Bias::Before {
-                        pos
-                    } else {
-                        pos + insn
-                    }
-                } else if off == end {
-                    if a.bias == Bias::After {
-                        pos + insn
-                    } else {
-                        pos
-                    }
-                } else {
-                    // strictly inside a deleted span → collapse to the replacement start
-                    if a.policy == AnchorPolicy::Invalidate {
-                        a.invalidated = true;
-                    }
-                    pos
-                };
-                (local as isize + delta) as usize
-            } else {
-                // between edits: shift by the carried delta only
-                (off as isize + delta) as usize
+        }
+    }
+
+    /// Rebuild the order after inserts/removes: fold every pending shift in and sort once.
+    fn normalize(&mut self) {
+        let mut live: Vec<(usize, u32)> = Vec::with_capacity(self.len());
+        for i in 0..self.slots.len() {
+            if let Some(a) = self.slots[i].anchor {
+                live.push((self.offset_of(&a), i as u32));
+            }
+        }
+        live.sort_unstable();
+        self.order.clear();
+        for (r, &(off, slot)) in live.iter().enumerate() {
+            let a = self.slots[slot as usize].anchor.as_mut().expect("live");
+            a.offset = off;
+            a.rank = r as u32;
+            self.order.push(slot);
+        }
+        self.shift.reset(self.order.len());
+        self.stale = false;
+    }
+
+    /// The absolute offset of the anchor at rank `r`.
+    fn at_rank(&self, r: usize) -> usize {
+        let a = self.slots[self.order[r] as usize]
+            .anchor
+            .expect("ranked anchors are live");
+        (a.offset as isize + self.shift.at(r)) as usize
+    }
+
+    /// Carry every live anchor across one transaction's whole disjoint edit set (anchor-store §4). With
+    /// no text to read, a line anchor moves like an `After` byte anchor; [`AnchorStore::apply_change`]
+    /// gives it its line rule.
+    pub fn apply_edits(&mut self, edits: &EditList) {
+        self.apply(edits, None);
+    }
+
+    /// Carry every live anchor across one change: the byte anchors by the byte rule, the line anchors by
+    /// [`LineMap`] over the text before (`old`) and after (`new`) it. A [`LineGravity::Drop`] anchor whose
+    /// line was deleted stays resolvable at the edit, flagged `invalidated`.
+    pub fn apply_change(&mut self, old: &[u8], new: &[u8], edits: &EditList) {
+        self.apply(edits, Some(LineMap::new(old, new, edits)));
+    }
+
+    /// The edit cost is `O(log² A)` to find each touched region plus the anchors in it: the region is
+    /// the edits' lines (with one line either side, where a line anchor can land) or, without text, the
+    /// edits' closed spans. Regions go right to left, so the order is never searched across a region
+    /// already moved; each region's anchors are mapped from their old offsets, re-sorted among
+    /// themselves, and every rank past the region takes its delta from the Fenwick tree.
+    fn apply(&mut self, edits: &EditList, map: Option<LineMap<'_>>) {
+        let es = edits.edits();
+        if es.is_empty() || self.is_empty() {
+            return;
+        }
+        if self.stale {
+            self.normalize();
+        }
+        // The touched regions, in old offsets (inclusive), merged when they meet, with their delta.
+        let mut regions: Vec<(usize, usize, isize)> = Vec::new();
+        for e in es {
+            let (ws, we) = match &map {
+                Some(m) => {
+                    let ls = crate::pos::raw::line_start(m.old, e.pos.0);
+                    let ws = crate::pos::raw::line_start(m.old, ls.saturating_sub(1));
+                    let le = crate::pos::raw::line_end(m.old, e.end().0);
+                    (ws, crate::pos::raw::line_end(m.old, le + 1))
+                }
+                None => (e.pos.0, e.end().0),
             };
-            a.offset = new_off;
+            match regions.last_mut() {
+                Some(last) if ws <= last.1 => {
+                    last.1 = last.1.max(we);
+                    last.2 += e.delta();
+                }
+                _ => regions.push((ws, we, e.delta())),
+            }
+        }
+        // Every region's anchors are found and mapped first, from the order as it stands, so no search
+        // probes a rank a write has already moved.
+        let n = self.order.len();
+        let plan: Vec<(usize, usize, Vec<Moved>)> = regions
+            .iter()
+            .map(|&(ws, we, _)| {
+                let lo = partition(n, |r| self.at_rank(r) < ws);
+                let hi = lo + partition(n - lo, |r| self.at_rank(lo + r) <= we);
+                let mut moved: Vec<Moved> = (lo..hi)
+                    .map(|r| {
+                        let slot = self.order[r];
+                        let a = self.slots[slot as usize].anchor.expect("live");
+                        let (to, gone) = map_anchor(&a, self.at_rank(r), es, map.as_ref());
+                        (to, slot, gone)
+                    })
+                    .collect();
+                moved.sort_by_key(|m| m.0);
+                (lo, hi, moved)
+            })
+            .collect();
+        // Each region's anchors are stored LESS the deltas of the regions left of it (`left`), which
+        // the later steps add from their ranks on.
+        let mut left: isize = regions.iter().map(|r| r.2).sum();
+        for ((lo, hi, moved), &(_, _, delta)) in plan.iter().zip(&regions).rev() {
+            left -= delta;
+            for (i, &(to, slot, gone)) in moved.iter().enumerate() {
+                let r = lo + i;
+                self.order[r] = slot;
+                let pending = self.shift.at(r);
+                let a = self.slots[slot as usize].anchor.as_mut().expect("live");
+                a.rank = r as u32;
+                a.offset = (to as isize - left - pending) as usize;
+                a.invalidated |= gone;
+            }
+            self.shift.add_from(*hi, delta);
+        }
+        // Each region is sorted and the anchors between regions keep their order, so the order holds
+        // unless an anchor left its region. Only a line anchor on a moved block does (`:m`,
+        // [`LineMap::moved`], #1164): it goes where the block was inserted, which can be another
+        // region. Every offset is right either way; a crossed order is rebuilt at the next edit.
+        let inverted = |r: usize| r > 0 && r < n && self.at_rank(r - 1) > self.at_rank(r);
+        if plan.iter().any(|&(lo, hi, _)| inverted(lo) || inverted(hi)) {
+            debug_assert!(map.is_some(), "only a line anchor leaves its region");
+            self.stale = true;
+        }
+    }
+}
+
+/// Where the anchor `a`, now at `o`, goes through the edits `es` (by line when there is a text map,
+/// else by byte), and whether that loses it: its line was dropped, or it is an `Invalidate` anchor a
+/// deleted span swallowed.
+fn map_anchor(a: &Anchor, o: usize, es: &[Edit], map: Option<&LineMap<'_>>) -> (usize, bool) {
+    match (a.track, map) {
+        (Track::Line(g), Some(m)) => match m.map_offset(o, g) {
+            Some(p) => (p, false),
+            None => (
+                m.map_offset(o, LineGravity::Keep)
+                    .expect("Keep never drops"),
+                true,
+            ),
+        },
+        (Track::Line(_), None) => (map_byte_inside(es, o, Bias::After).0, false),
+        (Track::Byte(bias), _) => {
+            let (p, inside) = map_byte_inside(es, o, bias);
+            (p, inside && a.policy == AnchorPolicy::Invalidate)
+        }
+    }
+}
+
+/// One anchor of a touched region after an edit: its new offset, its slot, and whether the edit lost it.
+type Moved = (usize, u32, bool);
+
+/// The count of leading `r` in `0..n` with `pred(r)` (a monotone predicate).
+fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Where one byte anchor at `o` goes through `edits` — the store's rule for a single position, for a
+/// caller holding one outside the store. `O(log E)` plus the edits touching `o`.
+#[must_use]
+pub fn map_byte(edits: &EditList, o: BytePos, bias: Bias) -> BytePos {
+    BytePos(map_byte_inside(edits.edits(), o.0, bias).0)
+}
+
+/// A position a [`crate::Document`] carries through its changes for an owner that keeps it outside the
+/// store (a View's marks, #686): `pos` is updated in place by each change, `None` once a
+/// [`LineGravity::Drop`] line was deleted (or before it was ever set). `restore` = an undo puts it back
+/// where it was when the undone change began, as Vim's `u_undoredo` restores the lowercase and Visual
+/// marks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tracked {
+    pub pos: Option<BytePos>,
+    pub track: Track,
+    pub restore: bool,
+}
+
+impl Tracked {
+    /// A position followed by line (a Vim mark) that undo does not restore.
+    #[must_use]
+    pub fn line(pos: Option<BytePos>, gravity: LineGravity) -> Tracked {
+        Tracked {
+            pos,
+            track: Track::Line(gravity),
+            restore: false,
+        }
+    }
+
+    /// Mark this position as one undo restores.
+    #[must_use]
+    pub fn restored(mut self) -> Tracked {
+        self.restore = true;
+        self
+    }
+
+    /// Carry this position through one change.
+    pub fn apply(&mut self, edits: &EditList, map: &LineMap<'_>) {
+        self.pos = self.pos.and_then(|p| match self.track {
+            Track::Byte(bias) => Some(BytePos(crate::motion::snap(
+                map.new,
+                map_byte_inside(edits.edits(), p.0, bias).0,
+            ))),
+            Track::Line(g) => map.map(p, g),
+        });
+    }
+}
+
+/// The line-anchor rule (anchor-store §3.1): where a position on a line goes when one transaction's
+/// edits apply, as nvim's `mark_adjust` moves a mark. A position is `(line, column)`:
+///
+/// - an edit inside its line, or one that starts in its line and splits it or joins the next line on,
+///   leaves the column alone (clamped into the line);
+/// - whole lines inserted or deleted before it shift its line; a deleted line takes the position with it
+///   ([`LineGravity`]); a replaced block keeps it on the line of the same index while one is left;
+/// - a join running into its line from above (its line's `\n` and the next line's indent replaced by
+///   blanks) moves it with the text after the join, or to the join's end if it sat in the removed indent;
+///   a charwise delete across lines puts it on the joined line at its old column plus the kept head's
+///   length, as nvim's `do_join(insert_space = false)` does after `op_delete`; any other edit running in
+///   from above moves it with the text after the edit, or to the edit's end;
+/// - a block of whole lines deleted where the same lines are inserted elsewhere in the change (`:m`) takes
+///   it along to the line of the same index there.
+///
+/// A whole-line edit is one whose span starts and ends at line starts (`dd`, `O`, `:put`), or one that
+/// starts at a line's `\n` and ends at one (`dd` of the last line, `o`): with no other clue, the first
+/// reading wins. The lines a position is read on are found once per change and remembered
+/// ([`Lines`]), so the cost per position is `O(log E + log L)` for `L` lines seen, plus one scan of each
+/// line the first time a position on it asks (and, for a deleted block, a scan of the change's edits for
+/// its moved copy). Before #1237 each position scanned its line, so many marks on one long line cost
+/// O(line × positions) per edit.
+pub struct LineMap<'a> {
+    pub(crate) old: &'a [u8],
+    pub(crate) new: &'a [u8],
+    edits: &'a [Edit],
+    /// `prefix[i]` = the summed delta of `edits[..i]`.
+    prefix: Vec<isize>,
+    /// The lines of `old` and of `new` found so far.
+    old_lines: Lines,
+    new_lines: Lines,
+}
+
+/// The lines of one text found so far, as `(start, end)` (`end` the line's `\n` or the text's end),
+/// disjoint and sorted. A line is scanned for once; every later lookup of a position on it is a binary
+/// search (#1237).
+#[derive(Default)]
+struct Lines(std::cell::RefCell<Vec<(usize, usize)>>);
+
+impl Lines {
+    /// The line holding `p` (clamped to `text`) as `(start, end)`, the same as
+    /// `(pos::raw::line_start(text, p), pos::raw::line_end(text, p))`.
+    fn of(&self, text: &[u8], p: usize) -> (usize, usize) {
+        let p = p.min(text.len());
+        let mut lines = self.0.borrow_mut();
+        let i = lines.partition_point(|&(s, _)| s <= p);
+        if let Some(&(s, e)) = i.checked_sub(1).and_then(|j| lines.get(j)) {
+            if p <= e {
+                return (s, e);
+            }
+        }
+        let line = (
+            crate::pos::raw::line_start(text, p),
+            crate::pos::raw::line_end(text, p),
+        );
+        lines.insert(i, line);
+        line
+    }
+}
+
+impl<'a> LineMap<'a> {
+    /// The map for `edits` (disjoint, sorted) turning `old` into `new`.
+    #[must_use]
+    pub fn new(old: &'a [u8], new: &'a [u8], edits: &'a EditList) -> LineMap<'a> {
+        let edits = edits.edits();
+        let mut prefix = Vec::with_capacity(edits.len() + 1);
+        let mut sum = 0isize;
+        prefix.push(0);
+        for e in edits {
+            sum += e.delta();
+            prefix.push(sum);
+        }
+        LineMap {
+            old,
+            new,
+            edits,
+            prefix,
+            old_lines: Lines::default(),
+            new_lines: Lines::default(),
+        }
+    }
+
+    fn line_start_at(&self, p: usize) -> bool {
+        p == 0 || self.old.get(p - 1) == Some(&b'\n')
+    }
+
+    /// The edit's span starts and ends at line starts and it inserts whole lines (`dd`, `O`).
+    fn start_aligned(&self, e: &Edit) -> bool {
+        self.line_start_at(e.pos.0)
+            && self.line_start_at(e.end().0)
+            && (e.ins.is_empty() || e.ins.ends_with(b"\n"))
+    }
+
+    /// The edit's span starts at a line's `\n` and ends at one or the buffer end, and it inserts
+    /// newline-led lines (`dd` of the last line, `o`).
+    fn end_aligned(&self, e: &Edit) -> bool {
+        self.old.get(e.pos.0) == Some(&b'\n')
+            && (e.end().0 == self.old.len() || self.old.get(e.end().0) == Some(&b'\n'))
+            && (e.ins.is_empty() || e.ins.starts_with(b"\n"))
+    }
+
+    /// The new-text offset of column `col` on the line starting at `ls` (clamped onto the line).
+    fn at_col(&self, ls: usize, col: usize) -> usize {
+        let ls = ls.min(self.new.len());
+        let le = self.new_lines.of(self.new, ls).1;
+        ls + col.min(le - ls)
+    }
+
+    /// The start of the new-text line holding `p`; the slot after a final newline is no line, so it
+    /// reads as the last line.
+    fn new_line_start(&self, p: usize) -> usize {
+        let mut p = p.min(self.new.len());
+        if p == self.new.len() && p > 0 && self.new[p - 1] == b'\n' {
+            p -= 1;
+        }
+        self.new_lines.of(self.new, p).0
+    }
+
+    /// Where the position at `o` (an old-text offset) goes, or `None` when its line was deleted and
+    /// `gravity` is [`LineGravity::Drop`]. Always a char boundary of the new text.
+    #[must_use]
+    pub fn map(&self, o: BytePos, gravity: LineGravity) -> Option<BytePos> {
+        self.map_offset(o.0, gravity).map(BytePos)
+    }
+
+    /// [`LineMap::map`] over a bare offset, for the store's own sweep.
+    fn map_offset(&self, o: usize, gravity: LineGravity) -> Option<usize> {
+        let o = o.min(self.old.len());
+        let (ls, le) = self.old_lines.of(self.old, o);
+        let col = o - ls;
+        let mut i = self.edits.partition_point(|e| e.end().0 < ls);
+        let mut delta = self.prefix[i];
+        let mut out = None;
+        while let Some(e) = self.edits.get(i) {
+            if e.pos.0 > ls {
+                break;
+            }
+            let base = (e.pos.0 as isize + delta) as usize;
+            if e.end().0 == ls && e.pos.0 < ls && (self.start_aligned(e) || !self.end_aligned(e)) {
+                // Ends at this line's start: lines above it went or a join reached up to it.
+                delta += e.delta();
+                i += 1;
+                continue;
+            }
+            if e.del == 0 && e.pos.0 == ls && e.ins.ends_with(b"\n") {
+                // Whole lines inserted above this one.
+                delta += e.delta();
+                i += 1;
+                continue;
+            }
+            if self.start_aligned(e) && ls < e.end().0 {
+                // This line is one of a replaced block of whole lines, or of a block moved elsewhere.
+                let j = crate::pos::count_newlines(&self.old[e.pos.0..ls]);
+                out = Some(match self.moved(e, j, col, false) {
+                    Some(to) => Some(to),
+                    None => self.replaced(e, base, j, col, gravity, false),
+                });
+            } else if e.pos.0 < ls && self.end_aligned(e) {
+                // This line is one of the lines after the edit's `\n` it replaces.
+                let j = crate::pos::count_newlines(&self.old[e.pos.0 + 1..ls]);
+                out = Some(match self.moved(e, j, col, true) {
+                    Some(to) => Some(to),
+                    None => self.replaced(e, base, j, col, gravity, true),
+                });
+            } else if e.pos.0 < ls {
+                // A charwise edit runs into this line from above.
+                out = Some(if e.end().0 > le {
+                    match gravity {
+                        LineGravity::Drop => None,
+                        LineGravity::Keep => Some(base + e.ins.len()),
+                        LineGravity::Cursor => Some(self.new_lines.of(self.new, base).0),
+                    }
+                } else if e.ins.is_empty() && !self.is_join(e) {
+                    // A charwise delete across lines (#1125): nvim's `op_delete` cuts both ends without
+                    // moving marks, then joins with no space, which adds the kept head's length. The
+                    // head is measured in the new text: an earlier edit of this change on the head's
+                    // line (#1148) can have shortened or split it.
+                    let start = self.new_lines.of(self.new, base).0;
+                    Some(self.at_col(start, base - start + col))
+                } else if o >= e.end().0 {
+                    Some((o as isize + delta + e.delta()) as usize)
+                } else {
+                    Some(base + e.ins.len())
+                });
+            }
+            break;
+        }
+        let new = match out {
+            Some(r) => r?,
+            None => self.at_col((ls as isize + delta) as usize, col),
+        };
+        Some(crate::motion::snap(self.new, new))
+    }
+
+    /// Whether the charwise `e` is a join: it starts at its line's `\n`, removes only blanks after it on
+    /// the next line, and puts only blanks there (`J` / `gJ`), so marks after it follow the text.
+    fn is_join(&self, e: &Edit) -> bool {
+        let blank = |c: &u8| *c == b' ' || *c == b'\t';
+        self.old.get(e.pos.0) == Some(&b'\n')
+            && self.old[e.pos.0 + 1..e.end().0].iter().all(blank)
+            && e.ins.iter().all(blank)
+    }
+
+    /// Line `j` (column `col`) of the whole-line block the pure delete `e` removes, when the same change
+    /// inserts those very lines as whole lines elsewhere (`:m`, #1125): the line of the same index in that
+    /// insert. `lead`: `e` removes the lines after a `\n` (an end-aligned delete) rather than lines ending
+    /// in one. `None` when `e` inserts text or no edit carries its lines.
+    fn moved(&self, e: &Edit, j: usize, col: usize, lead: bool) -> Option<usize> {
+        if !e.ins.is_empty() {
+            return None;
+        }
+        let gone = &self.old[e.pos.0 + usize::from(lead)..e.end().0];
+        let gone = if lead {
+            gone
+        } else {
+            gone.strip_suffix(b"\n")?
+        };
+        for (k, f) in self.edits.iter().enumerate() {
+            if f.del != 0 || f.pos.0 == e.pos.0 {
+                continue;
+            }
+            // The inserted lines and where the first starts: lines ending in `\n` at a line start, or
+            // lines each after a `\n` at a line's end.
+            let (body, first) = if self.line_start_at(f.pos.0) && f.ins.ends_with(b"\n") {
+                (&f.ins[..f.ins.len() - 1], 0)
+            } else if f.ins.starts_with(b"\n")
+                && (f.pos.0 == self.old.len() || self.old[f.pos.0] == b'\n')
+            {
+                (&f.ins[1..], 1)
+            } else {
+                continue;
+            };
+            if body != gone {
+                continue;
+            }
+            let at = (f.pos.0 as isize + self.prefix[k]) as usize + first;
+            let start: usize = body
+                .split(|&c| c == b'\n')
+                .take(j)
+                .map(|l| l.len() + 1)
+                .sum();
+            return Some(self.at_col(at + start, col));
+        }
+        None
+    }
+
+    /// Line `j` of the whole-line block `e` replaces (at `base` in the new text): the line of the same
+    /// index in the inserted text while there is one, else `gravity`. `lead` = the inserted lines each
+    /// follow a `\n` (an end-aligned edit) rather than end with one.
+    fn replaced(
+        &self,
+        e: &Edit,
+        base: usize,
+        j: usize,
+        col: usize,
+        gravity: LineGravity,
+        lead: bool,
+    ) -> Option<usize> {
+        // The start offsets (in `e.ins`) of the inserted lines.
+        let mut starts: Vec<usize> = Vec::new();
+        if !lead && !e.ins.is_empty() {
+            starts.push(0);
+        }
+        for (k, &b) in e.ins.iter().enumerate() {
+            if b == b'\n' && (lead || k + 1 < e.ins.len()) {
+                starts.push(k + 1);
+            }
+        }
+        if let Some(&s) = starts.get(j) {
+            return Some(self.at_col(base + s, col));
+        }
+        match gravity {
+            LineGravity::Drop => None,
+            // The line after the block; past the buffer end, the last line.
+            LineGravity::Keep => {
+                let after = base + e.ins.len() + usize::from(lead && e.end().0 < self.old.len());
+                Some(self.at_col(self.new_line_start(after), col))
+            }
+            // Column 0 of the line before the deleted ones: the block's last line, else the one above.
+            LineGravity::Cursor => Some(match starts.last() {
+                Some(&s) => base + s,
+                None if lead => crate::pos::raw::line_start(self.new, base),
+                None if base == 0 => 0,
+                None => crate::pos::raw::line_start(self.new, base - 1),
+            }),
         }
     }
 }
@@ -250,9 +889,9 @@ mod tests {
     fn bias_truth_table_at_insertion_point() {
         // Two anchors sharing offset 3; an insertion of 2 bytes lands exactly at 3.
         let mut store = AnchorStore::new();
-        let before = store.insert(3, Bias::Before, AnchorPolicy::Clamp);
-        let after = store.insert(3, Bias::After, AnchorPolicy::Clamp);
-        let edits = EditList::new(vec![Edit::insert(3, b"XY".to_vec())]).unwrap();
+        let before = store.insert(BytePos(3), Bias::Before, AnchorPolicy::Clamp);
+        let after = store.insert(BytePos(3), Bias::After, AnchorPolicy::Clamp);
+        let edits = EditList::new(vec![Edit::insert(BytePos(3), b"XY".to_vec())]).unwrap();
         store.apply_edits(&edits);
         // Before clings left (unchanged); After clings right (advances past the inserted bytes).
         assert_eq!(at(&store, before), 3, "Before bias must not grow");
@@ -266,22 +905,22 @@ mod tests {
     #[test]
     fn anchor_shifts_when_edit_is_left_of_it() {
         let mut store = AnchorStore::new();
-        let a = store.insert(10, Bias::After, AnchorPolicy::Clamp);
+        let a = store.insert(BytePos(10), Bias::After, AnchorPolicy::Clamp);
         // insert 3 bytes at 2 (wholly left) → anchor shifts by +3.
-        store.apply_edits(&EditList::new(vec![Edit::insert(2, b"abc".to_vec())]).unwrap());
+        store.apply_edits(&EditList::new(vec![Edit::insert(BytePos(2), b"abc".to_vec())]).unwrap());
         assert_eq!(at(&store, a), 13);
         // delete 4 bytes at 0 (wholly left) → shifts by -4.
-        store.apply_edits(&EditList::new(vec![Edit::delete(0, 4)]).unwrap());
+        store.apply_edits(&EditList::new(vec![Edit::delete(BytePos(0), 4)]).unwrap());
         assert_eq!(at(&store, a), 9);
     }
 
     #[test]
     fn span_delete_clamp_vs_invalidate() {
         let mut store = AnchorStore::new();
-        let clamp = store.insert(4, Bias::After, AnchorPolicy::Clamp);
-        let inval = store.insert(4, Bias::After, AnchorPolicy::Invalidate);
+        let clamp = store.insert(BytePos(4), Bias::After, AnchorPolicy::Clamp);
+        let inval = store.insert(BytePos(4), Bias::After, AnchorPolicy::Invalidate);
         // delete [2,6): both anchors sit strictly inside the deleted span → collapse to pos=2.
-        store.apply_edits(&EditList::new(vec![Edit::delete(2, 4)]).unwrap());
+        store.apply_edits(&EditList::new(vec![Edit::delete(BytePos(2), 4)]).unwrap());
         let rc = store.resolve(clamp);
         let ri = store.resolve(inval);
         assert_eq!(rc.offset.0, 2);
@@ -294,10 +933,10 @@ mod tests {
     fn boundary_at_end_of_deleted_span() {
         // anchor at pos+del (the right edge of a deletion): After -> collapse start, Before -> start.
         let mut store = AnchorStore::new();
-        let a_after = store.insert(6, Bias::After, AnchorPolicy::Clamp);
-        let a_before = store.insert(6, Bias::Before, AnchorPolicy::Clamp);
+        let a_after = store.insert(BytePos(6), Bias::After, AnchorPolicy::Clamp);
+        let a_before = store.insert(BytePos(6), Bias::Before, AnchorPolicy::Clamp);
         // delete [2,6), no insertion: pos=2, end=6, insn=0.
-        store.apply_edits(&EditList::new(vec![Edit::delete(2, 4)]).unwrap());
+        store.apply_edits(&EditList::new(vec![Edit::delete(BytePos(2), 4)]).unwrap());
         assert_eq!(
             at(&store, a_after),
             2,
@@ -314,25 +953,8 @@ mod tests {
 
     /// The single-edit rule (§3) in one coordinate frame; the reference for the batched sweep.
     fn map1(off: usize, e: &Edit, bias: Bias, policy: AnchorPolicy) -> (usize, bool) {
-        let (pos, end, insn, delta) = (e.pos.0, e.end(), e.ins.len(), e.delta());
-        if off < pos {
-            (off, false)
-        } else if off > end {
-            ((off as isize + delta) as usize, false)
-        } else if off == pos {
-            (
-                if bias == Bias::Before {
-                    pos
-                } else {
-                    pos + insn
-                },
-                false,
-            )
-        } else if off == end {
-            (if bias == Bias::After { pos + insn } else { pos }, false)
-        } else {
-            (pos, policy == AnchorPolicy::Invalidate)
-        }
+        let (n, inside) = map_one(off, e.pos.0, e.del, e.ins.len(), bias);
+        (n, inside && policy == AnchorPolicy::Invalidate)
     }
 
     /// Fold an anchor through a disjoint edit set left-to-right, shifting each edit into the frame left
@@ -363,14 +985,14 @@ mod tests {
     fn batch_equals_sequential_fixed_cases() {
         // three disjoint edits; an anchor between the second and third.
         let edits = vec![
-            Edit::insert(1, b"AA".to_vec()),
-            Edit::delete(5, 2),
-            Edit::replace(9, 1, b"ZZZ".to_vec()),
+            Edit::insert(BytePos(1), b"AA".to_vec()),
+            Edit::delete(BytePos(5), 2),
+            Edit::replace(BytePos(9), 1, b"ZZZ".to_vec()),
         ];
         for &off in &[0usize, 1, 3, 5, 7, 9, 10, 12] {
             for bias in [Bias::Before, Bias::After] {
                 let mut store = AnchorStore::new();
-                let id = store.insert(off, bias, AnchorPolicy::Clamp);
+                let id = store.insert(BytePos(off), bias, AnchorPolicy::Clamp);
                 store.apply_edits(&EditList::new(edits.clone()).unwrap());
                 let got = at(&store, id);
                 let (want, _) = sequential(
@@ -413,7 +1035,9 @@ mod tests {
                         ins,
                     });
                 }
-                cursor += del + 1 + (rng() % 3); // advance past the interval + a gap
+                // Advance past the interval, often with no gap at all: a delete ending where the next edit
+                // starts is the touching case the sweep must compose (#758).
+                cursor += del + (rng() % 3) + usize::from(del == 0);
             }
             let Ok(list) = EditList::new(edits.clone()) else {
                 continue;
@@ -431,7 +1055,7 @@ mod tests {
                     AnchorPolicy::Invalidate
                 };
                 let mut store = AnchorStore::new();
-                let id = store.insert(off, bias, policy);
+                let id = store.insert(BytePos(off), bias, policy);
                 store.apply_edits(&list);
                 let got = store.resolve(id);
                 let (want_off, want_inv) = sequential(off, bias, policy, list.edits());
@@ -449,12 +1073,310 @@ mod tests {
     #[test]
     fn stale_id_is_not_resolvable() {
         let mut store = AnchorStore::new();
-        let id = store.insert(1, Bias::After, AnchorPolicy::Clamp);
+        let id = store.insert(BytePos(1), Bias::After, AnchorPolicy::Clamp);
         assert!(store.remove(id));
         assert!(
             store.try_resolve(id).is_none(),
             "freed id must not resolve (INV-HANDLE)"
         );
         assert!(!store.contains(id));
+    }
+
+    #[test]
+    fn touching_edits_compose_like_sequential() {
+        // #758: `[del 2..4, ins@4]` and `[replace 2..4, ins@4]`, anchor at 4 with After bias.
+        for (edits, want) in [
+            (
+                vec![
+                    Edit::delete(BytePos(2), 2),
+                    Edit::insert(BytePos(4), b"Z".to_vec()),
+                ],
+                3,
+            ),
+            (
+                vec![
+                    Edit::replace(BytePos(2), 2, b"Q".to_vec()),
+                    Edit::insert(BytePos(4), b"Z".to_vec()),
+                ],
+                4,
+            ),
+        ] {
+            let list = EditList::new(edits).unwrap();
+            let mut store = AnchorStore::new();
+            let id = store.insert(BytePos(4), Bias::After, AnchorPolicy::Clamp);
+            store.apply_edits(&list);
+            let (seq, _) = sequential(4, Bias::After, AnchorPolicy::Clamp, list.edits());
+            assert_eq!(at(&store, id), seq);
+            assert_eq!(at(&store, id), want);
+        }
+    }
+
+    #[test]
+    fn a_replacement_keeps_each_bias_in_order() {
+        // #941: replace [2,6) with 3 bytes. Inside anchors take their bias at the insertion, as nvim moves
+        // an extmark (delete, then insert), so no same-bias pair inverts.
+        let list = EditList::new(vec![Edit::replace(BytePos(2), 4, b"XYZ".to_vec())]).unwrap();
+        let mut store = AnchorStore::new();
+        let ids: Vec<(usize, Bias, AnchorId)> = [1usize, 2, 3, 5, 6, 7]
+            .iter()
+            .flat_map(|&o| [Bias::Before, Bias::After].map(|b| (o, b)))
+            .map(|(o, b)| (o, b, store.insert(BytePos(o), b, AnchorPolicy::Clamp)))
+            .collect();
+        store.apply_edits(&list);
+        // nvim 0.12.6 `nvim_buf_set_text(0, 0, 2, 0, 6, {"XYZ"})` over extmarks at these columns:
+        // (column, Before lands, After lands).
+        let want = [
+            (1, 1, 1),
+            (2, 2, 5),
+            (3, 2, 5),
+            (5, 2, 5),
+            (6, 2, 5),
+            (7, 6, 6),
+        ];
+        for (o, before, after) in want {
+            let find = |b| {
+                let &(_, _, id) = ids.iter().find(|g| g.0 == o && g.1 == b).unwrap();
+                at(&store, id)
+            };
+            assert_eq!(find(Bias::Before), before, "{o} Before");
+            assert_eq!(find(Bias::After), after, "{o} After");
+        }
+    }
+
+    // --- line anchors (anchor-store §3.1, nvim `mark_adjust`) ---
+
+    /// Apply `edits` to `old` and map `o` with `g`.
+    fn line(old: &str, edits: Vec<Edit>, o: usize, g: LineGravity) -> Option<usize> {
+        let list = EditList::new(edits).unwrap();
+        let new = list.apply_to(old.as_bytes());
+        LineMap::new(old.as_bytes(), &new, &list)
+            .map(BytePos(o), g)
+            .map(|p| p.0)
+    }
+
+    #[test]
+    fn a_line_anchor_keeps_its_column_through_an_edit_in_its_line() {
+        // nvim: `5|ma0x`a` lands on col 4 again (the mark did not move left).
+        assert_eq!(
+            line(
+                "abcdefgh\n",
+                vec![Edit::delete(BytePos(0), 1)],
+                4,
+                LineGravity::Drop
+            ),
+            Some(4)
+        );
+        // `0iZZ<Esc>`: the column stays 4 too.
+        let ins = vec![Edit::insert(BytePos(0), b"ZZ".to_vec())];
+        assert_eq!(line("abcdefgh\n", ins, 4, LineGravity::Drop), Some(4));
+        // A column past the shortened line clamps onto its end.
+        let del = vec![Edit::delete(BytePos(0), 5)];
+        assert_eq!(line("abcdefgh\nx\n", del, 7, LineGravity::Drop), Some(3));
+    }
+
+    #[test]
+    fn a_line_anchor_follows_whole_lines_inserted_or_deleted_above() {
+        // `O` above line 2: "x\n" at 2 moves the mark on `b` (2) to 4.
+        let o = vec![Edit::insert(BytePos(2), b"x\n".to_vec())];
+        assert_eq!(line("a\nb\n", o, 2, LineGravity::Drop), Some(4));
+        // `dd` of line 1 moves the mark on line 3 up a line, column kept.
+        let dd = vec![Edit::delete(BytePos(0), 2)];
+        assert_eq!(line("a\nb\ncde\n", dd, 6, LineGravity::Drop), Some(4));
+        // An edit after the line leaves it.
+        let after = vec![Edit::delete(BytePos(4), 2)];
+        assert_eq!(line("a\nb\ncde\n", after, 2, LineGravity::Drop), Some(2));
+    }
+
+    #[test]
+    fn a_deleted_line_drops_keeps_or_moves_the_cursor() {
+        let text = "a\nbcd\ne\n";
+        let dd = || vec![Edit::delete(BytePos(2), 4)];
+        assert_eq!(line(text, dd(), 4, LineGravity::Drop), None);
+        // Keep: the line that took its place, column kept, clamped onto the line's end (`e\n`: 3).
+        assert_eq!(line(text, dd(), 4, LineGravity::Keep), Some(3));
+        // Cursor: column 0 of the line above.
+        assert_eq!(line(text, dd(), 4, LineGravity::Cursor), Some(0));
+        // The last line deleted through its leading `\n` ("a\nb" minus "\nb"): Keep lands on the new last
+        // line, Cursor on column 0 of it.
+        let last = || vec![Edit::delete(BytePos(1), 2)];
+        assert_eq!(line("a\nb", last(), 2, LineGravity::Drop), None);
+        assert_eq!(line("a\nb", last(), 2, LineGravity::Keep), Some(0));
+        assert_eq!(line("a\nb", last(), 2, LineGravity::Cursor), Some(0));
+    }
+
+    #[test]
+    fn a_replaced_block_keeps_marks_on_the_lines_left() {
+        // `:2,3!` filtering two lines into one: line 2's mark stays, line 3's is dropped.
+        let f = || vec![Edit::replace(BytePos(2), 6, b"XY\n".to_vec())];
+        let text = "a\nbbb\nc\nd\n";
+        assert_eq!(line(text, f(), 3, LineGravity::Drop), Some(3));
+        assert_eq!(line(text, f(), 6, LineGravity::Drop), None);
+        assert_eq!(line(text, f(), 6, LineGravity::Keep), Some(5));
+        assert_eq!(line(text, f(), 8, LineGravity::Drop), Some(5));
+    }
+
+    #[test]
+    fn a_join_moves_the_next_lines_marks_onto_the_joined_line() {
+        // `J` on "aa\n  bbbb": "\n  " becomes " ". nvim moves the mark at col 2 (`b`) to col 3.
+        let j = || vec![Edit::replace(BytePos(2), 3, b" ".to_vec())];
+        assert_eq!(line("aa\n  bbbb", j(), 5, LineGravity::Drop), Some(3));
+        // In the removed indent: onto the first joined char.
+        assert_eq!(line("aa\n  bbbb", j(), 4, LineGravity::Drop), Some(3));
+        // The first line's marks stay.
+        assert_eq!(line("aa\n  bbbb", j(), 1, LineGravity::Drop), Some(1));
+    }
+
+    #[test]
+    fn a_charwise_delete_across_lines_adds_the_kept_head() {
+        // nvim `d/i` from `f` of "abcdef\nghijklmnop": the mark on `l` (col 5) goes to col 5 + 5 = 10.
+        let d = || vec![Edit::delete(BytePos(5), 4)];
+        let text = "abcdef\nghijklmnop\n";
+        assert_eq!(line(text, d(), 12, LineGravity::Drop), Some(10));
+        // In the deleted part of the last line: col 1 + 5.
+        assert_eq!(line(text, d(), 8, LineGravity::Drop), Some(6));
+        // Past the joined line's end: clamped onto it.
+        let long = vec![Edit::delete(BytePos(1), 8)];
+        assert_eq!(line(text, long, 15, LineGravity::Drop), Some(9));
+        // An earlier edit of the same change shortens the kept head (#1148): the head is the 3 bytes
+        // "bcd" left of the cut in the new text, so `l` lands at col 5 + 3, not past an underflow.
+        let two = vec![Edit::delete(BytePos(0), 1), Edit::delete(BytePos(4), 5)];
+        assert_eq!(line(text, two, 12, LineGravity::Drop), Some(8));
+    }
+
+    #[test]
+    fn a_moved_block_takes_its_marks_along() {
+        // `:2m3` as the block deleted and inserted after line 3: the mark on `b` follows it.
+        let m = || {
+            vec![
+                Edit::delete(BytePos(2), 2),
+                Edit::insert(BytePos(6), b"b\n".to_vec()),
+            ]
+        };
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(line(text, m(), 2, LineGravity::Drop), Some(4));
+        // The line it passed moves up; the lines around stay.
+        assert_eq!(line(text, m(), 4, LineGravity::Drop), Some(2));
+        assert_eq!(line(text, m(), 6, LineGravity::Drop), Some(6));
+        // Upward: `:3m0`.
+        let up = || {
+            vec![
+                Edit::insert(BytePos(0), b"c\n".to_vec()),
+                Edit::delete(BytePos(4), 2),
+            ]
+        };
+        assert_eq!(line(text, up(), 4, LineGravity::Drop), Some(0));
+        assert_eq!(line(text, up(), 0, LineGravity::Drop), Some(2));
+        // A plain delete still drops.
+        assert_eq!(
+            line(
+                text,
+                vec![Edit::delete(BytePos(2), 2)],
+                2,
+                LineGravity::Drop
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn opening_a_line_below_leaves_the_line_above() {
+        // `o` as "\nx" at the end of an EMPTY line: the mark on it stays (an end-aligned insert).
+        let o = vec![Edit::insert(BytePos(2), b"\nx".to_vec())];
+        assert_eq!(line("a\n\nb\n", o, 2, LineGravity::Drop), Some(2));
+        // Splitting a line keeps its marks on the first half, clamped (nvim `i<CR>`).
+        let split = vec![Edit::insert(BytePos(2), b"\n".to_vec())];
+        assert_eq!(line("abcdefgh\n", split, 5, LineGravity::Drop), Some(2));
+    }
+
+    #[test]
+    fn line_anchors_in_the_store() {
+        let old = b"a\nb\nc\n".to_vec();
+        let list = EditList::new(vec![Edit::delete(BytePos(2), 2)]).unwrap();
+        let new = list.apply_to(&old);
+        let mut store = AnchorStore::new();
+        let drop = store.insert_line(BytePos(2), LineGravity::Drop);
+        let keep = store.insert_line(BytePos(2), LineGravity::Keep);
+        let below = store.insert_line(BytePos(4), LineGravity::Drop);
+        store.apply_change(&old, &new, &list);
+        assert!(store.resolve(drop).invalidated);
+        assert_eq!(store.resolve(keep).offset.0, 2);
+        assert!(!store.resolve(keep).invalidated);
+        assert_eq!(store.resolve(below).offset.0, 2);
+    }
+
+    #[test]
+    fn a_line_anchor_on_a_moved_line_may_pass_other_anchors() {
+        // #1164 (the property's shrunk case): deleting the last, empty line and inserting an empty line
+        // at the top reads as moving that line (`:m0`), so the mark on it goes to the top, past the
+        // byte anchor at 1. The order must be rebuilt, not left inverted.
+        let old = b"aaaaa\na\n\n\n".to_vec();
+        let list = EditList::new(vec![
+            Edit::delete(BytePos(9), 1),
+            Edit::insert(BytePos(0), b"\n".to_vec()),
+        ])
+        .unwrap();
+        let new = list.apply_to(&old);
+        let mut store = AnchorStore::new();
+        let mark = store.insert_line(BytePos(9), LineGravity::Drop);
+        let byte = store.insert(BytePos(1), Bias::Before, AnchorPolicy::Clamp);
+        store.apply_change(&old, &new, &list);
+        store.assert_invariants(new.len());
+        assert_eq!(store.resolve(mark).offset.0, 0);
+        assert!(!store.resolve(mark).invalidated);
+        assert_eq!(store.resolve(byte).offset.0, 2);
+        let order: Vec<usize> = store.resolved().iter().map(|r| r.1.offset.0).collect();
+        assert_eq!(order, [0, 2]);
+        // The next change starts from a rebuilt order and keeps both anchors right.
+        let next = EditList::new(vec![Edit::insert(BytePos(1), b"z".to_vec())]).unwrap();
+        let newer = next.apply_to(&new);
+        store.apply_change(&new, &newer, &next);
+        store.assert_invariants(newer.len());
+        assert_eq!(store.resolve(mark).offset.0, 0);
+        assert_eq!(store.resolve(byte).offset.0, 3);
+    }
+
+    proptest::proptest! {
+        /// #1237: one [`LineMap`] remembers the lines it found, so mapping every position of a change
+        /// through it, in any order, gives what a fresh map (which scans each position's line, as before
+        /// #1237) gives for each, and the remembered lines are the scanned ones.
+        #[test]
+        fn line_map_with_remembered_lines_maps_as_a_fresh_one(
+            text in proptest::collection::vec(proptest::sample::select(b"ab \n".to_vec()), 0..40),
+            raw in proptest::collection::vec((0usize..48, 0usize..6, proptest::collection::vec(
+                proptest::sample::select(b"xy\n".to_vec()), 0..4)), 0..4),
+            order in proptest::collection::vec(0usize..48, 0..48),
+        ) {
+            // Disjoint, sorted edits inside the text.
+            let mut edits = Vec::new();
+            let mut at = 0;
+            let mut cuts: Vec<(usize, usize, Vec<u8>)> = raw
+                .into_iter()
+                .map(|(p, d, ins)| (p.min(text.len()), d, ins))
+                .collect();
+            cuts.sort_by_key(|c| c.0);
+            for (p, d, ins) in cuts {
+                if p < at {
+                    continue;
+                }
+                let d = d.min(text.len() - p);
+                edits.push(Edit::replace(BytePos(p), d, ins));
+                at = p + d + 1;
+            }
+            let list = EditList::new(edits).expect("disjoint and sorted");
+            let new = list.apply_to(&text);
+            let shared = LineMap::new(&text, &new, &list);
+            for &o in &order {
+                let o = o.min(text.len());
+                for g in [LineGravity::Keep, LineGravity::Drop, LineGravity::Cursor] {
+                    let fresh = LineMap::new(&text, &new, &list);
+                    proptest::prop_assert_eq!(shared.map(BytePos(o), g), fresh.map(BytePos(o), g));
+                }
+                let line = shared.old_lines.of(&text, o);
+                proptest::prop_assert_eq!(
+                    line,
+                    (crate::pos::raw::line_start(&text, o), crate::pos::raw::line_end(&text, o))
+                );
+            }
+        }
     }
 }

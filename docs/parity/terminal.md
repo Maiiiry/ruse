@@ -46,6 +46,11 @@ timeout regime). Push/pop-on-exit (was TERM-KBD-2) is the set/reset LIFECYCLE of
 separate fact. F-010 derives all four from `nvim.keyenc.*`; the negotiation is fenced by DA1 exactly
 as `CSI ? u` `CSI c` in `tui_query_kitty_keyboard`.
 
+`nvim.keyenc.xterm` gap (#772): nvim asks for modifyOtherKeys (`CSI > 4 ; 2 m`) under xterm and tmux and
+decodes the `CSI 27 ; mods ; code ~` keys it gets back; ruse's input parser (crossterm 0.29) cannot, so ruse
+never asks and stays on the legacy encoding there (tmux 3.8 with `extended-keys on` then sends `C-u` as
+`0x15`). The `CSI code ; mods u` form is decoded whenever it arrives.
+
 **⚠️ TERMIN-2/3/4**: disambiguate `Ctrl+I`/Tab, `Ctrl+M`/Enter, `Ctrl+[`/Esc; report release/repeat. This
 enables ruse's rich profile bindings (architecture §1) without the legacy timeout footgun. Always
 pop/reset flags on exit (guards a common real-world corruption bug).
@@ -70,9 +75,8 @@ security + correctness bug — some terminals leak `ESC` through the brackets).
 Source: contour vt-extensions.
 - BSU `CSI ? 2026 h`, ESU `CSI ? 2026 l`. Detect via `DECRQM` (`CSI ? 2026 $ p`; ps 1/2 = supported, 0/no-reply = unsupported).
 
-| ID | Capability | Target | Compat | Weight |
-| --- | --- | --- | --- | --- |
-| TERM-SYNC-1 | Atomic (tear-free) frame updates for large redraws | L1 | Equivalent | med |
+<!-- TERM-SYNC-1 (atomic frame updates) retired — census-backed by nvim.termmode.synchronizedoutput.
+     F-006 derives it from there. -->
 
 Gate behind detection so it never leaks as visible text (guards TERMOUT-9).
 
@@ -122,7 +126,7 @@ Source: xterm ctlseqs.
 
 | ID | Capability | Target | Compat | Weight |
 | --- | --- | --- | --- | --- |
-| TERM-MOUSE-2 | Focus events (backlogged #91 — mode 1004 is SET-only in neovim, never DA1-queried) | L1 | Equivalent | med |
+| TERM-MOUSE-2 | Focus events (backlogged #91 — mode 1004 is SET-only in neovim, never DA1-queried). ruse sets it from the capability ledger (env hint or DECRQM reply, `RUSE_NO_FOCUS` override) and runs the disk check on `CSI I` (#1220); tmux needs `focus-events on` | L1 | Equivalent | med |
 
 <!-- TERM-MOUSE-1 (SGR-1006 mouse) retired in #91 — census-backed by nvim.termmode.mousesgrext (1006)
      plus the nvim.termmode.mousebuttonevent/mouseanyevent probe pair (1002/1003). F-010 derives it there. -->
