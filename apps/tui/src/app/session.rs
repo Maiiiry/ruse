@@ -797,6 +797,13 @@ pub(crate) struct Session {
     pub(crate) confirm: Option<Confirm>,
     /// A backwards Ex range waiting for its `y`/`n` (`Backwards range given, OK to swap (y/n)?`, #1093).
     swap: Option<SwapPrompt>,
+    /// A `'confirm'` / `:confirm` dialog over unsaved changes, waiting for its key (#619).
+    changed_prompt: Option<crate::app::abandon::ChangedPrompt>,
+    /// The Ex command a window key stands for (`C-w q` is `:quit`, `C-w c` `:close`), run after routing.
+    window_ex: Option<&'static str>,
+    /// `:confirm` on the Ex command running, and that command's line as typed (modifiers included).
+    ex_confirm: bool,
+    ex_line: String,
     /// The key that answered [`Session::swap`], handed from the key routing to [`Session::answer_swap`].
     swap_answer: Option<KeyEvent>,
     /// The hlsearch pattern (last `/`-search), until `:noh`.
@@ -970,6 +977,10 @@ impl Session {
             macro_undo: None,
             confirm: None,
             swap: None,
+            changed_prompt: None,
+            window_ex: None,
+            ex_confirm: false,
+            ex_line: String::new(),
             swap_answer: None,
             search_hl: None,
             hlsearch_on: true,
@@ -1474,7 +1485,9 @@ impl Session {
     /// Look at every file buffer's file again (RFC-0023 §8): a stat, and a hash when it moved. A buffer
     /// whose file newly differs from what ruse read or saved gets nvim's W11 (unmodified) or W12 (modified
     /// too) on the status line when `announce`, the focused buffer first; one whose file is gone gets
-    /// nvim's E211 and no `[disk changed]` flag. ruse does not offer to reload.
+    /// nvim's E211 and no `[disk changed]` flag. With `'autoread'` (on, as nvim) an unmodified buffer whose
+    /// file changed is re-read instead, silently and as one undoable change (#619); a modified one still
+    /// gets W12 and keeps its text. ruse does not offer to reload.
     pub(crate) fn check_disk(&mut self, announce: bool) {
         self.disk_checked = std::time::Instant::now();
         // The config layer files too (#1152); a file's own warning, below, is shown over its report.
@@ -1487,7 +1500,15 @@ impl Session {
             let Some(bf) = self.files.get(&id) else {
                 continue;
             };
-            let state = persist::disk::check(&bf.path);
+            let mut state = persist::disk::check(&bf.path);
+            let clean = self.ws.document(id).is_some_and(|d| !d.is_modified());
+            if state == persist::disk::State::Changed
+                && clean
+                && self.ui_opts.buffers.autoread
+                && self.autoread(id)
+            {
+                state = persist::disk::State::Same;
+            }
             if state == persist::disk::State::Changed {
                 self.disk_changed.insert(id);
             } else {
@@ -1521,6 +1542,27 @@ impl Session {
                 "W11: Warning: File \"{name}\" has changed since editing started"
             ));
         }
+    }
+
+    /// `'autoread'`: re-read the unmodified buffer `id` from its changed file as one undoable change, with
+    /// the file's new line endings and BOM. Returns whether it did (an unreadable file is left to the
+    /// warning).
+    fn autoread(&mut self, id: DocumentId) -> bool {
+        let Some(path) = self.files.get(&id).map(|bf| bf.path.clone()) else {
+            return false;
+        };
+        let Ok(raw) = persist::read_file(&path) else {
+            return false;
+        };
+        persist::disk::saw(&path, &raw);
+        let fmt = persist::encoding::FileFormat::detect(&raw);
+        self.ws.reload_undoable(id, fmt.to_buffer(&raw));
+        if let Some(bf) = self.files.get_mut(&id) {
+            bf.fmt = fmt;
+            bf.reloads = bf.reloads.saturating_add(1);
+        }
+        persist::journal::clear(Some(&path));
+        true
     }
 
     /// The idle trigger of [`Session::check_disk`]: once [`persist::journal::IDLE`] passed since the last
@@ -1671,8 +1713,11 @@ impl Session {
         if let Some(key) = self.swap_answer.take() {
             if let Some(prompt) = self.swap.take() {
                 self.answer_swap(prompt, key, frame);
+            } else if let Some(prompt) = self.changed_prompt.take() {
+                self.answer_changed(prompt, key, frame);
             }
         }
+
         if self.failed_since(status_before) {
             self.macros.flush_replay();
         }
@@ -1783,7 +1828,10 @@ impl Session {
     /// Whether a modal overlay owns the keystream: a `:s///c` confirm loop or an open picker. The macro
     /// layer must not take its `q`/`@` (#851).
     fn overlay_open(&self) -> bool {
-        self.confirm.is_some() || self.swap.is_some() || self.overlay.is_some()
+        self.confirm.is_some()
+            || self.swap.is_some()
+            || self.changed_prompt.is_some()
+            || self.overlay.is_some()
     }
 
     /// The focused window's `'scrolloff'` as the rows of context the viewport keeps.
@@ -2016,6 +2064,16 @@ impl Session {
     }
 
     fn route(&mut self, raw_key: KeyEvent, from_replay: bool, frame: &FrameCtx) {
+        self.route_key(raw_key, from_replay, frame);
+        // A window key that stands for an Ex command (`CTRL-W q` = `:quit`) runs it now, before the next
+        // key, through the Ex dispatch and its unsaved-changes gate (#619).
+        if let Some(line) = self.window_ex.take() {
+            self.status.clear();
+            self.run_ex_pieces(vec![line.to_string()], frame);
+        }
+    }
+
+    fn route_key(&mut self, raw_key: KeyEvent, from_replay: bool, frame: &FrameCtx) {
         let so = self.scrolloff_rows();
         let report = self.ui_opts.report;
         let overlay_open = self.overlay_open();
@@ -2036,7 +2094,9 @@ impl Session {
             macros,
             confirm,
             swap,
+            changed_prompt,
             swap_answer,
+            window_ex,
             search_hl,
             last_substitute,
             last_ex_line,
@@ -2196,7 +2256,7 @@ impl Session {
             return;
         }
         // A backwards-range prompt owns the next key; [`Session::on_key`] answers it once routing is done.
-        if swap.is_some() {
+        if swap.is_some() || changed_prompt.is_some() {
             *swap_answer = Some(key);
             return;
         }
@@ -2699,7 +2759,7 @@ impl Session {
                 }
             }
             *prefix = Prefix::None;
-            dispatch_window(key, count, ws, quit, status);
+            dispatch_window(key, count, ws, window_ex);
             return;
         }
         // The command-line window (`q:`/`q/`/`q?`) owns the keystream while open, like the `:` line: suppress
@@ -3546,6 +3606,7 @@ impl Session {
         let mut pieces = pieces.into_iter();
         while let Some(cmd) = pieces.next() {
             self.status.clear();
+            self.ex_line = cmd.clone();
             // Command modifiers (`:silent`, `:verbose`, …) come first (#609). `:silent` hides the command's
             // message but not an error; `:silent!` hides the error too, and the line goes on after it. The
             // hidden error is still the last error (Vim's `v:errmsg`).
@@ -3573,6 +3634,7 @@ impl Session {
             }
             self.ex_filter = mods.filter.clone();
             self.ex_verbose = mods.verbose;
+            self.ex_confirm = mods.confirm;
             // What `:silent` keeps off the screen stays out of `:messages` too (#1235).
             let hushed = self.status.hush(if mods.silent_errors {
                 Silence::All
@@ -3597,7 +3659,12 @@ impl Session {
                 self.ws.set_alternate(alt);
                 self.alt_file = alt_file;
             }
+            self.ex_confirm = false;
             if let Some(prompt) = &mut self.swap {
+                prompt.pending.extend(pieces);
+                return;
+            }
+            if let Some(prompt) = &mut self.changed_prompt {
                 prompt.pending.extend(pieces);
                 return;
             }
@@ -3632,16 +3699,61 @@ impl Session {
         }
     }
 
+    /// The key that answered a `'confirm'` dialog (#619, [`crate::app::abandon`]): act on it and run the
+    /// command again, or keep the prompt up for a key that is no answer.
+    fn answer_changed(
+        &mut self,
+        prompt: crate::app::abandon::ChangedPrompt,
+        key: KeyEvent,
+        frame: &FrameCtx,
+    ) {
+        let Some(a) = crate::app::abandon::answer(&prompt, key) else {
+            self.changed_prompt = Some(prompt);
+            return;
+        };
+        self.status.clear();
+        if crate::app::abandon::act(&prompt, a, &mut self.ws, &self.files, &mut self.status)
+            && !self.status.is_error()
+        {
+            self.status.clear();
+            self.run_ex_pieces(prompt.pending, frame);
+        }
+    }
+
     /// Run ONE Ex command (a `|`-free piece of the typed line). This is the single Ex dispatch (#892):
     /// every `Ex` variant has exactly one arm here, so a new command cannot land in a match that never sees
     /// it.
     fn execute_ex_one(&mut self, text: String, frame: &FrameCtx) {
         let parsed = parse_ex(&text);
+        // Unsaved changes in a buffer the command leaves (#619): 'hidden', 'autowrite', 'confirm'.
+        let line = self.ex_line.clone();
+        match crate::app::abandon::gate(
+            &parsed,
+            &mut self.ws,
+            &self.files,
+            &self.ui_opts.buffers,
+            self.ex_confirm,
+            &line,
+            &mut self.status,
+        ) {
+            crate::app::abandon::Gate::Go => {}
+            crate::app::abandon::Gate::Stop => return,
+            crate::app::abandon::Gate::Ask(prompt) => {
+                self.status
+                    .echo(crate::app::abandon::prompt_text(&prompt, &self.ws));
+                self.changed_prompt = Some(prompt);
+                return;
+            }
+        }
         let external = runs_external(&parsed);
         if external {
             self.sync_journals();
         }
         self.execute_ex_parsed(text, frame);
+        // An edit `'nomodifiable'` refused (#619): nvim's E21 over whatever the command said.
+        if self.ws.take_not_modifiable() {
+            self.status.error(ruse_core::E21);
+        }
         // The files may have changed: after another program ran (nvim checks after a shell command), and
         // after a write, which may have been refused because one did (RFC-0023 §8). `:checktime` asks.
         self.check_disk(external || parsed == Ex::CheckTime);
@@ -6285,8 +6397,7 @@ fn dispatch_window(
     key: crossterm::event::KeyEvent,
     count: u32,
     ws: &mut Workspace,
-    quit: &mut bool,
-    status: &mut Status,
+    window_ex: &mut Option<&'static str>,
 ) {
     // `{count}C-w w` / `{count}C-w W` go to window `count`, the last one when there are fewer (nvim 0.12.6:
     // `9<C-w>w` with three windows lands in window 3); without a count they step to the next / previous.
@@ -6306,14 +6417,11 @@ fn dispatch_window(
         KeyCode::Char('v') => {
             ws.split(SplitDir::Vertical);
         }
-        KeyCode::Char('c') => {
-            if !ws.close_focused() {
-                status.error("E444: Cannot close last window");
-            }
-        }
-        // `C-w q` is `:quit`: close the focused window (its buffer stays loaded, hidden, as with nvim's
-        // default 'hidden'), or on the last window quit through the same unsaved-changes check (E37/E162).
-        KeyCode::Char('q') => crate::app::dispatch::quit_window(ws, status, quit, false),
+        // `C-w c` is `:close` and `C-w q` (`C-w C-q`) is `:quit` (`:help CTRL-W_c`): they run as those Ex
+        // commands once routing is done, so 'hidden', 'autowrite' and 'confirm' apply as they do (#619).
+        KeyCode::Char('c') if key.modifiers.is_empty() => *window_ex = Some("close"),
+        KeyCode::Char('q') if key.modifiers.is_empty() => *window_ex = Some("quit"),
+        _ if is_ctrl(key, 'q') => *window_ex = Some("quit"),
         _ => {}
     }
 }

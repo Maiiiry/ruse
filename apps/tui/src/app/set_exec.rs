@@ -74,6 +74,8 @@ pub(crate) struct UiOptions {
     pub conceal: bool,
     /// `'report'`: the line count a command's report needs to pass (#1276).
     pub report: i64,
+    /// `'hidden'`, `'confirm'`, `'autowrite'`, `'autowriteall'`, `'autoread'` (#619).
+    pub buffers: crate::app::abandon::BufferOptions,
 }
 
 impl UiOptions {
@@ -94,6 +96,7 @@ impl Default for UiOptions {
             foldopen: crate::input::set_cmd::FOLDOPEN.to_string(),
             conceal: true,
             report: crate::app::report::REPORT_DEFAULT,
+            buffers: crate::app::abandon::BufferOptions::default(),
         }
     }
 }
@@ -335,6 +338,17 @@ impl OptionHost<'_> {
             Opt::BackupCopy => OptVal::Text(self.files.write.backupcopy.clone().into()),
             Opt::PatchMode => OptVal::Text(self.files.write.patchmode.clone().into()),
             Opt::EndOfLine => OptVal::Bool(self.file_format(buf).final_newline),
+            Opt::AutoRead => OptVal::Bool(self.ui.buffers.autoread),
+            Opt::AutoWrite => OptVal::Bool(self.ui.buffers.autowrite),
+            Opt::AutoWriteAll => OptVal::Bool(self.ui.buffers.autowriteall),
+            Opt::Confirm => OptVal::Bool(self.ui.buffers.confirm),
+            Opt::Hidden => OptVal::Bool(self.ui.buffers.hidden),
+            Opt::Modifiable => OptVal::Bool(
+                self.ws
+                    .document(buf)
+                    .is_none_or(ruse_core::Document::is_modifiable),
+            ),
+            Opt::Modified => OptVal::Bool(self.ws.document(buf).is_some_and(|d| d.is_modified())),
             Opt::EndOfFile => OptVal::Bool(self.file_format(buf).eof),
             Opt::Bomb => OptVal::Bool(self.file_format(buf).bom),
             Opt::FoldLevel => OptVal::Num(
@@ -477,6 +491,20 @@ impl OptionHost<'_> {
             (Opt::FoldEnable, _) => {
                 self.foldenable.insert(buf, on);
                 self.reapply_folds(buf);
+            }
+            (Opt::AutoRead, _) => self.ui.buffers.autoread = on,
+            (Opt::AutoWrite, _) => self.ui.buffers.autowrite = on,
+            // nvim: 'autowriteall' implies 'autowrite' (it does not set it).
+            (Opt::AutoWriteAll, _) => self.ui.buffers.autowriteall = on,
+            (Opt::Confirm, _) => self.ui.buffers.confirm = on,
+            (Opt::Hidden, _) => self.ui.buffers.hidden = on,
+            // Buffer state of the focused buffer, recorded so a replay refuses the same edits (#619).
+            (Opt::Modifiable, _) => {
+                crate::app::dispatch::run_ex(ExCmd::Modifiable(on), self.ws, self.recorded);
+            }
+            // `:set nomod` marks the buffer unchanged (its text stays); `:set mod` marks it changed.
+            (Opt::Modified, _) => {
+                crate::app::dispatch::run_ex(ExCmd::Modified(on), self.ws, self.recorded);
             }
             (Opt::Backup, _) => self.files.write.backup = on,
             (Opt::WriteBackup, _) => self.files.write.writebackup = on,
@@ -762,6 +790,11 @@ pub(crate) fn config_key(opt: Opt) -> Option<&'static str> {
         Opt::IncSearch => "editor.incsearch",
         Opt::TildeOp => "editor.tildeop",
         Opt::FixEol => "editor.fixeol",
+        Opt::Hidden => "editor.hidden",
+        Opt::Confirm => "editor.confirm",
+        Opt::AutoWrite => "editor.autowrite",
+        Opt::AutoWriteAll => "editor.autowriteall",
+        Opt::AutoRead => "editor.autoread",
         Opt::Backup => "files.backup",
         Opt::WriteBackup => "files.writebackup",
         Opt::BackupDir => "files.backupdir",

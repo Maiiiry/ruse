@@ -154,6 +154,10 @@ pub enum ExCmd {
     },
     /// The `:keepjumps` switch (R6): while on, no jumplist or change-list entry is recorded.
     KeepJumps(bool),
+    /// `:set (no)modifiable` on the focused buffer (#619): a replay refuses the same edits live did.
+    Modifiable(bool),
+    /// `:set (no)modified` on the focused buffer (#619): marks it unsaved / saved.
+    Modified(bool),
     /// A register value the session wrote that no recorded command produced (R6): the read-only
     /// `"/ ": ". "% "#` synced from frontend state, a clipboard read, a macro's raw keys, and the registers
     /// filled when the trace began. Sets exactly that slot ([`RegisterStore::set_slot`]); `None` is the
@@ -183,12 +187,40 @@ pub enum ExOutcome {
     Applied(bool),
     /// A pattern that does not compile; nothing changed.
     Failed(RegexError),
+    /// The buffer is `'nomodifiable'` (`E21`, #619); nothing changed.
+    NotModifiable,
+}
+
+impl ExCmd {
+    /// Whether the command changes the text (every edit `'nomodifiable'` refuses).
+    #[must_use]
+    pub fn edits(&self) -> bool {
+        matches!(
+            self,
+            ExCmd::Substitute { .. }
+                | ExCmd::Global { .. }
+                | ExCmd::Delete { .. }
+                | ExCmd::Join { .. }
+                | ExCmd::Shift { .. }
+                | ExCmd::Move { .. }
+                | ExCmd::Copy { .. }
+                | ExCmd::Put { .. }
+                | ExCmd::Sort { .. }
+                | ExCmd::Retab { .. }
+                | ExCmd::ReadText { .. }
+                | ExCmd::FilterReplace { .. }
+                | ExCmd::Edits { .. }
+        )
+    }
 }
 
 impl EditorState {
     /// Run one resolved Ex edit (RFC-0020). The group markers are inert here: undo grouping across a group
     /// is the caller's ([`crate::trace::Trace::replay`] opens one undo block per outermost group).
     pub fn apply_ex(&mut self, ex: &ExCmd) -> ExOutcome {
+        if ex.edits() && !self.doc.is_modifiable() {
+            return ExOutcome::NotModifiable;
+        }
         let lines = |first: usize, last: usize| SubRange::Lines(first, last);
         match ex {
             ExCmd::Substitute {
@@ -345,6 +377,18 @@ impl EditorState {
             ExCmd::Edits { origin, edits } => ExOutcome::Applied(self.apply_edits(edits, *origin)),
             ExCmd::KeepJumps(on) => {
                 self.view.keep_jumps = *on;
+                ExOutcome::Done
+            }
+            ExCmd::Modifiable(on) => {
+                self.doc.set_modifiable(*on);
+                ExOutcome::Done
+            }
+            ExCmd::Modified(on) => {
+                if *on {
+                    self.doc.mark_unsaved();
+                } else {
+                    self.doc.mark_saved();
+                }
                 ExOutcome::Done
             }
             ExCmd::Register { name, value } => {
@@ -639,6 +683,8 @@ impl ExCmd {
                 s
             }
             ExCmd::KeepJumps(on) => format!("ex_keepjumps {}", bool_token(*on)),
+            ExCmd::Modifiable(on) => format!("ex_modifiable {}", bool_token(*on)),
+            ExCmd::Modified(on) => format!("ex_modified {}", bool_token(*on)),
             ExCmd::Register { name, value } => format!(
                 "ex_register {} {} {}",
                 reg_token(*name),
@@ -899,6 +945,8 @@ impl ExCmd {
                 ExCmd::Edits { origin, edits }
             }
             "ex_keepjumps" => ExCmd::KeepJumps(a.flag()?),
+            "ex_modifiable" => ExCmd::Modifiable(a.flag()?),
+            "ex_modified" => ExCmd::Modified(a.flag()?),
             "ex_register" => {
                 let name = a.reg()?;
                 if !RegisterStore::is_slot(name) {
@@ -1259,6 +1307,10 @@ pub(crate) fn samples() -> Vec<ExCmd> {
         },
         ExCmd::KeepJumps(true),
         ExCmd::KeepJumps(false),
+        ExCmd::Modifiable(false),
+        ExCmd::Modifiable(true),
+        ExCmd::Modified(true),
+        ExCmd::Modified(false),
         ExCmd::Register {
             name: None,
             value: Register::linewise(b"a\n".to_vec()),
